@@ -195,6 +195,8 @@ async fn serve() {
     let engine_host = std::env::var("BEST_PEER_ENGINE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let peer = peer(&endpoint, &engine_host, gpu, runtime, engine, log, images, patience).await;
     let door = Arc::new(door(&endpoint, peer, auth));
+    // What the last run accepted and never completed is run now, before anyone can send more.
+    best_peer_door::resume(&door).await;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .unwrap_or_else(|e| fail(&format!("cannot listen on {listen}: {e}")));
@@ -325,6 +327,7 @@ mod tests {
         .await;
         let auth = Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() })));
         let door = Arc::new(super::door(EP, peer.clone(), auth));
+        best_peer_door::resume(&door).await;
         let app = best_peer_door::router(door.clone());
         let key = key(&app).await;
         Bed {
@@ -835,7 +838,19 @@ mod tests {
                 .into(),
         );
         let lost_container = first.container_of(&lost);
+        // A job that keeps running across the restart: its command is complete, and must not be run again.
+        let (s, _) = first
+            .send(
+                "j2",
+                "RunJob",
+                "run-job",
+                json!({ "image": "busybox", "args": ["sleep", "1000"] }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED);
+        first.events_of("j2", "JobStarted").await;
         // The peer dies. While it is down the engine loses one deployment and the job, and nobody hears.
+        first.peer.halt();
         drop(first);
         runtime.stop(&lost_container).await.unwrap();
         runtime.stop(&job_container).await.unwrap();
@@ -845,7 +860,13 @@ mod tests {
         assert_eq!(w["deployments"].as_array().unwrap().len(), 1, "{w}");
         assert_eq!(w["deployments"][0]["deployment"], kept);
         assert_eq!(w["deployments"][0]["phase"], "ready");
-        assert!(w["jobs"].as_array().unwrap().is_empty());
+        assert_eq!(w["jobs"].as_array().unwrap().len(), 1, "{w}");
+        assert_eq!(w["jobs"][0]["phase"], "running");
+        assert_eq!(
+            types(&again.log_of("j2")).iter().filter(|t| *t == "JobStarted").count(),
+            1,
+            "the running job was not started a second time"
+        );
         let ended = again.events_of("d2", "DeploymentEnded").await;
         assert!(ended.last().unwrap().data["reason"]
             .as_str()
@@ -861,15 +882,50 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not observed"));
+        // A deploy accepted just before the crash, never run: it runs now, under its own correlation.
+        let owed_log = log.clone();
+        let envelope: Envelope = serde_json::from_value(json!({
+            "specversion": "1.0", "id": "d9", "source": "https://agent.test", "type": "DeployModel",
+            "datacontenttype": "application/json", "dataschema": format!("{EP}/commands/deploy-model/1.0"),
+            "time": "2026-10-12T10:30:00Z", "data": { "model": "owed:1b", "engine": "ollama", "memory_bytes": GB }
+        }))
+        .unwrap();
+        owed_log.accept_command(
+            "some-sender",
+            "d9",
+            &best_peer_door::payload_hash(&envelope),
+            "d9",
+            &envelope,
+        );
+        again.peer.halt();
+        drop(again);
+        let third = bed(card(), log.clone(), runtime.clone()).await;
+        let ready = third.events_of("d9", "DeploymentReady").await;
+        assert_eq!(ready.last().unwrap().data["model"], "owed:1b");
+        assert!(
+            third.door.log.unfinished().is_empty(),
+            "nothing is owed once it completed"
+        );
+        let again = third;
         // The kept deployment still holds its memory, and can still be undeployed.
         let (s, b) = again.deploy("d3", "more:1b", "ollama", 21).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
-        assert_eq!(b["error"]["details"]["devices"][0]["promised_bytes"], 4 * GB);
+        assert_eq!(
+            b["error"]["details"]["devices"][0]["promised_bytes"],
+            5 * GB,
+            "the kept deployment and the one owed after the restart"
+        );
         let (s, _) = again
             .send("u1", "UndeployModel", "undeploy-model", json!({ "deployment": kept }))
             .await;
         assert_eq!(s, StatusCode::CREATED);
         again.events_of("u1", "Undeployed").await;
-        assert!(runtime.running().await.unwrap().is_empty());
+        let still = runtime.running().await.unwrap();
+        assert_eq!(
+            still.len(),
+            2,
+            "the deployment owed after the restart and the running job"
+        );
+        assert_eq!(again.query("get-workloads").await["deployments"][0]["model"], "owed:1b");
     }
 }

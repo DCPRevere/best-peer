@@ -2,7 +2,7 @@
 //! commands, each outcome as events. The schemas and descriptions here are everything an agent gets; the behaviour
 //! is in [`crate::lifecycle`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use best_peer_door::{BestError, Catalogue, CommandDef, EventDef, QueryDef};
@@ -26,6 +26,33 @@ pub fn catalogue(peer: Arc<Peer>) -> Catalogue {
         c = c.event(e);
     }
     c
+}
+
+/// What completes each command: the events after which its outcome is known, so a consumer stops waiting for the
+/// command and a restart does not run it again. What the command made then has a life of its own, told under the
+/// same correlation id (a deployment's end, a job's end). `CommandFailed` completes any command.
+pub fn completions() -> HashMap<String, HashSet<String>> {
+    let set = |types: &[&str]| types.iter().map(|t| t.to_string()).collect::<HashSet<_>>();
+    HashMap::from([
+        ("PullImage".to_string(), set(&["ImagePulled", "ImagePullFailed"])),
+        (
+            "DeployModel".to_string(),
+            set(&["DeploymentReady", "DeploymentFailed", "DeploymentEnded", "OutOfMemory"]),
+        ),
+        ("UndeployModel".to_string(), set(&["Undeployed"])),
+        ("RunJob".to_string(), set(&["JobStarted", "JobFailed"])),
+        ("StopJob".to_string(), set(&["JobStopped"])),
+    ])
+}
+
+fn completes(command_type: &str) -> Vec<String> {
+    let mut v: Vec<String> = completions()
+        .remove(command_type)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    v.sort();
+    v
 }
 
 /// Event type to absolute dataschema URI, for the peer's own emitters: the same map the door builds.
@@ -124,6 +151,7 @@ fn pull_image(peer: Arc<Peer>) -> CommandDef {
             "additionalProperties": false
         }),
         produces: vec!["ImagePulling".into(), "ImagePulled".into(), "ImagePullFailed".into()],
+        completes: completes("PullImage"),
         impact: None,
         admit: None,
         handler: Arc::new(move |cmd, emitter| {
@@ -139,7 +167,7 @@ fn deploy_model(peer: Arc<Peer>) -> CommandDef {
         schema: "deploy-model".into(),
         version: "1.0".into(),
         command_type: "DeployModel".into(),
-        description: "Serves a model on this peer with the engine named, on a device that offers an API the engine runs on and has the memory asked for free. Refused at once, with the reason and what to do, when no device fits. Otherwise the facts follow on the stream with this command's correlation id: ImagePulling and ImagePulled, DeploymentStarted, WeightsLoading, then DeploymentReady with the OpenAI-compatible endpoint to send prompts to, or DeploymentFailed. Later, OutOfMemory or DeploymentEnded if the engine ends it on its own.".into(),
+        description: "Serves a model on this peer with the engine named, on a device that offers an API the engine runs on and has the memory asked for free. Refused at once, with the reason and what to do, when no device fits. Otherwise the facts follow on the stream with this command's correlation id: ImagePulling and ImagePulled, DeploymentStarted, WeightsLoading, then DeploymentReady with the OpenAI-compatible endpoint to send prompts to, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it on its own, under the same correlation id.".into(),
         data_schema: json!({
             "type": "object",
             "required": ["model", "engine", "memory_bytes"],
@@ -161,6 +189,7 @@ fn deploy_model(peer: Arc<Peer>) -> CommandDef {
             "OutOfMemory".into(),
             "DeploymentEnded".into(),
         ],
+        completes: completes("DeployModel"),
         impact: None,
         admit: Some(Arc::new(move |cmd, key| {
             let peer = admit.clone();
@@ -189,6 +218,7 @@ fn undeploy_model(peer: Arc<Peer>) -> CommandDef {
             "additionalProperties": false
         }),
         produces: vec!["Undeployed".into(), "CommandFailed".into()],
+        completes: completes("UndeployModel"),
         impact: None,
         admit: Some(Arc::new(move |cmd, _key| {
             let peer = admit.clone();
@@ -207,7 +237,7 @@ fn run_job(peer: Arc<Peer>) -> CommandDef {
         schema: "run-job".into(),
         version: "1.0".into(),
         command_type: "RunJob".into(),
-        description: "Runs an image once, with the arguments given, and tells its end. With memory_bytes the job is placed on a device with that much room and handed that device; without, it runs with no device. The facts follow with this command's correlation id: ImagePulling and ImagePulled, JobStarted, then JobFinished with the exit code, or JobFailed.".into(),
+        description: "Runs an image once, with the arguments given, and tells its end. With memory_bytes the job is placed on a device with that much room and handed that device; without, it runs with no device. The facts follow with this command's correlation id: ImagePulling and ImagePulled, then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed.".into(),
         data_schema: json!({
             "type": "object",
             "required": ["image"],
@@ -226,6 +256,7 @@ fn run_job(peer: Arc<Peer>) -> CommandDef {
             "JobFinished".into(),
             "JobFailed".into(),
         ],
+        completes: completes("RunJob"),
         impact: None,
         admit: Some(Arc::new(move |cmd, key| {
             let peer = admit.clone();
@@ -254,6 +285,7 @@ fn stop_job(peer: Arc<Peer>) -> CommandDef {
             "additionalProperties": false
         }),
         produces: vec!["JobStopped".into(), "CommandFailed".into()],
+        completes: completes("StopJob"),
         impact: None,
         admit: Some(Arc::new(move |cmd, _key| {
             let peer = admit.clone();

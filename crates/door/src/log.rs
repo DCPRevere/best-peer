@@ -82,11 +82,33 @@ struct AcceptedLine {
     id: String,
     hash: String,
     correlation: String,
+    /// The command itself, so one the peer died before running can be run after the restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    envelope: Option<Envelope>,
+    /// Told by a line with the same sender and id once a completing event was emitted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    finished: bool,
+    /// The workload the command made (a deployment or job id), told by a later line, so a fact about the workload
+    /// that completes the command finds it without the correlation id, which clients may share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workload: Option<String>,
+    /// The order of acceptance: the file's order, never the client's clock.
+    #[serde(skip)]
+    order: u64,
+}
+
+/// An accepted command the door has not seen through to a completing event.
+#[derive(Clone, Debug)]
+pub struct Unfinished {
+    pub sender: String,
+    pub envelope: Envelope,
 }
 
 pub struct EventLog {
     events: Mutex<Vec<Stored>>,
     accepted: Mutex<HashMap<(String, String), AcceptedLine>>,
+    /// How many commands were ever accepted: the next one's order.
+    accepted_count: Mutex<u64>,
     events_file: Mutex<Option<File>>,
     accepted_file: Mutex<Option<File>>,
     tx: broadcast::Sender<Stored>,
@@ -99,6 +121,7 @@ impl EventLog {
         Self {
             events: Mutex::new(Vec::new()),
             accepted: Mutex::new(HashMap::new()),
+            accepted_count: Mutex::new(0),
             events_file: Mutex::new(None),
             accepted_file: Mutex::new(None),
             tx,
@@ -120,8 +143,23 @@ impl EventLog {
         }
         for line in read_lines(&accepted_path)? {
             match serde_json::from_str::<AcceptedLine>(&line) {
-                Ok(a) => {
-                    log.accepted.lock().unwrap().insert((a.sender.clone(), a.id.clone()), a);
+                Ok(mut a) => {
+                    let mut accepted = log.accepted.lock().unwrap();
+                    match accepted.get_mut(&(a.sender.clone(), a.id.clone())) {
+                        // A later line for a known command only ever says it finished, or what it made.
+                        Some(known) => {
+                            known.finished |= a.finished;
+                            if a.workload.is_some() {
+                                known.workload = a.workload;
+                            }
+                        }
+                        None => {
+                            let mut count = log.accepted_count.lock().unwrap();
+                            a.order = *count;
+                            *count += 1;
+                            accepted.insert((a.sender.clone(), a.id.clone()), a);
+                        }
+                    }
                 }
                 Err(e) => tracing::warn!(error = %e, "an accepted-command line could not be read and is skipped"),
             }
@@ -168,7 +206,7 @@ impl EventLog {
 
     /// Records that `sender` sent a command with `id`, payload hash `hash` and correlation `correlation`, or says
     /// why it is not new. One sender's ids are theirs alone: another sender's identical id is a different command.
-    pub fn accept_command(&self, sender: &str, id: &str, hash: &str, correlation: &str) -> Accept {
+    pub fn accept_command(&self, sender: &str, id: &str, hash: &str, correlation: &str, envelope: &Envelope) -> Accept {
         let mut accepted = self.accepted.lock().unwrap();
         let key = (sender.to_string(), id.to_string());
         match accepted.get(&key) {
@@ -177,17 +215,125 @@ impl EventLog {
             },
             Some(_) => Accept::Conflict,
             None => {
+                let order = {
+                    let mut count = self.accepted_count.lock().unwrap();
+                    *count += 1;
+                    *count - 1
+                };
                 let line = AcceptedLine {
                     sender: sender.into(),
                     id: id.into(),
                     hash: hash.into(),
                     correlation: correlation.into(),
+                    envelope: Some(envelope.clone()),
+                    finished: false,
+                    workload: None,
+                    order,
                 };
                 write_line(&self.accepted_file, &line, "accepted command");
                 accepted.insert(key, line);
                 Accept::New
             }
         }
+    }
+
+    /// Records that `sender`'s command `id` reached a completing event: it is not run again after a restart.
+    pub fn finish_command(&self, sender: &str, id: &str) {
+        let mut accepted = self.accepted.lock().unwrap();
+        let Some(a) = accepted.get_mut(&(sender.to_string(), id.to_string())) else {
+            return;
+        };
+        if a.finished {
+            return;
+        }
+        a.finished = true;
+        let line = AcceptedLine {
+            sender: sender.into(),
+            id: id.into(),
+            hash: a.hash.clone(),
+            correlation: a.correlation.clone(),
+            envelope: None,
+            finished: true,
+            workload: None,
+            order: a.order,
+        };
+        write_line(&self.accepted_file, &line, "finished command");
+    }
+
+    /// Records that `sender`'s command `id` made the workload `workload`, so a later fact about the workload can
+    /// complete the command.
+    pub fn bind_workload(&self, sender: &str, id: &str, workload: &str) {
+        let mut accepted = self.accepted.lock().unwrap();
+        let Some(a) = accepted.get_mut(&(sender.to_string(), id.to_string())) else {
+            return;
+        };
+        if a.workload.as_deref() == Some(workload) {
+            return;
+        }
+        a.workload = Some(workload.into());
+        let line = AcceptedLine {
+            sender: sender.into(),
+            id: id.into(),
+            hash: a.hash.clone(),
+            correlation: a.correlation.clone(),
+            envelope: None,
+            finished: false,
+            workload: Some(workload.into()),
+            order: a.order,
+        };
+        write_line(&self.accepted_file, &line, "bound command");
+    }
+
+    /// The stored hash of `sender`'s command `id`, for a restart to check the stored envelope against.
+    pub fn hash_of(&self, sender: &str, id: &str) -> Option<String> {
+        self.accepted
+            .lock()
+            .unwrap()
+            .get(&(sender.to_string(), id.to_string()))
+            .map(|a| a.hash.clone())
+    }
+
+    /// Records that the unfinished command that made `workload`, when its type `completes` says the event told
+    /// completes it, is finished: for a fact told later by the engine about the workload, not by the command's
+    /// own handler. Precise: a workload id is the peer's, never shared.
+    pub fn finish_by_workload(&self, workload: &str, completes: impl Fn(&str) -> bool) {
+        let owed: Vec<(String, String)> = {
+            let accepted = self.accepted.lock().unwrap();
+            accepted
+                .values()
+                .filter(|a| !a.finished && a.workload.as_deref() == Some(workload))
+                .filter(|a| a.envelope.as_ref().is_some_and(|e| completes(&e.r#type)))
+                .map(|a| (a.sender.clone(), a.id.clone()))
+                .collect()
+        };
+        for (sender, id) in owed {
+            self.finish_command(&sender, &id);
+        }
+    }
+
+    /// The accepted commands no completing event was told for, oldest first by acceptance: what a restart owes.
+    /// A command accepted before envelopes were kept cannot be run again and is not listed.
+    pub fn unfinished(&self) -> Vec<Unfinished> {
+        let accepted = self.accepted.lock().unwrap();
+        struct Owed {
+            order: u64,
+            unfinished: Unfinished,
+        }
+        let mut u: Vec<Owed> = accepted
+            .values()
+            .filter(|a| !a.finished)
+            .filter_map(|a| {
+                a.envelope.as_ref().map(|e| Owed {
+                    order: a.order,
+                    unfinished: Unfinished {
+                        sender: a.sender.clone(),
+                        envelope: e.clone(),
+                    },
+                })
+            })
+            .collect();
+        u.sort_by_key(|x| x.order);
+        u.into_iter().map(|x| x.unfinished).collect()
     }
 
     /// A page of the log, oldest first, and the cursor for the next page when there is one. `limit` is what the
@@ -259,8 +405,16 @@ fn read_lines(path: &Path) -> std::io::Result<Vec<String>> {
         .collect())
 }
 
+/// Opens the file for appending. A file whose last line was torn (the process died mid-write) gets a newline first,
+/// so the next record starts on its own line and only the torn one is lost.
 fn append_to(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new().create(true).append(true).open(path)
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let bytes = std::fs::read(path)?;
+    if bytes.last().is_some_and(|b| *b != b'\n') {
+        file.write_all(b"\n")?;
+        file.flush()?;
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -326,20 +480,26 @@ mod tests {
     #[test]
     fn an_id_is_an_idempotency_key_per_sender_and_a_different_payload_is_a_conflict() {
         let log = EventLog::ephemeral();
-        assert_eq!(log.accept_command("alice", "x", "h1", "corr-1"), Accept::New);
+        let cmd = ev("PullImage", "corr-1");
+        assert_eq!(log.accept_command("alice", "x", "h1", "corr-1", &cmd), Accept::New);
         assert_eq!(
-            log.accept_command("alice", "x", "h1", "corr-2"),
+            log.accept_command("alice", "x", "h1", "corr-2", &cmd),
             Accept::Duplicate {
                 correlation: "corr-1".into()
             },
             "the retry is told the original correlation"
         );
-        assert_eq!(log.accept_command("alice", "x", "h2", "corr-3"), Accept::Conflict);
+        assert_eq!(log.accept_command("alice", "x", "h2", "corr-3", &cmd), Accept::Conflict);
         assert_eq!(
-            log.accept_command("bob", "x", "h1", "corr-4"),
+            log.accept_command("bob", "x", "h1", "corr-4", &cmd),
             Accept::New,
             "another sender's id is their own"
         );
+        assert_eq!(log.unfinished().len(), 2, "both accepted commands are owed");
+        log.finish_command("alice", "x");
+        let owed = log.unfinished();
+        assert_eq!(owed.len(), 1);
+        assert_eq!(owed[0].sender, "bob");
     }
 
     #[test]
@@ -366,7 +526,10 @@ mod tests {
         let first = EventLog::open(dir.path()).unwrap();
         first.append(ev("A", "c"));
         first.append(ev("B", "c"));
-        assert_eq!(first.accept_command("alice", "cmd-1", "h", "c"), Accept::New);
+        let cmd = ev("PullImage", "c");
+        assert_eq!(first.accept_command("alice", "cmd-1", "h", "c", &cmd), Accept::New);
+        assert_eq!(first.accept_command("alice", "cmd-2", "h", "c", &cmd), Accept::New);
+        first.finish_command("alice", "cmd-2");
         drop(first);
         let path = dir.path().join("events.jsonl");
         let mut torn = std::fs::read_to_string(&path).unwrap();
@@ -379,13 +542,46 @@ mod tests {
             vec!["A", "B"]
         );
         assert_eq!(
-            again.accept_command("alice", "cmd-1", "h", "c"),
+            again.accept_command("alice", "cmd-1", "h", "c", &cmd),
             Accept::Duplicate {
                 correlation: "c".into()
             }
         );
+        let owed = again.unfinished();
+        assert_eq!(owed.len(), 1, "the finished one is not owed after the restart");
+        assert_eq!(owed[0].envelope.id, cmd.id);
         let c = again.append(ev("C", "c"));
         assert_eq!(c.seq, 3);
+        // The record written after the torn line starts on its own line: a third open reads A, B and C.
+        drop(again);
+        let third = EventLog::open(dir.path()).unwrap();
+        let (events, _) = third.list(&Filter::default());
+        assert_eq!(
+            events.iter().map(|e| e.r#type.as_str()).collect::<Vec<_>>(),
+            vec!["A", "B", "C"]
+        );
+    }
+
+    #[test]
+    fn a_restart_owes_commands_in_the_order_they_were_accepted_and_finishes_by_the_workload_made() {
+        let log = EventLog::ephemeral();
+        let mut late = ev("DeployModel", "wf");
+        late.time = "2020-01-01T00:00:00Z".into();
+        let early = ev("DeployModel", "wf");
+        assert_eq!(log.accept_command("a", "first", "h", "wf", &early), Accept::New);
+        assert_eq!(log.accept_command("a", "second", "h", "wf", &late), Accept::New);
+        let owed: Vec<String> = log.unfinished().iter().map(|u| u.envelope.id.clone()).collect();
+        assert_eq!(
+            owed,
+            vec![early.id.clone(), late.id.clone()],
+            "acceptance order, not the client's clock"
+        );
+        // The first made dep-1; a fact about dep-1 completes it and leaves the second, which shares the correlation.
+        log.bind_workload("a", "first", "dep-1");
+        log.finish_by_workload("dep-1", |t| t == "DeployModel");
+        let owed: Vec<String> = log.unfinished().iter().map(|u| u.envelope.id.clone()).collect();
+        assert_eq!(owed, vec![late.id.clone()]);
+        assert_eq!(log.hash_of("a", "second").as_deref(), Some("h"));
     }
 
     #[tokio::test]

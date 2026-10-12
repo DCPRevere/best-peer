@@ -23,6 +23,7 @@ use time::OffsetDateTime;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::auth::{Credential, DeviceRequest, OAuthError, TokenRequest, AUTH_HEADER};
+use crate::catalogue::{CommandDef, Emitter};
 use crate::envelope::Envelope;
 use crate::error::BestError;
 use crate::log::{Accept, Filter, MAX_PAGE};
@@ -272,9 +273,7 @@ async fn ingest(
     door.catalogue.validate_data(&envelope.r#type, &envelope.data)?;
 
     let correlation = envelope.effective_correlation();
-    let hash = hex::encode(Sha256::digest(
-        serde_json::to_vec(&json!({ "type": envelope.r#type, "data": envelope.data })).expect("json"),
-    ));
+    let hash = payload_hash(&envelope);
     let conflict = || {
         BestError::conflict(format!(
             "id {} was already used for a different command: a new command needs a new id",
@@ -303,32 +302,93 @@ async fn ingest(
             return Err(refusal);
         }
     }
-    let accepted = door.log.accept_command(&sender.hash, &envelope.id, &hash, &correlation);
+    let accepted = door
+        .log
+        .accept_command(&sender.hash, &envelope.id, &hash, &correlation, &envelope);
     door.inflight.lock().unwrap().remove(&key);
     let answered = match accepted {
         Accept::Conflict => return Err(conflict()),
         Accept::Duplicate { correlation: original } => original,
         Accept::New => {
-            let emitter = door
-                .emitter(&correlation)
-                .with_key(&command_key(&sender.hash, &envelope.id));
-            let handler = (def.handler)(envelope.clone(), emitter.clone());
-            let command_type = envelope.r#type.clone();
-            tokio::spawn(async move {
-                if let Err(panic) = std::panic::AssertUnwindSafe(handler).catch_unwind().await {
-                    let reason = panic
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-                        .unwrap_or_else(|| "the handler panicked".into());
-                    tracing::error!(command = %command_type, %reason, "a command handler panicked");
-                    emitter.emit("CommandFailed", json!({ "type": command_type, "reason": reason }));
-                }
-            });
+            run(&door, def, &sender.hash, envelope.clone());
             correlation
         }
     };
     Ok(created(&envelope.id, &answered))
+}
+
+/// The emitter of `sender`'s command `envelope`: its correlation, its key, and what completes it.
+fn emitter_for(door: &Shared, def: &CommandDef, sender: &str, envelope: &Envelope) -> Emitter {
+    door.emitter(&envelope.effective_correlation())
+        .with_key(&command_key(sender, &envelope.id))
+        .with_completes(&def.completes)
+}
+
+/// Runs the handler of an accepted command on its own task. A handler that panics leaves a `CommandFailed`, never
+/// silence.
+fn run(door: &Shared, def: &CommandDef, sender: &str, envelope: Envelope) {
+    let emitter = emitter_for(door, def, sender, &envelope);
+    let command_type = envelope.r#type.clone();
+    let handler = (def.handler)(envelope, emitter.clone());
+    tokio::spawn(async move {
+        if let Err(panic) = std::panic::AssertUnwindSafe(handler).catch_unwind().await {
+            let reason = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "the handler panicked".into());
+            tracing::error!(command = %command_type, %reason, "a command handler panicked");
+            emitter.emit("CommandFailed", json!({ "type": command_type, "reason": reason }));
+        }
+    });
+}
+
+/// What a restart owes: every command accepted with a `201` that no completing event was told for is run again,
+/// through its admit check as if it had just arrived; one the door can no longer honour is failed with the reason.
+/// Run once, after the peer's state is rebuilt and before the door opens.
+pub async fn resume(door: &Shared) {
+    for owed in door.log.unfinished() {
+        let envelope = owed.envelope;
+        let fail = |reason: String| {
+            door.emitter(&envelope.effective_correlation())
+                .with_key(&command_key(&owed.sender, &envelope.id))
+                .emit("CommandFailed", json!({ "type": envelope.r#type, "reason": reason }));
+        };
+        // The stored command is believed only when it still matches its record and the catalogue of today.
+        if door.log.hash_of(&owed.sender, &envelope.id) != Some(payload_hash(&envelope)) {
+            fail("the command was accepted before a restart and its stored copy no longer matches its record".into());
+            continue;
+        }
+        let Some(def) = door.catalogue.command_by_type(&envelope.r#type) else {
+            fail("the command was accepted before a restart and its type is no longer offered".into());
+            continue;
+        };
+        if let Err(refusal) = door.catalogue.validate_data(&envelope.r#type, &envelope.data) {
+            fail(format!(
+                "the command was accepted before a restart and no longer passes its schema: {}",
+                refusal.message
+            ));
+            continue;
+        }
+        if let Some(admit) = &def.admit {
+            if let Err(refusal) = admit(envelope.clone(), command_key(&owed.sender, &envelope.id)).await {
+                emitter_for(door, def, &owed.sender, &envelope).emit(
+                    "CommandFailed",
+                    json!({ "type": envelope.r#type, "reason": format!("accepted before a restart and refused now: {}", refusal.message), "details": refusal.details }),
+                );
+                continue;
+            }
+        }
+        tracing::info!(command = %envelope.r#type, id = %envelope.id, "running a command accepted before the restart");
+        run(door, def, &owed.sender, envelope);
+    }
+}
+
+/// What makes two commands the same command: the type and the data, hashed.
+pub fn payload_hash(envelope: &Envelope) -> String {
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&json!({ "type": envelope.r#type, "data": envelope.data })).expect("json"),
+    ))
 }
 
 /// The key a handler files a command's own state under: the sender and the envelope id, which together are unique.
@@ -521,7 +581,25 @@ mod tests {
         ADMITTED.lock().unwrap().iter().filter(|i| *i == image).count()
     }
 
+    /// The `stall:` images that already died once; the second run of each completes.
+    static STALLED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Whether this image's command dies now: the first time, yes.
+    fn stalls(image: &str) -> bool {
+        let mut stalled = STALLED.lock().unwrap();
+        if image.starts_with("stall:") && !stalled.iter().any(|i| i == image) {
+            stalled.push(image.into());
+            return true;
+        }
+        false
+    }
+
     fn door() -> Shared {
+        door_over(Arc::new(EventLog::ephemeral()))
+    }
+
+    /// A door over a log that may hold a previous door's commands and events.
+    fn door_over(log: Arc<EventLog>) -> Shared {
         let catalogue = Catalogue::new()
             .command(CommandDef {
                 schema: "pull-image".into(),
@@ -530,6 +608,7 @@ mod tests {
                 description: "Makes an image present on the peer.".into(),
                 data_schema: json!({ "type": "object", "required": ["image"], "properties": { "image": { "type": "string", "minLength": 1 } }, "additionalProperties": false }),
                 produces: vec!["ImagePulled".into()],
+                completes: vec!["ImagePulled".into()],
                 impact: None,
                 admit: Some(Arc::new(|cmd, key| {
                     Box::pin(async move {
@@ -554,6 +633,10 @@ mod tests {
                         if cmd.data["image"] == "panic:1" {
                             panic!("the engine exploded");
                         }
+                        // The peer dies here: nothing completes it, and a restart owes it.
+                        if stalls(cmd.data["image"].as_str().unwrap_or("")) {
+                            return;
+                        }
                         emitter.emit("ImagePulled", json!({ "image": cmd.data["image"] }));
                     })
                 }),
@@ -574,14 +657,7 @@ mod tests {
                 handler: Arc::new(|p| Box::pin(async move { Ok(json!({ "name": "peer", "echo": p.get("x") })) })),
             });
         let auth = Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() })));
-        Arc::new(Door::new(
-            EP,
-            "io.best.agents",
-            "A test peer.",
-            catalogue,
-            Arc::new(EventLog::ephemeral()),
-            auth,
-        ))
+        Arc::new(Door::new(EP, "io.best.agents", "A test peer.", catalogue, log, auth))
     }
 
     async fn call(app: &Router, req: Request) -> (StatusCode, HeaderMap, Value) {
@@ -876,6 +952,103 @@ mod tests {
             "a retry of an accepted command is answered without the state check"
         );
         assert_eq!(d.log.len(), 1, "and runs no second handler");
+    }
+
+    #[tokio::test]
+    async fn a_command_accepted_before_a_restart_is_run_after_it_and_a_finished_one_is_not() {
+        let d = door();
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        for (id, image) in [("done-1", "small:9"), ("owed-1", "stall:1")] {
+            let (s, _, b) = call(
+                &app,
+                post_json("/commands", &key, "application/json", command(id, json!(image))),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+        }
+        settle(&d, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(d.log.len(), 1, "one completed, the stalled one told nothing");
+        assert_eq!(d.log.unfinished().len(), 1);
+        // The peer restarts over the same log.
+        let again = door_over(d.log.clone());
+        resume(&again).await;
+        settle(&again, 2).await;
+        let (events, _) = again.log.list(&Filter::default());
+        let of = |corr: &str| {
+            events
+                .iter()
+                .filter(|e| e.correlationid.as_deref() == Some(corr))
+                .map(|e| e.r#type.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            of("owed-1"),
+            vec!["ImagePulled"],
+            "the stalled command ran again and completed"
+        );
+        assert_eq!(of("done-1"), vec!["ImagePulled"], "the finished one was not run again");
+        assert!(again.log.unfinished().is_empty(), "{:?}", again.log.unfinished().len());
+        // Resuming again owes nothing.
+        resume(&again).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(again.log.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_command_the_door_cannot_honour_after_a_restart_is_failed_with_the_reason() {
+        let d = door();
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        // Accepted on the old state; the handler died before completing it.
+        let (s, _, _) = call(
+            &app,
+            post_json(
+                "/commands",
+                &key,
+                "application/json",
+                command("owed-3", json!("stall:2")),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Make the command one the admit check refuses now, as a device full since would.
+        let mut owed = d.log.unfinished();
+        assert_eq!(owed.len(), 1);
+        owed[0].envelope.data["image"] = json!("full:2");
+        let again = door_over(Arc::new(EventLog::ephemeral()));
+        again.log.accept_command(
+            "x",
+            "owed-3",
+            &payload_hash(&owed[0].envelope),
+            "owed-3",
+            &owed[0].envelope,
+        );
+        // And one whose stored copy was edited after acceptance: it no longer matches its record.
+        let mut tampered = owed[0].envelope.clone();
+        tampered.id = "owed-4".into();
+        again
+            .log
+            .accept_command("x", "owed-4", "the-hash-of-something-else", "owed-4", &tampered);
+        resume(&again).await;
+        settle(&again, 2).await;
+        let (events, _) = again.log.list(&Filter::default());
+        let reason = |corr: &str| {
+            events
+                .iter()
+                .find(|e| e.correlationid.as_deref() == Some(corr))
+                .map(|e| (e.r#type.clone(), e.data["reason"].as_str().unwrap_or("").to_string()))
+                .unwrap()
+        };
+        let (t, r) = reason("owed-3");
+        assert_eq!(t, "CommandFailed");
+        assert!(r.contains("no space"), "{r}");
+        let (t, r) = reason("owed-4");
+        assert_eq!(t, "CommandFailed");
+        assert!(r.contains("no longer matches its record"), "{r}");
+        assert!(again.log.unfinished().is_empty(), "a failed command is finished");
     }
 
     #[tokio::test]

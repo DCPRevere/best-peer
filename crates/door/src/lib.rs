@@ -21,8 +21,8 @@ pub use auth::{Approver, Auth, FakeApprover, LocalApprover};
 pub use catalogue::{AdmitHook, Catalogue, CommandDef, Emitter, EventDef, QueryDef};
 pub use envelope::Envelope;
 pub use error::BestError;
-pub use log::{Accept, EventLog, Filter, Stored};
-pub use router::router;
+pub use log::{Accept, EventLog, Filter, Stored, Unfinished};
+pub use router::{payload_hash, resume, router};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,6 +46,8 @@ pub struct Door {
     /// Commands between their duplicate check and their record, by sender and id: a second copy of one in flight
     /// is the same command, answered as such, never admitted twice.
     pub inflight: std::sync::Mutex<HashMap<(String, String), (String, String)>>,
+    /// Command type to the event types that complete it.
+    pub completions: Arc<HashMap<String, std::collections::HashSet<String>>>,
 }
 
 impl Door {
@@ -59,6 +61,7 @@ impl Door {
     ) -> Self {
         let endpoint = endpoint.trim_end_matches('/').to_string();
         let event_dataschemas = Arc::new(catalogue.event_dataschemas(&endpoint));
+        let completions = Arc::new(catalogue.completions());
         Self {
             endpoint,
             service: service.into(),
@@ -68,6 +71,7 @@ impl Door {
             auth,
             event_dataschemas,
             inflight: std::sync::Mutex::new(HashMap::new()),
+            completions,
         }
     }
 
@@ -84,5 +88,6 @@ impl Door {
             correlation,
             self.event_dataschemas.clone(),
         )
+        .with_completions(self.completions.clone())
     }
 }

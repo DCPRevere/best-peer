@@ -2,7 +2,7 @@
 //! agent can act on, and the handler the peer plugs in. The catalogue is the source of every `dataschema`; a caller's
 //! `dataschema` is never fetched (SPEC.md, Ingestion Semantics).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -22,6 +22,11 @@ pub struct Emitter {
     /// The command's own key, the sender and the envelope id: what a handler files its own state under, since the
     /// correlation id is the client's and may be shared across commands.
     key: String,
+    /// The event types that complete the command; telling one marks the command finished in the log.
+    completes: Arc<HashSet<String>>,
+    /// Command type to the event types that complete it, for an emitter that speaks for no command of its own
+    /// (a fact the engine told later): it finishes whatever command with its correlation the fact completes.
+    completions: Arc<HashMap<String, HashSet<String>>>,
     dataschemas: Arc<HashMap<String, String>>,
 }
 
@@ -32,12 +37,24 @@ impl Emitter {
             source: source.into(),
             correlation: correlation.into(),
             key: String::new(),
+            completes: Arc::new(HashSet::new()),
+            completions: Arc::new(HashMap::new()),
             dataschemas,
         }
     }
 
+    pub fn with_completions(mut self, completions: Arc<HashMap<String, HashSet<String>>>) -> Self {
+        self.completions = completions;
+        self
+    }
+
     pub fn with_key(mut self, key: &str) -> Self {
         self.key = key.into();
+        self
+    }
+
+    pub fn with_completes(mut self, completes: &[String]) -> Self {
+        self.completes = Arc::new(completes.iter().cloned().collect());
         self
     }
 
@@ -46,12 +63,37 @@ impl Emitter {
     }
 
     /// Appends an event of `r#type` with `data`. A type the catalogue declares gets its `dataschema`; another is
-    /// untyped, which the spec allows.
+    /// untyped, which the spec allows. A type that completes the command (one of its `completes`, or the door's
+    /// own `CommandFailed`) marks the command finished, so a restart does not run it again.
     pub fn emit(&self, r#type: &str, data: Value) -> Envelope {
         let dataschema = self.dataschemas.get(r#type).cloned();
         let event = Envelope::event(&self.source, r#type, data, Some(self.correlation.clone()), dataschema);
         self.log.append(event.clone());
+        if !self.key.is_empty() && (r#type == "CommandFailed" || self.completes.contains(r#type)) {
+            if let Some((sender, id)) = self.key.split_once(':') {
+                self.log.finish_command(sender, id);
+            }
+        }
         event
+    }
+
+    /// Records that this emitter's command made the workload `workload`, so a fact about it told later, by an
+    /// emitter that speaks for no command, can complete the command.
+    pub fn bind_workload(&self, workload: &str) {
+        if let Some((sender, id)) = self.key.split_once(':') {
+            self.log.bind_workload(sender, id, workload);
+        }
+    }
+
+    /// For an emitter that speaks for no command: the fact just told about `workload` completes the command that
+    /// made it when that command's type lists the fact's type among its `completes`.
+    pub fn completes_workload(&self, workload: &str, r#type: &str) {
+        if !self.key.is_empty() {
+            return;
+        }
+        self.log.finish_by_workload(workload, |command_type| {
+            self.completions.get(command_type).is_some_and(|c| c.contains(r#type))
+        });
     }
 
     pub fn correlation(&self) -> &str {
@@ -86,6 +128,9 @@ pub struct CommandDef {
     pub data_schema: Value,
     /// PascalCase event types this command can raise, failures included.
     pub produces: Vec<String>,
+    /// The subset of `produces` that completes the command: once one of these is told, nothing more follows for
+    /// it and a consumer stops waiting. The others are progress. `CommandFailed` completes any command.
+    pub completes: Vec<String>,
     /// The spec's high-impact annotation, when the command deserves one.
     pub impact: Option<Value>,
     /// The state-dependent check, when the command has one.
@@ -136,6 +181,12 @@ impl Catalogue {
     pub fn command(mut self, def: CommandDef) -> Self {
         let validator = jsonschema::validator_for(&def.data_schema)
             .unwrap_or_else(|e| panic!("command {}/{}: data schema is not valid: {e}", def.schema, def.version));
+        if let Some(stray) = def.completes.iter().find(|c| !def.produces.contains(c)) {
+            panic!(
+                "command {}/{}: {stray} completes it but is not among what it produces",
+                def.schema, def.version
+            );
+        }
         self.commands.push(Compiled { def, validator });
         self
     }
@@ -214,6 +265,14 @@ impl Catalogue {
 
     pub fn event_by_schema(&self, schema: &str, version: &str) -> Option<&EventDef> {
         self.events.iter().find(|e| e.schema == schema && e.version == version)
+    }
+
+    /// Command type to the event types that complete it.
+    pub fn completions(&self) -> HashMap<String, HashSet<String>> {
+        self.commands
+            .iter()
+            .map(|c| (c.def.command_type.clone(), c.def.completes.iter().cloned().collect()))
+            .collect()
     }
 
     pub fn command_types(&self) -> Vec<&str> {
@@ -310,6 +369,9 @@ impl Catalogue {
         if !def.produces.is_empty() {
             o.insert("produces".into(), json!(def.produces));
         }
+        if !def.completes.is_empty() {
+            o.insert("completes".into(), json!(def.completes));
+        }
         if let Some(impact) = &def.impact {
             o.insert("impact".into(), impact.clone());
         }
@@ -392,6 +454,7 @@ mod tests {
                 "additionalProperties": false
             }),
             produces: vec!["ImagePulled".into(), "ImagePullFailed".into()],
+            completes: vec!["ImagePulled".into(), "ImagePullFailed".into()],
             impact: None,
             admit: None,
             handler: noop(),
@@ -424,7 +487,16 @@ mod tests {
         assert_eq!(doc["commandType"], "PullImage");
         assert_eq!(doc["$id"], entry["dataschema"]);
         assert_eq!(doc["produces"][1], "ImagePullFailed");
+        assert_eq!(doc["completes"], json!(["ImagePulled", "ImagePullFailed"]));
         assert_eq!(doc["required"][0], "image");
+    }
+
+    #[test]
+    #[should_panic(expected = "completes it but is not among what it produces")]
+    fn a_completion_the_command_does_not_produce_is_refused_at_startup() {
+        let mut d = pull_image();
+        d.completes = vec!["Elsewhere".into()];
+        let _ = Catalogue::new().command(d);
     }
 
     #[test]

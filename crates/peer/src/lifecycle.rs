@@ -68,6 +68,7 @@ pub struct Peer {
     pub log: Arc<EventLog>,
     service: String,
     dataschemas: Arc<HashMap<String, String>>,
+    completions: Arc<HashMap<String, std::collections::HashSet<String>>>,
     /// The host consumers reach the engines' published ports at: the door endpoint's host.
     host: String,
     /// The host the peer itself reaches the engines at: where the containers' ports are bound, on this machine.
@@ -77,6 +78,8 @@ pub struct Peer {
     pub state: Mutex<State>,
     /// Runtime events for containers the state did not know when they arrived, by container.
     unowned: Mutex<HashMap<ContainerId, RuntimeEvent>>,
+    /// The tasks that follow the engine, so a peer that stops stops hearing.
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Deserialize)]
@@ -138,12 +141,14 @@ impl Peer {
             log,
             service: service.into(),
             dataschemas: Arc::new(crate::domain::event_dataschemas(endpoint)),
+            completions: Arc::new(crate::domain::completions()),
             host: host_of(endpoint),
             engine_host: engine_host.into(),
             images,
             patience,
             state: Mutex::new(State::default()),
             unowned: Mutex::new(HashMap::new()),
+            tasks: Mutex::new(Vec::new()),
         }
     }
 
@@ -154,14 +159,14 @@ impl Peer {
             let mut state = self.state.lock().unwrap();
             self.log.replay(|e| state.apply(e));
         }
-        self.reconcile().await;
+        self.reconcile(true).await;
     }
 
     /// Squares the state with what the engine runs: a workload whose container is gone ended while nobody watched,
-    /// and is told so now; a deployment still starting cannot be trusted to finish, and is failed; a container the
-    /// peer started but never told (it died in between) is stopped. Also run on a timer and when the event feed
-    /// fell behind.
-    pub async fn reconcile(&self) {
+    /// and is told so now; a container the peer started but never told (it died in between) is stopped. After a
+    /// restart (`restarted`), a deployment still starting has no handler left to finish it, and is failed; on the
+    /// timer and after a lag it is left to its handler.
+    pub async fn reconcile(&self, restarted: bool) {
         let running = match self.runtime.running().await {
             Ok(r) => r,
             Err(e) => {
@@ -181,6 +186,7 @@ impl Peer {
             let alive = running.contains(&d.container);
             match (alive, d.phase) {
                 (true, Phase::Ready) | (true, Phase::Ending) => {}
+                (true, Phase::Starting) if !restarted => {}
                 (true, Phase::Starting) => {
                     self.fail_deployment(
                         &em,
@@ -192,7 +198,7 @@ impl Peer {
                     )
                     .await
                 }
-                (false, _) => {
+                (false, phase) => {
                     if !self.claim_deployment(&d.id) {
                         continue;
                     }
@@ -202,11 +208,19 @@ impl Peer {
                         self.engine.unload(d.engine, &self.engine_base(d.port), &d.model),
                     )
                     .await;
-                    self.tell(
-                        &em,
-                        "DeploymentEnded",
-                        json!({ "deployment": d.id, "model": d.model, "exit_code": null, "reason": "the container is not running; its exit was not observed" }),
-                    );
+                    if phase == Phase::Starting {
+                        self.tell(
+                            &em,
+                            "DeploymentFailed",
+                            json!({ "deployment": d.id, "model": d.model, "reason": "the container is not running and the deployment was not ready; its exit was not observed", "fix": "deploy it again" }),
+                        );
+                    } else {
+                        self.tell(
+                            &em,
+                            "DeploymentEnded",
+                            json!({ "deployment": d.id, "model": d.model, "exit_code": null, "reason": "the container is not running; its exit was not observed" }),
+                        );
+                    }
                 }
             }
         }
@@ -239,7 +253,7 @@ impl Peer {
     /// of the command it belongs to, and squares the state with the engine on a timer.
     pub fn follow(self: &Arc<Self>, mut rx: broadcast::Receiver<RuntimeEvent>) {
         let me = self.clone();
-        tokio::spawn(async move {
+        let listening = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(e) => me.on_runtime(e).await,
@@ -248,28 +262,43 @@ impl Peer {
                             missed = n,
                             "the engine's events outran the peer; squaring with the engine"
                         );
-                        me.reconcile().await;
+                        me.reconcile(false).await;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
         let me = self.clone();
-        tokio::spawn(async move {
+        let squaring = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(RECONCILE_EVERY).await;
-                me.reconcile().await;
+                me.reconcile(false).await;
             }
         });
+        self.tasks.lock().unwrap().extend([listening, squaring]);
+    }
+
+    /// Stops following the engine: what happens after this is told by the next peer over the same log.
+    pub fn halt(&self) {
+        for t in self.tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
     }
 
     pub fn emitter(&self, correlation: &str) -> Emitter {
         Emitter::new(self.log.clone(), &self.service, correlation, self.dataschemas.clone())
+            .with_completions(self.completions.clone())
     }
 
-    /// Tells a fact: appended to the log, then folded into the state. Never called with the state locked.
+    /// Tells a fact: appended to the log, then folded into the state. A fact about a workload, told by an emitter
+    /// that speaks for no command, completes the command that made the workload when its type says so. Never
+    /// called with the state locked.
     fn tell(&self, em: &Emitter, r#type: &str, data: Value) -> Envelope {
+        let workload = data["deployment"].as_str().or(data["job"].as_str()).map(str::to_string);
         let e = em.emit(r#type, data);
+        if let Some(w) = workload {
+            em.completes_workload(&w, r#type);
+        }
         self.state.lock().unwrap().apply(&e);
         e
     }
@@ -415,6 +444,7 @@ impl Peer {
             "DeploymentStarted",
             json!({ "deployment": id, "model": data.model, "engine": data.engine, "device": device.0, "memory_bytes": data.memory_bytes, "container": started.id.0, "port": port }),
         );
+        em.bind_workload(&id);
         self.replay_unowned(&started.id).await;
         let base = self.engine_base(port);
         let loading: best_peer_engine::Progress = {
@@ -563,6 +593,14 @@ impl Peer {
         }
         match self.runtime.stop(&d.container).await {
             Ok(()) | Err(RuntimeError::NoSuchContainer(_)) => {
+                if d.endpoint.is_none() {
+                    // Undeployed before it was ready: the deploy's outcome is that it did not get there.
+                    self.tell(
+                        &self.emitter(&d.correlation),
+                        "DeploymentFailed",
+                        json!({ "deployment": id, "model": d.model, "reason": "undeployed before the deployment was ready", "fix": "deploy it again if it is still wanted" }),
+                    );
+                }
                 self.tell(&em, "Undeployed", json!({ "deployment": id, "model": d.model }));
             }
             Err(e) => {
@@ -665,6 +703,7 @@ impl Peer {
                     "JobStarted",
                     json!({ "job": id, "image": data.image, "device": reservation.device.as_ref().map(|d| d.0.clone()), "memory_bytes": reservation.memory_bytes, "container": started.id.0 }),
                 );
+                em.bind_workload(&id);
                 self.replay_unowned(&started.id).await;
             }
             Err(e) => fail(e.to_string(), fix_for_runtime(&e)),

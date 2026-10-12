@@ -72,6 +72,27 @@ correlation id. `run-job` runs an image once and tells `JobStarted` and `JobFini
 The peer's state is the fold of the events it told. After a restart it is rebuilt from the log and squared with what
 the engine still runs; a workload that ended while the peer was down is told so then.
 
+## Commands over time
+
+Every command of this peer follows one pattern, and nothing else is needed to drive it:
+
+1. `POST /commands` answers `201` with the correlation id, once the command passed its schema and the peer's
+   current state (a deploy no device has the memory for is refused here, not failed later). From that moment the
+   command ends in a completing event, through a restart if need be: a command accepted and not yet run when the
+   peer stops is run when it starts again, through the same state check, or failed with a `CommandFailed` that
+   says why; one whose workload had already started and did not survive the restart is failed with the fix.
+2. Everything that happens is an event carrying that correlation id, in the order it happened. The command's
+   schema document lists what it `produces` and, among those, what `completes` it: the events after which the
+   command's outcome is known (`DeploymentReady` or `DeploymentFailed` for a deploy, `JobStarted` or `JobFailed`
+   for a job), so a consumer stops waiting for the command and a restart does not run it again; the others are
+   progress on the way (`ImagePulling`, `WeightsLoading`, with `progress_pct` where the engine says).
+   `CommandFailed` completes any command.
+3. What the command made then has a life of its own, told under the same correlation id (`JobFinished` with the
+   exit code, `OutOfMemory`, `DeploymentEnded`), so one filter follows it from the first event to the last.
+4. A consumer that was not listening catches up with `GET /events?correlationId=...`, following `nextCursor` to
+   the end, and follows from there with `GET /events/stream` and `Last-Event-ID`. There is no other channel for
+   progress or outcome, and nothing to poll.
+
 ## Sign in
 
 An agent signs a person in the way every BEST service is signed in to: it reads the manifest, posts to
