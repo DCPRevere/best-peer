@@ -1,0 +1,280 @@
+//! The peer's own state: what is deployed and what runs, folded from the events the peer told. Every fact passes
+//! through [`State::apply`], live and on replay, so the state after a restart is the state the log says.
+
+use std::collections::{BTreeMap, HashMap};
+
+use best_peer_door::Envelope;
+use best_peer_engine::Kind;
+use best_peer_gpu::{Compute, DeviceId};
+use best_peer_runtime::{ContainerId, ImageRef};
+use serde_json::Value;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// The container runs; the engine is not yet serving the model.
+    Starting,
+    /// The endpoint answers.
+    Ready,
+    /// An undeploy or a failure is ending it; its exit is expected and is not an ending of its own.
+    Ending,
+}
+
+#[derive(Clone, Debug)]
+pub struct Deployment {
+    pub id: String,
+    pub model: String,
+    pub engine: Kind,
+    pub device: DeviceId,
+    pub memory_bytes: u64,
+    pub container: ContainerId,
+    /// The host port the engine is reached at.
+    pub port: u16,
+    pub endpoint: Option<String>,
+    /// The correlation id of the command that deployed it: what every later fact about it carries.
+    pub correlation: String,
+    pub phase: Phase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobPhase {
+    Running,
+    /// A stop is in progress; the exit is expected.
+    Stopping,
+}
+
+#[derive(Clone, Debug)]
+pub struct Job {
+    pub id: String,
+    pub image: ImageRef,
+    pub device: Option<DeviceId>,
+    pub memory_bytes: u64,
+    pub container: ContainerId,
+    pub correlation: String,
+    pub phase: JobPhase,
+}
+
+/// What an admitted command was given before its handler told the first fact: its id, and the device and memory
+/// promised to it. Promised memory counts against the device until the deployment or job ends.
+#[derive(Clone, Debug)]
+pub struct Reservation {
+    pub id: String,
+    pub device: Option<DeviceId>,
+    pub compute: Option<Compute>,
+    pub memory_bytes: u64,
+}
+
+/// What a container belongs to.
+#[derive(Clone, Debug)]
+pub enum Owner {
+    Deployment(Deployment),
+    Job(String),
+}
+
+#[derive(Default)]
+pub struct State {
+    pub deployments: BTreeMap<String, Deployment>,
+    pub jobs: BTreeMap<String, Job>,
+    /// Admitted and not yet started, by the command's own key (the sender and the envelope id), never by a
+    /// correlation id a client may share across commands.
+    pub reserved: HashMap<String, Reservation>,
+}
+
+impl State {
+    /// Memory on `device` promised to what is admitted, starting or running there.
+    pub fn reserved_on(&self, device: &DeviceId) -> u64 {
+        let deployments = self
+            .deployments
+            .values()
+            .filter(|d| &d.device == device)
+            .map(|d| d.memory_bytes);
+        let jobs = self
+            .jobs
+            .values()
+            .filter(|j| j.device.as_ref() == Some(device))
+            .map(|j| j.memory_bytes);
+        let admitted = self
+            .reserved
+            .values()
+            .filter(|r| r.device.as_ref() == Some(device))
+            .map(|r| r.memory_bytes);
+        deployments.chain(jobs).chain(admitted).sum()
+    }
+
+    /// What holds memory on `device`, for a refusal that says what to undeploy.
+    pub fn holders_on(&self, device: &DeviceId) -> Vec<Value> {
+        let mut holders: Vec<Value> = self
+            .deployments
+            .values()
+            .filter(|d| &d.device == device)
+            .map(|d| serde_json::json!({ "deployment": d.id, "model": d.model, "memory_bytes": d.memory_bytes }))
+            .collect();
+        holders.extend(
+            self.jobs
+                .values()
+                .filter(|j| j.device.as_ref() == Some(device))
+                .map(|j| serde_json::json!({ "job": j.id, "image": j.image.0, "memory_bytes": j.memory_bytes })),
+        );
+        holders
+    }
+
+    pub fn by_container(&self, id: &ContainerId) -> Option<Owner> {
+        if let Some(d) = self.deployments.values().find(|d| &d.container == id) {
+            return Some(Owner::Deployment(d.clone()));
+        }
+        self.jobs
+            .values()
+            .find(|j| &j.container == id)
+            .map(|j| Owner::Job(j.id.clone()))
+    }
+
+    /// The reservation that became, or would have become, the workload `id` is released.
+    fn release(&mut self, id: &str) {
+        self.reserved.retain(|_, r| r.id != id);
+    }
+
+    /// Folds one fact in. An event about a deployment or job this state does not know is a fact about something
+    /// that ended before the log was rebuilt, or about nothing: it changes nothing.
+    pub fn apply(&mut self, e: &Envelope) {
+        let data = &e.data;
+        let text = |k: &str| data[k].as_str().unwrap_or_default().to_string();
+        let correlation = e.effective_correlation();
+        match e.r#type.as_str() {
+            "DeploymentStarted" => {
+                let engine: Kind = match serde_json::from_value(data["engine"].clone()) {
+                    Ok(k) => k,
+                    Err(_) => return,
+                };
+                let id = text("deployment");
+                self.release(&id);
+                self.deployments.insert(
+                    id.clone(),
+                    Deployment {
+                        id,
+                        model: text("model"),
+                        engine,
+                        device: DeviceId(text("device")),
+                        memory_bytes: data["memory_bytes"].as_u64().unwrap_or(0),
+                        container: ContainerId(text("container")),
+                        port: data["port"].as_u64().unwrap_or(0) as u16,
+                        endpoint: None,
+                        correlation,
+                        phase: Phase::Starting,
+                    },
+                );
+            }
+            "DeploymentReady" => {
+                if let Some(d) = self.deployments.get_mut(&text("deployment")) {
+                    d.endpoint = data["endpoint"].as_str().map(str::to_string);
+                    d.phase = Phase::Ready;
+                }
+            }
+            "DeploymentFailed" | "DeploymentEnded" | "Undeployed" | "OutOfMemory" => {
+                let id = text("deployment");
+                self.release(&id);
+                self.deployments.remove(&id);
+            }
+            "JobStarted" => {
+                let id = text("job");
+                self.release(&id);
+                self.jobs.insert(
+                    id.clone(),
+                    Job {
+                        id,
+                        image: ImageRef(text("image")),
+                        device: data["device"].as_str().map(|d| DeviceId(d.into())),
+                        memory_bytes: data["memory_bytes"].as_u64().unwrap_or(0),
+                        container: ContainerId(text("container")),
+                        correlation,
+                        phase: JobPhase::Running,
+                    },
+                );
+            }
+            "JobFinished" | "JobFailed" | "JobStopped" => {
+                let id = text("job");
+                self.release(&id);
+                self.jobs.remove(&id);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ev(r#type: &str, corr: &str, data: Value) -> Envelope {
+        Envelope::event("io.best.agents", r#type, data, Some(corr.into()), None)
+    }
+
+    fn reserve(s: &mut State, key: &str, id: &str, bytes: u64) {
+        s.reserved.insert(
+            key.into(),
+            Reservation {
+                id: id.into(),
+                device: Some("gpu-0".into()),
+                compute: Some(Compute::Cuda("12".into())),
+                memory_bytes: bytes,
+            },
+        );
+    }
+
+    #[test]
+    fn the_state_is_the_fold_of_the_facts_and_memory_is_promised_until_the_end() {
+        let mut s = State::default();
+        reserve(&mut s, "alice:cmd-1", "dep-1", 8);
+        assert_eq!(s.reserved_on(&"gpu-0".into()), 8, "admitted memory is promised");
+        s.apply(&ev(
+            "DeploymentStarted",
+            "c1",
+            json!({ "deployment": "dep-1", "model": "m", "engine": "ollama", "device": "gpu-0", "memory_bytes": 8, "container": "k-1", "port": 41434 }),
+        ));
+        assert!(s.reserved.is_empty(), "the reservation became the deployment");
+        assert_eq!(s.deployments["dep-1"].phase, Phase::Starting);
+        assert_eq!(s.deployments["dep-1"].port, 41434);
+        assert_eq!(s.reserved_on(&"gpu-0".into()), 8);
+        s.apply(&ev(
+            "DeploymentReady",
+            "c1",
+            json!({ "deployment": "dep-1", "endpoint": "http://h:41434/v1" }),
+        ));
+        assert_eq!(s.deployments["dep-1"].phase, Phase::Ready);
+        assert_eq!(s.deployments["dep-1"].endpoint.as_deref(), Some("http://h:41434/v1"));
+        assert!(matches!(s.by_container(&ContainerId("k-1".into())), Some(Owner::Deployment(d)) if d.id == "dep-1"));
+        s.apply(&ev(
+            "JobStarted",
+            "c2",
+            json!({ "job": "job-1", "image": "busybox", "device": "gpu-0", "memory_bytes": 2, "container": "k-2" }),
+        ));
+        assert_eq!(s.reserved_on(&"gpu-0".into()), 10);
+        assert_eq!(s.holders_on(&"gpu-0".into()).len(), 2);
+        s.apply(&ev("JobFinished", "c2", json!({ "job": "job-1", "exit_code": 0 })));
+        s.apply(&ev("Undeployed", "c1", json!({ "deployment": "dep-1" })));
+        assert_eq!(s.reserved_on(&"gpu-0".into()), 0);
+        assert!(s.by_container(&ContainerId("k-1".into())).is_none());
+        s.apply(&ev("Undeployed", "c9", json!({ "deployment": "never" })));
+        assert!(s.deployments.is_empty() && s.jobs.is_empty());
+    }
+
+    #[test]
+    fn two_commands_sharing_a_correlation_id_keep_their_own_reservations() {
+        let mut s = State::default();
+        reserve(&mut s, "alice:cmd-1", "dep-1", 8);
+        reserve(&mut s, "alice:cmd-2", "dep-2", 4);
+        assert_eq!(s.reserved_on(&"gpu-0".into()), 12);
+        // Both commands carry the correlation "wf"; the first one's start releases only its own reservation.
+        s.apply(&ev(
+            "DeploymentStarted",
+            "wf",
+            json!({ "deployment": "dep-1", "model": "m", "engine": "ollama", "device": "gpu-0", "memory_bytes": 8, "container": "k-1", "port": 1 }),
+        ));
+        assert_eq!(s.reserved.len(), 1);
+        assert_eq!(s.reserved["alice:cmd-2"].id, "dep-2");
+        assert_eq!(s.reserved_on(&"gpu-0".into()), 12);
+        // A failure of the second before it started releases its promise and nothing else.
+        s.apply(&ev("DeploymentFailed", "wf", json!({ "deployment": "dep-2" })));
+        assert!(s.reserved.is_empty());
+        assert_eq!(s.reserved_on(&"gpu-0".into()), 8);
+    }
+}

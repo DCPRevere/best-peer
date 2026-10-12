@@ -17,9 +17,11 @@
   can act on; a refusal is a 400 that says what to do; sign-in is the spec's. Nothing is invented before the
   implementation proves the spec lacks it.
 - Facts are events; an event is versioned, never mutated; a redelivery is idempotent; nothing is clamped silently.
-- Low-level dependencies sit behind abstractions this workspace owns (`Gpu`, `Runtime`, later `Transport`); tests use
-  the fakes, never the dependency; an adapter is thin and is proven on a host by hand, with the proof on the slice's
-  issue. CI never needs a GPU.
+- Low-level dependencies sit behind abstractions this workspace owns (`Gpu`, `Runtime`, `Engine`, later
+  `Transport`); tests use the fakes, never the dependency; an adapter is thin and is proven on a host by hand, with the
+  proof on the slice's issue. CI runs on the fakes and never needs an engine or a GPU.
+- A command the peer cannot honour in its current state is refused at ingest, before it is accepted, with the reason
+  and the fix; a command that was accepted ends in a terminal event, never in silence.
 - The accelerator abstraction is vendor-neutral: a workload asks for a compute API and memory, never for a vendor.
 - The inference data path stays on the runtime's OpenAI-compatible endpoint; BEST carries the control path only.
 - Instructions and this file state the current rule, not its history; the history is in git.

@@ -1,0 +1,11 @@
+[package]
+name = "best-peer-host"
+description = "The host itself as an accelerator: a Gpu adapter that reports the machine's CPU and system memory as one device, so a peer with no accelerator still serves and the lifecycle can be proven on any machine. Thin; proven by hand, never unit-tested."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+best-peer-gpu = { path = "../gpu" }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }

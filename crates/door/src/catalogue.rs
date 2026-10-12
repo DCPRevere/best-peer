@@ -19,6 +19,9 @@ pub struct Emitter {
     log: Arc<EventLog>,
     source: String,
     correlation: String,
+    /// The command's own key, the sender and the envelope id: what a handler files its own state under, since the
+    /// correlation id is the client's and may be shared across commands.
+    key: String,
     dataschemas: Arc<HashMap<String, String>>,
 }
 
@@ -28,8 +31,18 @@ impl Emitter {
             log,
             source: source.into(),
             correlation: correlation.into(),
+            key: String::new(),
             dataschemas,
         }
+    }
+
+    pub fn with_key(mut self, key: &str) -> Self {
+        self.key = key.into();
+        self
+    }
+
+    pub fn command_key(&self) -> &str {
+        &self.key
     }
 
     /// Appends an event of `r#type` with `data`. A type the catalogue declares gets its `dataschema`; another is
@@ -50,6 +63,14 @@ impl Emitter {
 /// (SPEC.md: BEST defines no synchronous command response). A failure is an event too.
 pub type CommandHandler = Arc<dyn Fn(Envelope, Emitter) -> BoxFuture<'static, ()> + Send + Sync>;
 
+/// What a command may ask before it is accepted: a check against the door's current state, run after the schema
+/// and before the command is recorded, so a command the peer cannot honour now (no device has the memory, the thing
+/// it names does not exist) is refused with the reason and the fix instead of being accepted and failed later. A
+/// refused command was never accepted: its `id` is free for the corrected retry. The check may reserve what the
+/// handler will use, filed under the command's key (the second argument, the same the handler's emitter carries);
+/// the handler runs next, or never, if the peer dies in between.
+pub type AdmitHook = Arc<dyn Fn(Envelope, String) -> BoxFuture<'static, Result<(), BestError>> + Send + Sync>;
+
 /// A query handler answers now, from current state, with the result body or a refusal.
 pub type QueryHandler =
     Arc<dyn Fn(HashMap<String, String>) -> BoxFuture<'static, Result<Value, BestError>> + Send + Sync>;
@@ -67,6 +88,8 @@ pub struct CommandDef {
     pub produces: Vec<String>,
     /// The spec's high-impact annotation, when the command deserves one.
     pub impact: Option<Value>,
+    /// The state-dependent check, when the command has one.
+    pub admit: Option<AdmitHook>,
     pub handler: CommandHandler,
 }
 
@@ -370,6 +393,7 @@ mod tests {
             }),
             produces: vec!["ImagePulled".into(), "ImagePullFailed".into()],
             impact: None,
+            admit: None,
             handler: noop(),
         }
     }

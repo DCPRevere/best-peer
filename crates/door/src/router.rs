@@ -275,16 +275,43 @@ async fn ingest(
     let hash = hex::encode(Sha256::digest(
         serde_json::to_vec(&json!({ "type": envelope.r#type, "data": envelope.data })).expect("json"),
     ));
-    let answered = match door.log.accept_command(&sender.hash, &envelope.id, &hash, &correlation) {
-        Accept::Conflict => {
-            return Err(BestError::conflict(format!(
-                "id {} was already used for a different command: a new command needs a new id",
-                envelope.id
-            )))
+    let conflict = || {
+        BestError::conflict(format!(
+            "id {} was already used for a different command: a new command needs a new id",
+            envelope.id
+        ))
+    };
+    // A retry of an accepted command is answered as it was, before any state-dependent check: what was admitted
+    // once is not refused on the retry because of the state it caused. The same holds for a copy still in flight.
+    let key = (sender.hash.clone(), envelope.id.clone());
+    match door.log.known_command(&sender.hash, &envelope.id, &hash) {
+        Some(Accept::Conflict) => return Err(conflict()),
+        Some(Accept::Duplicate { correlation: original }) => return Ok(created(&envelope.id, &original)),
+        _ => {}
+    }
+    {
+        let mut inflight = door.inflight.lock().unwrap();
+        match inflight.get(&key) {
+            Some((h, original)) if *h == hash => return Ok(created(&envelope.id, original)),
+            Some(_) => return Err(conflict()),
+            None => inflight.insert(key.clone(), (hash.clone(), correlation.clone())),
+        };
+    }
+    if let Some(admit) = &def.admit {
+        if let Err(refusal) = admit(envelope.clone(), command_key(&sender.hash, &envelope.id)).await {
+            door.inflight.lock().unwrap().remove(&key);
+            return Err(refusal);
         }
+    }
+    let accepted = door.log.accept_command(&sender.hash, &envelope.id, &hash, &correlation);
+    door.inflight.lock().unwrap().remove(&key);
+    let answered = match accepted {
+        Accept::Conflict => return Err(conflict()),
         Accept::Duplicate { correlation: original } => original,
         Accept::New => {
-            let emitter = door.emitter(&correlation);
+            let emitter = door
+                .emitter(&correlation)
+                .with_key(&command_key(&sender.hash, &envelope.id));
             let handler = (def.handler)(envelope.clone(), emitter.clone());
             let command_type = envelope.r#type.clone();
             tokio::spawn(async move {
@@ -301,11 +328,20 @@ async fn ingest(
             correlation
         }
     };
-    Ok((
+    Ok(created(&envelope.id, &answered))
+}
+
+/// The key a handler files a command's own state under: the sender and the envelope id, which together are unique.
+fn command_key(sender: &str, id: &str) -> String {
+    format!("{sender}:{id}")
+}
+
+fn created(id: &str, correlation: &str) -> Response {
+    (
         StatusCode::CREATED,
-        Json(json!({ "id": envelope.id, "correlationId": answered })),
+        Json(json!({ "id": id, "correlationId": correlation })),
     )
-        .into_response())
+        .into_response()
 }
 
 // ----- events ------------------------------------------------------------------------------------------------------
@@ -477,6 +513,14 @@ mod tests {
 
     const EP: &str = "http://peer.test";
 
+    /// The images the test door's admit hook was asked about, across every test of this module; a test looks for
+    /// its own image, so the others' traffic does not count.
+    static ADMITTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn admitted(image: &str) -> usize {
+        ADMITTED.lock().unwrap().iter().filter(|i| *i == image).count()
+    }
+
     fn door() -> Shared {
         let catalogue = Catalogue::new()
             .command(CommandDef {
@@ -487,6 +531,24 @@ mod tests {
                 data_schema: json!({ "type": "object", "required": ["image"], "properties": { "image": { "type": "string", "minLength": 1 } }, "additionalProperties": false }),
                 produces: vec!["ImagePulled".into()],
                 impact: None,
+                admit: Some(Arc::new(|cmd, key| {
+                    Box::pin(async move {
+                        let image = cmd.data["image"].as_str().unwrap_or("").to_string();
+                        assert!(key.ends_with(&format!(":{}", cmd.id)), "the key ends with the envelope id");
+                        if image.starts_with("slow:") {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        ADMITTED.lock().unwrap().push(image.clone());
+                        if image.starts_with("full:") {
+                            return Err(BestError::bad_request(
+                                "NO_SPACE",
+                                "no space for the image: remove one with RemoveImage, or ask for a smaller one",
+                            )
+                            .with_details(json!({ "image": cmd.data["image"] })));
+                        }
+                        Ok(())
+                    })
+                })),
                 handler: Arc::new(|cmd, emitter| {
                     Box::pin(async move {
                         if cmd.data["image"] == "panic:1" {
@@ -768,6 +830,93 @@ mod tests {
         assert_eq!(s, StatusCode::CREATED);
         settle(&d, 2).await;
         assert_eq!(d.log.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_command_the_state_cannot_honour_is_refused_before_it_is_accepted_and_a_retry_is_not_rechecked() {
+        let d = door();
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        let (s, _, b) = call(
+            &app,
+            post_json("/commands", &key, "application/json", command("cmd-9", json!("full:1"))),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "NO_SPACE");
+        assert_eq!(b["error"]["details"]["image"], "full:1");
+        assert!(d.log.is_empty(), "a refused command runs no handler");
+        // The id was never accepted, so the corrected command may reuse it: no conflict.
+        let (s, _, b) = call(
+            &app,
+            post_json(
+                "/commands",
+                &key,
+                "application/json",
+                command("cmd-9", json!("small:1")),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        settle(&d, 1).await;
+        let (s, _, b) = call(
+            &app,
+            post_json(
+                "/commands",
+                &key,
+                "application/json",
+                command("cmd-9", json!("small:1")),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(
+            admitted("small:1"),
+            1,
+            "a retry of an accepted command is answered without the state check"
+        );
+        assert_eq!(d.log.len(), 1, "and runs no second handler");
+    }
+
+    #[tokio::test]
+    async fn two_copies_of_one_command_in_flight_are_one_command() {
+        let d = door();
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        let send = || {
+            call(
+                &app,
+                post_json("/commands", &key, "application/json", command("cmd-7", json!("slow:1"))),
+            )
+        };
+        let ((s1, _, b1), (s2, _, b2)) = tokio::join!(send(), send());
+        assert_eq!((s1, s2), (StatusCode::CREATED, StatusCode::CREATED), "{b1} {b2}");
+        assert_eq!(b1["correlationId"], b2["correlationId"]);
+        settle(&d, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(admitted("slow:1"), 1, "the state check ran once");
+        assert_eq!(d.log.len(), 1, "and one handler ran");
+        // A copy in flight with another payload is the conflict it would be once recorded.
+        let slow = call(
+            &app,
+            post_json("/commands", &key, "application/json", command("cmd-8", json!("slow:2"))),
+        );
+        let other = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            call(
+                &app,
+                post_json(
+                    "/commands",
+                    &key,
+                    "application/json",
+                    command("cmd-8", json!("other:2")),
+                ),
+            )
+            .await
+        };
+        let ((s1, _, _), (s2, _, b2)) = tokio::join!(slow, other);
+        assert_eq!(s1, StatusCode::CREATED);
+        assert_eq!(s2, StatusCode::CONFLICT, "{b2}");
     }
 
     #[tokio::test]

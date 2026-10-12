@@ -1,0 +1,18 @@
+[package]
+name = "best-peer-engine"
+description = "The inference engine abstraction of a BEST peer: which engines serve a model, what to run for each, and how a served model is made ready; ships the Fake tests run against."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+best-peer-gpu = { path = "../gpu" }
+best-peer-runtime = { path = "../runtime" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

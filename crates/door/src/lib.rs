@@ -18,10 +18,10 @@ pub mod manifest;
 pub mod router;
 
 pub use auth::{Approver, Auth, FakeApprover, LocalApprover};
-pub use catalogue::{Catalogue, CommandDef, Emitter, EventDef, QueryDef};
+pub use catalogue::{AdmitHook, Catalogue, CommandDef, Emitter, EventDef, QueryDef};
 pub use envelope::Envelope;
 pub use error::BestError;
-pub use log::{EventLog, Filter};
+pub use log::{Accept, EventLog, Filter, Stored};
 pub use router::router;
 
 use std::collections::HashMap;
@@ -43,6 +43,9 @@ pub struct Door {
     pub auth: Arc<Auth>,
     /// Event type → absolute dataschema URI, for every event the catalogue declares.
     pub event_dataschemas: Arc<HashMap<String, String>>,
+    /// Commands between their duplicate check and their record, by sender and id: a second copy of one in flight
+    /// is the same command, answered as such, never admitted twice.
+    pub inflight: std::sync::Mutex<HashMap<(String, String), (String, String)>>,
 }
 
 impl Door {
@@ -64,6 +67,7 @@ impl Door {
             log,
             auth,
             event_dataschemas,
+            inflight: std::sync::Mutex::new(HashMap::new()),
         }
     }
 

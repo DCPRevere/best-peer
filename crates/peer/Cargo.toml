@@ -12,15 +12,22 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.7"
+best-peer-docker = { path = "../docker" }
 best-peer-door = { path = "../door" }
+best-peer-engine = { path = "../engine" }
+best-peer-engine-http = { path = "../engine-http" }
 best-peer-gpu = { path = "../gpu" }
+best-peer-host = { path = "../host" }
+best-peer-native = { path = "../native" }
 best-peer-runtime = { path = "../runtime" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 time = { version = "0.3", features = ["formatting"] }
 tokio = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = "3"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

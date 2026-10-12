@@ -1,0 +1,12 @@
+[package]
+name = "best-peer-native"
+description = "The Runtime adapter for engines already running on the host, outside any container: a deploy binds to the engine's own port, nothing is pulled, and jobs need a container engine. Thin; proven on a host by hand, never unit-tested."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+best-peer-runtime = { path = "../runtime" }
+tokio = { workspace = true }

@@ -7,7 +7,7 @@
 //! and is proven on a host by hand, never unit-tested.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use best_peer_gpu::DeviceId;
@@ -15,11 +15,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 /// An image reference as the engine understands it (`ollama/ollama:0.6`, `vllm/vllm-openai:v0.8`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ImageRef(pub String);
 
 /// The engine's id for a running container.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ContainerId(pub String);
 
 /// What to run. Devices are handed over by [`DeviceId`]; how the engine exposes them (the NVIDIA toolkit's
@@ -41,13 +41,22 @@ pub struct Published {
     pub host: u16,
 }
 
-/// Every fact the engine can tell. The door turns these into BEST events on its stream, correlated to the command
-/// that caused them.
+/// What `start` answers: the container's id and the ports the engine published for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Started {
+    pub id: ContainerId,
+    pub ports: Vec<Published>,
+}
+
+/// What a long call tells while it runs: progress in percent, where the engine says. Called in order, before the
+/// call returns, so the caller tells each step as a fact before the outcome.
+pub type Progress = Arc<dyn Fn(Option<u8>) + Send + Sync>;
+
+/// Every fact the engine tells on its own, after a call returned. The door turns these into BEST events on its
+/// stream, correlated to the command that started the container.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Event {
-    ImagePulling { image: ImageRef, progress_pct: Option<u8> },
-    ImagePulled { image: ImageRef },
     Started { id: ContainerId, ports: Vec<Published> },
     Exited { id: ContainerId, code: i64 },
     OutOfMemory { id: ContainerId },
@@ -71,10 +80,10 @@ pub enum RuntimeError {
 /// What the door needs from a container engine.
 #[async_trait]
 pub trait Runtime: Send + Sync {
-    /// Makes the image present; emits `ImagePulling` progress and `ImagePulled`.
-    async fn pull(&self, image: &ImageRef) -> Result<(), RuntimeError>;
-    /// Creates and starts a container; emits `Started` with the published ports.
-    async fn start(&self, spec: Spec) -> Result<ContainerId, RuntimeError>;
+    /// Makes the image present, telling `progress` as it goes.
+    async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError>;
+    /// Creates and starts a container, answering its id and the published ports; emits `Started` too.
+    async fn start(&self, spec: Spec) -> Result<Started, RuntimeError>;
     /// Stops and removes a container; emits `Exited`.
     async fn stop(&self, id: &ContainerId) -> Result<(), RuntimeError>;
     /// The containers this engine runs for the peer.
@@ -90,6 +99,8 @@ pub trait Runtime: Send + Sync {
 pub struct Fake {
     local: Mutex<Vec<ImageRef>>,
     registry: Mutex<Vec<ImageRef>>,
+    /// A registry that serves every image, for a peer run on the fakes.
+    open_registry: bool,
     containers: Mutex<BTreeMap<ContainerId, Spec>>,
     devices: Vec<DeviceId>,
     next: Mutex<u32>,
@@ -103,6 +114,7 @@ impl Fake {
         Self {
             local: Mutex::new(local),
             registry: Mutex::new(Vec::new()),
+            open_registry: false,
             containers: Mutex::new(BTreeMap::new()),
             devices,
             next: Mutex::new(0),
@@ -113,6 +125,12 @@ impl Fake {
     /// Declares an image the registry serves, so a `pull` of it succeeds; it is not local until pulled.
     pub fn registry_has(&self, image: ImageRef) {
         self.registry.lock().unwrap().push(image);
+    }
+
+    /// A registry that serves every image: the peer's fake mode, where the whole surface works and nothing runs.
+    pub fn with_open_registry(mut self) -> Self {
+        self.open_registry = true;
+        self
     }
 
     /// Drives a running container out of memory, as the engine would report it.
@@ -147,23 +165,19 @@ impl Fake {
 
 #[async_trait]
 impl Runtime for Fake {
-    async fn pull(&self, image: &ImageRef) -> Result<(), RuntimeError> {
-        if !self.registry.lock().unwrap().contains(image) {
+    async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
+        if !self.open_registry && !self.registry.lock().unwrap().contains(image) {
             return Err(RuntimeError::ImageNotFound(image.0.clone()));
         }
-        let _ = self.tx.send(Event::ImagePulling {
-            image: image.clone(),
-            progress_pct: Some(50),
-        });
+        progress(Some(50));
         let mut local = self.local.lock().unwrap();
         if !local.contains(image) {
             local.push(image.clone());
         }
-        let _ = self.tx.send(Event::ImagePulled { image: image.clone() });
         Ok(())
     }
 
-    async fn start(&self, spec: Spec) -> Result<ContainerId, RuntimeError> {
+    async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {
         if !self.local.lock().unwrap().contains(&spec.image) {
             return Err(RuntimeError::ImageNotFound(spec.image.0.clone()));
         }
@@ -186,8 +200,11 @@ impl Runtime for Fake {
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.containers.lock().unwrap().insert(id.clone(), spec);
-        let _ = self.tx.send(Event::Started { id: id.clone(), ports });
-        Ok(id)
+        let _ = self.tx.send(Event::Started {
+            id: id.clone(),
+            ports: ports.clone(),
+        });
+        Ok(Started { id, ports })
     }
 
     async fn stop(&self, id: &ContainerId) -> Result<(), RuntimeError> {
@@ -237,7 +254,7 @@ mod tests {
         rt.registry_has(image.clone());
         let err = rt.start(spec("vllm/vllm-openai:v0.8", "gpu-0")).await.unwrap_err();
         assert!(matches!(err, RuntimeError::ImageNotFound(ref i) if i == "vllm/vllm-openai:v0.8"));
-        rt.pull(&image).await.unwrap();
+        rt.pull(&image, Arc::new(|_| {})).await.unwrap();
         rt.start(spec("vllm/vllm-openai:v0.8", "gpu-0")).await.unwrap();
     }
 
@@ -255,11 +272,27 @@ mod tests {
         let mut events = rt.events();
         let image = ImageRef("ollama/ollama:0.6".into());
         rt.registry_has(image.clone());
-        rt.pull(&image).await.unwrap();
-        let id = rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap();
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let sink = told.clone();
+        rt.pull(&image, Arc::new(move |pct| sink.lock().unwrap().push(pct)))
+            .await
+            .unwrap();
+        assert_eq!(
+            *told.lock().unwrap(),
+            vec![Some(50)],
+            "progress is told to the caller, in order"
+        );
+        let started = rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap();
+        let id = started.id.clone();
+        assert_eq!(
+            started.ports,
+            vec![Published {
+                container: 11434,
+                host: 41434
+            }],
+            "the answer carries the published ports"
+        );
         rt.stop(&id).await.unwrap();
-        assert!(matches!(events.recv().await.unwrap(), Event::ImagePulling { .. }));
-        assert!(matches!(events.recv().await.unwrap(), Event::ImagePulled { .. }));
         match events.recv().await.unwrap() {
             Event::Started { id: started, ports } => {
                 assert_eq!(started, id);
@@ -280,10 +313,15 @@ mod tests {
     #[tokio::test]
     async fn an_image_the_registry_lacks_is_refused_by_name() {
         let rt = fake();
-        let err = rt.pull(&ImageRef("nobody/nothing:1".into())).await.unwrap_err();
+        let err = rt
+            .pull(&ImageRef("nobody/nothing:1".into()), Arc::new(|_| {}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, RuntimeError::ImageNotFound(ref i) if i == "nobody/nothing:1"));
         rt.registry_has(ImageRef("nobody/nothing:1".into()));
-        rt.pull(&ImageRef("nobody/nothing:1".into())).await.unwrap();
+        rt.pull(&ImageRef("nobody/nothing:1".into()), Arc::new(|_| {}))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -297,8 +335,8 @@ mod tests {
     async fn out_of_memory_and_failure_are_events_and_end_the_container() {
         let rt = fake();
         let mut events = rt.events();
-        let a = rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap();
-        let b = rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap();
+        let a = rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap().id;
+        let b = rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap().id;
         rt.out_of_memory(&a).unwrap();
         rt.fail(&b, "exit 137").unwrap();
         let _ = events.recv().await.unwrap();

@@ -1,0 +1,1051 @@
+//! The model lifecycle over the three abstractions: a deploy is placed on a device with the memory it asks for,
+//! its image pulled, its container started, its engine made ready and its model loaded, each step a fact on the
+//! stream with the command's correlation id; a job is an image run once; an undeploy and a stop end them. Progress
+//! (a pull, the weights) is told to the handler as it happens and reaches the stream in order, before the outcome.
+//! What the engine does on its own (exits, runs out of memory, fails) is forwarded from the runtime's events, under
+//! the correlation id of the command that started the workload. The state is the fold of the facts, rebuilt from the
+//! log at start and squared with what the engine still runs, then and on a timer.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use best_peer_door::{BestError, Emitter, Envelope, EventLog};
+use best_peer_engine::{Engine, EngineError, Kind};
+use best_peer_gpu::{Compute, DeviceId, Gpu, Host};
+use best_peer_runtime::{ContainerId, Event as RuntimeEvent, Runtime, RuntimeError, Spec};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio::sync::broadcast;
+
+use crate::state::{JobPhase, Owner, Phase, Reservation, State};
+
+/// The operator's overrides for the engines' images (a pinned tag, a mirror); none means the engine's default.
+#[derive(Clone, Debug, Default)]
+pub struct Images {
+    pub ollama: Option<String>,
+    pub vllm: Option<String>,
+}
+
+impl Images {
+    fn for_engine(&self, kind: Kind) -> Option<&str> {
+        match kind {
+            Kind::Ollama => self.ollama.as_deref(),
+            Kind::Vllm => self.vllm.as_deref(),
+        }
+    }
+}
+
+/// How long the peer waits on an engine: to answer after its container started, to load a model, to unload one.
+#[derive(Clone, Copy, Debug)]
+pub struct Patience {
+    pub ready: Duration,
+    pub load: Duration,
+    pub unload: Duration,
+}
+
+impl Default for Patience {
+    fn default() -> Self {
+        Self {
+            ready: Duration::from_secs(900),
+            load: Duration::from_secs(3600),
+            unload: Duration::from_secs(30),
+        }
+    }
+}
+
+/// How often the state is squared with what the engine runs, for the exits the event feed may have missed.
+const RECONCILE_EVERY: Duration = Duration::from_secs(30);
+
+/// The most runtime events kept for containers the state does not know yet: a job can exit before its start is
+/// told, and its exit is replayed once it is.
+const MAX_UNOWNED: usize = 64;
+
+pub struct Peer {
+    pub gpu: Arc<dyn Gpu>,
+    pub runtime: Arc<dyn Runtime>,
+    pub engine: Arc<dyn Engine>,
+    pub log: Arc<EventLog>,
+    service: String,
+    dataschemas: Arc<HashMap<String, String>>,
+    /// The host consumers reach the engines' published ports at: the door endpoint's host.
+    host: String,
+    /// The host the peer itself reaches the engines at: where the containers' ports are bound, on this machine.
+    engine_host: String,
+    images: Images,
+    patience: Patience,
+    pub state: Mutex<State>,
+    /// Runtime events for containers the state did not know when they arrived, by container.
+    unowned: Mutex<HashMap<ContainerId, RuntimeEvent>>,
+}
+
+#[derive(Deserialize)]
+struct DeployData {
+    model: String,
+    engine: Kind,
+    memory_bytes: u64,
+    #[serde(default)]
+    device: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RunJobData {
+    image: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    memory_bytes: Option<u64>,
+    #[serde(default)]
+    device: Option<String>,
+}
+
+/// Where a deploy stands when it fails: before its start was told, with the container to stop if one was started
+/// anyway; or after, when the state holds it.
+enum Stage {
+    BeforeStart(Option<ContainerId>),
+    AfterStart,
+}
+
+/// The compute APIs any job may run on: a job names an image, not an engine, so any device will do.
+fn any_compute() -> Vec<Compute> {
+    vec![
+        Compute::Cuda("0".into()),
+        Compute::Rocm("0".into()),
+        Compute::OneApi("0".into()),
+        Compute::Metal,
+        Compute::Vulkan,
+        Compute::Cpu,
+    ]
+}
+
+impl Peer {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        endpoint: &str,
+        engine_host: &str,
+        service: &str,
+        gpu: Arc<dyn Gpu>,
+        runtime: Arc<dyn Runtime>,
+        engine: Arc<dyn Engine>,
+        log: Arc<EventLog>,
+        images: Images,
+        patience: Patience,
+    ) -> Self {
+        Self {
+            gpu,
+            runtime,
+            engine,
+            log,
+            service: service.into(),
+            dataschemas: Arc::new(crate::domain::event_dataschemas(endpoint)),
+            host: host_of(endpoint),
+            engine_host: engine_host.into(),
+            images,
+            patience,
+            state: Mutex::new(State::default()),
+            unowned: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Folds every fact the log holds into the state, then squares it with the engine. Run once, before the door
+    /// opens, with the runtime's events already subscribed so nothing told meanwhile is lost.
+    pub async fn rebuild(&self) {
+        {
+            let mut state = self.state.lock().unwrap();
+            self.log.replay(|e| state.apply(e));
+        }
+        self.reconcile().await;
+    }
+
+    /// Squares the state with what the engine runs: a workload whose container is gone ended while nobody watched,
+    /// and is told so now; a deployment still starting cannot be trusted to finish, and is failed; a container the
+    /// peer started but never told (it died in between) is stopped. Also run on a timer and when the event feed
+    /// fell behind.
+    pub async fn reconcile(&self) {
+        let running = match self.runtime.running().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "the engine could not be asked what runs: the state is the log's");
+                return;
+            }
+        };
+        let (deployments, jobs) = {
+            let s = self.state.lock().unwrap();
+            (
+                s.deployments.values().cloned().collect::<Vec<_>>(),
+                s.jobs.values().cloned().collect::<Vec<_>>(),
+            )
+        };
+        for d in &deployments {
+            let em = self.emitter(&d.correlation);
+            let alive = running.contains(&d.container);
+            match (alive, d.phase) {
+                (true, Phase::Ready) | (true, Phase::Ending) => {}
+                (true, Phase::Starting) => {
+                    self.fail_deployment(
+                        &em,
+                        &d.id,
+                        &d.model,
+                        "the peer restarted before the deployment was ready",
+                        "deploy it again",
+                        Stage::AfterStart,
+                    )
+                    .await
+                }
+                (false, _) => {
+                    if !self.claim_deployment(&d.id) {
+                        continue;
+                    }
+                    // The engine may still hold the model (an engine outside any container): ask it to let go.
+                    let _ = tokio::time::timeout(
+                        self.patience.unload,
+                        self.engine.unload(d.engine, &self.engine_base(d.port), &d.model),
+                    )
+                    .await;
+                    self.tell(
+                        &em,
+                        "DeploymentEnded",
+                        json!({ "deployment": d.id, "model": d.model, "exit_code": null, "reason": "the container is not running; its exit was not observed" }),
+                    );
+                }
+            }
+        }
+        for j in &jobs {
+            if !running.contains(&j.container) && self.job_running(&j.id) {
+                self.tell(
+                    &self.emitter(&j.correlation),
+                    "JobFailed",
+                    json!({ "job": j.id, "image": j.image.0, "reason": "the container is not running; its exit was not observed", "fix": "run it again" }),
+                );
+            }
+        }
+        let known: Vec<ContainerId> = deployments
+            .iter()
+            .map(|d| d.container.clone())
+            .chain(jobs.iter().map(|j| j.container.clone()))
+            .collect();
+        for orphan in running.iter().filter(|c| !known.contains(c)) {
+            if self.unowned.lock().unwrap().contains_key(orphan) {
+                continue;
+            }
+            tracing::warn!(container = %orphan.0, "a container of this peer that no workload claims is stopped");
+            if let Err(e) = self.runtime.stop(orphan).await {
+                tracing::warn!(container = %orphan.0, error = %e, "the orphan could not be stopped");
+            }
+        }
+    }
+
+    /// Follows the runtime's events for as long as the peer runs, telling each as a fact under the correlation id
+    /// of the command it belongs to, and squares the state with the engine on a timer.
+    pub fn follow(self: &Arc<Self>, mut rx: broadcast::Receiver<RuntimeEvent>) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(e) => me.on_runtime(e).await,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            missed = n,
+                            "the engine's events outran the peer; squaring with the engine"
+                        );
+                        me.reconcile().await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        let me = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(RECONCILE_EVERY).await;
+                me.reconcile().await;
+            }
+        });
+    }
+
+    pub fn emitter(&self, correlation: &str) -> Emitter {
+        Emitter::new(self.log.clone(), &self.service, correlation, self.dataschemas.clone())
+    }
+
+    /// Tells a fact: appended to the log, then folded into the state. Never called with the state locked.
+    fn tell(&self, em: &Emitter, r#type: &str, data: Value) -> Envelope {
+        let e = em.emit(r#type, data);
+        self.state.lock().unwrap().apply(&e);
+        e
+    }
+
+    pub async fn hardware(&self) -> Result<Host, BestError> {
+        let gpu = self.gpu.clone();
+        tokio::task::spawn_blocking(move || gpu.snapshot())
+            .await
+            .map_err(|e| BestError::internal(format!("the hardware query did not complete: {e}")))?
+            .map_err(|e| BestError::internal(format!("the accelerator library failed: {e}")))
+    }
+
+    /// The base URL the peer itself reaches an engine at.
+    fn engine_base(&self, port: u16) -> String {
+        format!("http://{}:{port}", self.engine_host)
+    }
+
+    // ----- pull-image -----------------------------------------------------------------------------------------------
+
+    pub async fn pull_image(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        let image = best_peer_runtime::ImageRef(cmd.data["image"].as_str().unwrap_or_default().to_string());
+        match self.runtime.pull(&image, self.pulling(&em, &image)).await {
+            Ok(()) => {
+                self.tell(&em, "ImagePulled", json!({ "image": image.0 }));
+            }
+            Err(e) => {
+                self.tell(
+                    &em,
+                    "ImagePullFailed",
+                    json!({ "image": image.0, "reason": e.to_string(), "fix": fix_for_runtime(&e) }),
+                );
+            }
+        }
+    }
+
+    // ----- deploy-model ---------------------------------------------------------------------------------------------
+
+    pub async fn admit_deploy(&self, cmd: Envelope, key: String) -> Result<(), BestError> {
+        let data: DeployData = parse(&cmd.data)?;
+        let host = self.hardware().await?;
+        let mut state = self.state.lock().unwrap();
+        let (device, compute) = place(
+            &host,
+            &state,
+            &data.engine.runs_on(),
+            data.memory_bytes,
+            data.device.as_deref(),
+            &format!("{} on {}", data.model, data.engine),
+        )?;
+        state.reserved.insert(
+            key,
+            Reservation {
+                id: new_id("dep"),
+                device: Some(device),
+                compute: Some(compute),
+                memory_bytes: data.memory_bytes,
+            },
+        );
+        Ok(())
+    }
+
+    pub async fn deploy(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        let Ok(data) = parse::<DeployData>(&cmd.data) else {
+            return;
+        };
+        let reservation = self.state.lock().unwrap().reserved.get(em.command_key()).cloned();
+        let Some(Reservation {
+            id,
+            device: Some(device),
+            compute: Some(compute),
+            ..
+        }) = reservation
+        else {
+            self.tell(
+                &em,
+                "CommandFailed",
+                json!({ "type": cmd.r#type, "reason": "the command was accepted but its placement is gone; send it again" }),
+            );
+            return;
+        };
+        let recipe = data
+            .engine
+            .recipe(&data.model, &compute, self.images.for_engine(data.engine));
+        let image = recipe.image.clone();
+        if let Err(e) = self.runtime.pull(&image, self.pulling(&em, &image)).await {
+            self.fail_deployment(
+                &em,
+                &id,
+                &data.model,
+                &e.to_string(),
+                fix_for_runtime(&e),
+                Stage::BeforeStart(None),
+            )
+            .await;
+            return;
+        }
+        self.tell(&em, "ImagePulled", json!({ "image": image.0 }));
+        let spec = Spec {
+            image,
+            args: recipe.args,
+            env: recipe.env,
+            devices: if compute == Compute::Cpu {
+                vec![]
+            } else {
+                vec![device.clone()]
+            },
+            ports: vec![recipe.port],
+        };
+        let started = match self.runtime.start(spec).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.fail_deployment(
+                    &em,
+                    &id,
+                    &data.model,
+                    &e.to_string(),
+                    fix_for_runtime(&e),
+                    Stage::BeforeStart(None),
+                )
+                .await;
+                return;
+            }
+        };
+        let Some(port) = started
+            .ports
+            .iter()
+            .find(|p| p.container == recipe.port)
+            .map(|p| p.host)
+        else {
+            self.fail_deployment(
+                &em,
+                &id,
+                &data.model,
+                &format!("the engine published no host port for container port {}", recipe.port),
+                "read the container engine's logs on the host",
+                Stage::BeforeStart(Some(started.id)),
+            )
+            .await;
+            return;
+        };
+        self.tell(
+            &em,
+            "DeploymentStarted",
+            json!({ "deployment": id, "model": data.model, "engine": data.engine, "device": device.0, "memory_bytes": data.memory_bytes, "container": started.id.0, "port": port }),
+        );
+        self.replay_unowned(&started.id).await;
+        let base = self.engine_base(port);
+        let loading: best_peer_engine::Progress = {
+            let (me, em, id, model) = (self.clone(), em.clone(), id.clone(), data.model.clone());
+            Arc::new(move |pct| {
+                me.tell(
+                    &em,
+                    "WeightsLoading",
+                    json!({ "deployment": id, "model": model, "progress_pct": pct }),
+                );
+            })
+        };
+        let outcome = async {
+            self.engine.ready(data.engine, &base, self.patience.ready).await?;
+            tokio::time::timeout(
+                self.patience.load,
+                self.engine.load(data.engine, &base, &data.model, loading),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(EngineError::Engine(format!(
+                    "the model was not loaded within {:?}",
+                    self.patience.load
+                )))
+            })
+        }
+        .await;
+        match outcome {
+            Ok(()) if self.phase_of(&id) == Some(Phase::Starting) => {
+                self.tell(
+                    &em,
+                    "DeploymentReady",
+                    json!({ "deployment": id, "model": data.model, "engine": data.engine, "endpoint": format!("http://{}:{port}{}", self.host, recipe.openai_path) }),
+                );
+            }
+            Ok(()) => {}
+            Err(e) => {
+                self.fail_deployment(
+                    &em,
+                    &id,
+                    &data.model,
+                    &e.to_string(),
+                    fix_for_engine(&e),
+                    Stage::AfterStart,
+                )
+                .await
+            }
+        }
+    }
+
+    /// The progress sink of a pull: each step told as an ImagePulling fact under the command's correlation.
+    fn pulling(self: &Arc<Self>, em: &Emitter, image: &best_peer_runtime::ImageRef) -> best_peer_runtime::Progress {
+        let (me, em, image) = (self.clone(), em.clone(), image.0.clone());
+        Arc::new(move |pct| {
+            me.tell(&em, "ImagePulling", json!({ "image": image, "progress_pct": pct }));
+        })
+    }
+
+    fn phase_of(&self, deployment: &str) -> Option<Phase> {
+        self.state.lock().unwrap().deployments.get(deployment).map(|d| d.phase)
+    }
+
+    /// Tells that a deployment failed, after its container is stopped when it has one, so the fact is true when
+    /// told. After its start was told, a deployment the state no longer holds, or already ending, has told or
+    /// will tell its own end: nothing is said twice.
+    async fn fail_deployment(&self, em: &Emitter, id: &str, model: &str, reason: &str, fix: &str, stage: Stage) {
+        let container = match stage {
+            Stage::BeforeStart(c) => c,
+            Stage::AfterStart => {
+                if !self.claim_deployment(id) {
+                    return;
+                }
+                self.state
+                    .lock()
+                    .unwrap()
+                    .deployments
+                    .get(id)
+                    .map(|d| d.container.clone())
+            }
+        };
+        let mut reason = reason.to_string();
+        if let Some(c) = container {
+            if let Err(e) = self.runtime.stop(&c).await {
+                reason = format!("{reason}; its container {} could not be stopped: {e}", c.0);
+            }
+        }
+        self.tell(
+            em,
+            "DeploymentFailed",
+            json!({ "deployment": id, "model": model, "reason": reason, "fix": fix }),
+        );
+    }
+
+    // ----- undeploy-model -------------------------------------------------------------------------------------------
+
+    /// Admits an undeploy and claims the deployment at once, so a second undeploy admitted before the first ran is
+    /// refused rather than told twice.
+    pub fn admit_undeploy(&self, cmd: Envelope) -> Result<(), BestError> {
+        let id = cmd.data["deployment"].as_str().unwrap_or_default();
+        let mut s = self.state.lock().unwrap();
+        let live: Vec<String> = s.deployments.keys().cloned().collect();
+        match s.deployments.get_mut(id) {
+            None => Err(BestError::bad_request(
+                "NO_SUCH_DEPLOYMENT",
+                format!(
+                    "no deployment {id}: the live ones are {}; get-workloads lists them",
+                    list(live.iter())
+                ),
+            )
+            .with_details(json!({ "deployment": id, "live": live }))),
+            Some(d) if d.phase == Phase::Ending => Err(BestError::bad_request(
+                "ALREADY_ENDING",
+                format!("deployment {id} is already ending: its Undeployed or DeploymentFailed event follows"),
+            )
+            .with_details(json!({ "deployment": id }))),
+            Some(d) => {
+                d.phase = Phase::Ending;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn undeploy(&self, cmd: Envelope, em: Emitter) {
+        let id = cmd.data["deployment"].as_str().unwrap_or_default().to_string();
+        // Ended by itself between admission and now: it is not deployed, and that is what this command asked for.
+        let Some(d) = self.state.lock().unwrap().deployments.get(&id).cloned() else {
+            self.tell(&em, "Undeployed", json!({ "deployment": id, "model": null }));
+            return;
+        };
+        // The engine frees the model's memory where it can; an engine that cannot is ended with its container.
+        if d.endpoint.is_some() {
+            match tokio::time::timeout(
+                self.patience.unload,
+                self.engine.unload(d.engine, &self.engine_base(d.port), &d.model),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(deployment = %id, error = %e, "the engine did not unload the model; its container is stopped next")
+                }
+                Err(_) => {
+                    tracing::warn!(deployment = %id, "the engine did not answer the unload in time; its container is stopped next")
+                }
+            }
+        }
+        match self.runtime.stop(&d.container).await {
+            Ok(()) | Err(RuntimeError::NoSuchContainer(_)) => {
+                self.tell(&em, "Undeployed", json!({ "deployment": id, "model": d.model }));
+            }
+            Err(e) => {
+                if let Some(d) = self.state.lock().unwrap().deployments.get_mut(&id) {
+                    d.phase = if d.endpoint.is_some() {
+                        Phase::Ready
+                    } else {
+                        Phase::Starting
+                    };
+                }
+                self.tell(
+                    &em,
+                    "CommandFailed",
+                    json!({ "type": cmd.r#type, "reason": format!("{e}; the deployment stays: {}", fix_for_runtime(&e)) }),
+                );
+            }
+        }
+    }
+
+    // ----- run-job --------------------------------------------------------------------------------------------------
+
+    pub async fn admit_run_job(&self, cmd: Envelope, key: String) -> Result<(), BestError> {
+        let data: RunJobData = parse(&cmd.data)?;
+        if data.device.is_some() && data.memory_bytes.is_none() {
+            return Err(BestError::bad_request(
+                "DEVICE_NEEDS_MEMORY",
+                "device names a device but memory_bytes is missing: send memory_bytes with it, or omit device to run with none",
+            )
+            .with_details(json!({ "field": "memory_bytes" })));
+        }
+        let host = match data.memory_bytes {
+            Some(_) => Some(self.hardware().await?),
+            None => None,
+        };
+        let mut state = self.state.lock().unwrap();
+        let placement = match (data.memory_bytes, &host) {
+            (Some(needed), Some(host)) => Some(place(
+                host,
+                &state,
+                &any_compute(),
+                needed,
+                data.device.as_deref(),
+                &format!("a job from {}", data.image),
+            )?),
+            _ => None,
+        };
+        state.reserved.insert(
+            key,
+            Reservation {
+                id: new_id("job"),
+                device: placement.as_ref().map(|(d, _)| d.clone()),
+                compute: placement.map(|(_, c)| c),
+                memory_bytes: data.memory_bytes.unwrap_or(0),
+            },
+        );
+        Ok(())
+    }
+
+    pub async fn run_job(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        let Ok(data) = parse::<RunJobData>(&cmd.data) else {
+            return;
+        };
+        let Some(reservation) = self.state.lock().unwrap().reserved.get(em.command_key()).cloned() else {
+            self.tell(
+                &em,
+                "CommandFailed",
+                json!({ "type": cmd.r#type, "reason": "the command was accepted but its placement is gone; send it again" }),
+            );
+            return;
+        };
+        let id = reservation.id.clone();
+        let image = best_peer_runtime::ImageRef(data.image.clone());
+        let fail = |reason: String, fix: &str| {
+            self.tell(
+                &em,
+                "JobFailed",
+                json!({ "job": id, "image": data.image, "reason": reason, "fix": fix }),
+            );
+        };
+        if let Err(e) = self.runtime.pull(&image, self.pulling(&em, &image)).await {
+            fail(e.to_string(), fix_for_runtime(&e));
+            return;
+        }
+        self.tell(&em, "ImagePulled", json!({ "image": image.0 }));
+        let devices = match (&reservation.device, &reservation.compute) {
+            (Some(d), Some(c)) if *c != Compute::Cpu => vec![d.clone()],
+            _ => vec![],
+        };
+        let spec = Spec {
+            image,
+            args: data.args.clone(),
+            env: vec![],
+            devices,
+            ports: vec![],
+        };
+        match self.runtime.start(spec).await {
+            Ok(started) => {
+                self.tell(
+                    &em,
+                    "JobStarted",
+                    json!({ "job": id, "image": data.image, "device": reservation.device.as_ref().map(|d| d.0.clone()), "memory_bytes": reservation.memory_bytes, "container": started.id.0 }),
+                );
+                self.replay_unowned(&started.id).await;
+            }
+            Err(e) => fail(e.to_string(), fix_for_runtime(&e)),
+        }
+    }
+
+    // ----- stop-job -------------------------------------------------------------------------------------------------
+
+    /// Admits a stop and claims the job at once, so a second stop admitted before the first ran is refused rather
+    /// than told twice.
+    pub fn admit_stop_job(&self, cmd: Envelope) -> Result<(), BestError> {
+        let id = cmd.data["job"].as_str().unwrap_or_default();
+        let mut s = self.state.lock().unwrap();
+        let running: Vec<String> = s.jobs.keys().cloned().collect();
+        match s.jobs.get_mut(id) {
+            None => Err(BestError::bad_request(
+                "NO_SUCH_JOB",
+                format!(
+                    "no job {id} is running: the running ones are {}; get-workloads lists them",
+                    list(running.iter())
+                ),
+            )
+            .with_details(json!({ "job": id, "running": running }))),
+            Some(j) if j.phase == JobPhase::Stopping => Err(BestError::bad_request(
+                "ALREADY_STOPPING",
+                format!("job {id} is already stopping: its JobStopped event follows"),
+            )
+            .with_details(json!({ "job": id }))),
+            Some(j) => {
+                j.phase = JobPhase::Stopping;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn stop_job(&self, cmd: Envelope, em: Emitter) {
+        let id = cmd.data["job"].as_str().unwrap_or_default().to_string();
+        let container = self.state.lock().unwrap().jobs.get(&id).map(|j| j.container.clone());
+        let stopped = match &container {
+            Some(c) => self.runtime.stop(c).await,
+            // Ended by itself between admission and now: it is not running, and that is what was asked.
+            None => Ok(()),
+        };
+        match stopped {
+            Ok(()) | Err(RuntimeError::NoSuchContainer(_)) => {
+                self.tell(&em, "JobStopped", json!({ "job": id }));
+            }
+            Err(e) => {
+                if let Some(j) = self.state.lock().unwrap().jobs.get_mut(&id) {
+                    j.phase = JobPhase::Running;
+                }
+                self.tell(
+                    &em,
+                    "CommandFailed",
+                    json!({ "type": cmd.r#type, "reason": format!("{e}; the job keeps running: {}", fix_for_runtime(&e)) }),
+                );
+            }
+        }
+    }
+
+    // ----- what the engine says on its own --------------------------------------------------------------------------
+
+    async fn on_runtime(&self, e: RuntimeEvent) {
+        let container = match &e {
+            RuntimeEvent::Exited { id, .. } | RuntimeEvent::OutOfMemory { id } | RuntimeEvent::Failed { id, .. } => {
+                id.clone()
+            }
+            RuntimeEvent::Started { .. } => return,
+        };
+        let Some((owner, em)) = self.owner_of(&container) else {
+            // Not ours yet: a job can exit before its start is told. Kept, and replayed once it is.
+            let mut unowned = self.unowned.lock().unwrap();
+            if unowned.len() >= MAX_UNOWNED {
+                let oldest = unowned.keys().next().cloned();
+                if let Some(k) = oldest {
+                    unowned.remove(&k);
+                }
+            }
+            unowned.insert(container, e);
+            return;
+        };
+        match (e, owner) {
+            (RuntimeEvent::Exited { code, .. }, Owner::Deployment(dep)) => {
+                if self.claim_deployment(&dep.id) {
+                    self.tell(
+                        &em,
+                        "DeploymentEnded",
+                        json!({ "deployment": dep.id, "model": dep.model, "exit_code": code, "reason": "the container exited by itself" }),
+                    );
+                }
+            }
+            (RuntimeEvent::Exited { code, .. }, Owner::Job(job)) => {
+                if self.job_running(&job) {
+                    self.tell(&em, "JobFinished", json!({ "job": job, "exit_code": code }));
+                }
+            }
+            (RuntimeEvent::OutOfMemory { .. }, Owner::Deployment(dep)) => {
+                if self.claim_deployment(&dep.id) {
+                    // The engine said the device ran out, not that the container died: it is stopped so the memory
+                    // the fact releases is really free.
+                    if let Err(e) = self.runtime.stop(&dep.container).await {
+                        tracing::warn!(container = %dep.container.0, error = %e, "the out-of-memory container could not be stopped");
+                    }
+                    self.tell(
+                        &em,
+                        "OutOfMemory",
+                        json!({ "deployment": dep.id, "model": dep.model, "device": dep.device.0, "memory_bytes": dep.memory_bytes, "fix": "deploy a smaller model, or ask for more memory_bytes so it is placed where it fits" }),
+                    );
+                }
+            }
+            (RuntimeEvent::OutOfMemory { id }, Owner::Job(job)) => {
+                if self.job_running(&job) {
+                    let _ = self.runtime.stop(&id).await;
+                    self.tell(
+                        &em,
+                        "JobFailed",
+                        json!({ "job": job, "reason": "out of memory", "fix": "run it with more memory_bytes so it is placed where it fits" }),
+                    );
+                }
+            }
+            (RuntimeEvent::Failed { reason, .. }, Owner::Deployment(dep)) => {
+                if self.claim_deployment(&dep.id) {
+                    self.tell(
+                        &em,
+                        "DeploymentFailed",
+                        json!({ "deployment": dep.id, "model": dep.model, "reason": reason, "fix": "read the container's logs on the host" }),
+                    );
+                }
+            }
+            (RuntimeEvent::Failed { reason, .. }, Owner::Job(job)) => {
+                if self.job_running(&job) {
+                    self.tell(
+                        &em,
+                        "JobFailed",
+                        json!({ "job": job, "reason": reason, "fix": "read the container's logs on the host" }),
+                    );
+                }
+            }
+            (RuntimeEvent::Started { .. }, _) => {}
+        }
+    }
+
+    /// Replays the runtime events that arrived for `container` before its start was told.
+    async fn replay_unowned(&self, container: &ContainerId) {
+        let kept = self.unowned.lock().unwrap().remove(container);
+        if let Some(e) = kept {
+            self.on_runtime(e).await;
+        }
+    }
+
+    /// Marks a deployment as ending for the fact about to be told, unless it is already ending or gone, in which
+    /// case the fact was or will be told by whoever claimed it.
+    fn claim_deployment(&self, id: &str) -> bool {
+        let mut s = self.state.lock().unwrap();
+        match s.deployments.get_mut(id) {
+            Some(d) if d.phase != Phase::Ending => {
+                d.phase = Phase::Ending;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Who a container belongs to, with the emitter of the command that started it.
+    fn owner_of(&self, container: &ContainerId) -> Option<(Owner, Emitter)> {
+        let s = self.state.lock().unwrap();
+        match s.by_container(container)? {
+            Owner::Deployment(d) => {
+                let em = self.emitter(&d.correlation);
+                Some((Owner::Deployment(d), em))
+            }
+            Owner::Job(id) => {
+                let j = s.jobs.get(&id)?;
+                Some((Owner::Job(id), self.emitter(&j.correlation)))
+            }
+        }
+    }
+
+    fn job_running(&self, id: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .get(id)
+            .is_some_and(|j| j.phase == JobPhase::Running)
+    }
+
+    /// `get-workloads`: what is deployed and what runs, now.
+    pub fn workloads(&self) -> Value {
+        let s = self.state.lock().unwrap();
+        let deployments: Vec<Value> = s
+            .deployments
+            .values()
+            .map(|d| {
+                json!({
+                    "deployment": d.id, "model": d.model, "engine": d.engine, "device": d.device.0,
+                    "memory_bytes": d.memory_bytes, "endpoint": d.endpoint,
+                    "phase": match d.phase { Phase::Starting => "starting", Phase::Ready => "ready", Phase::Ending => "ending" }
+                })
+            })
+            .collect();
+        let jobs: Vec<Value> = s
+            .jobs
+            .values()
+            .map(|j| {
+                json!({
+                    "job": j.id, "image": j.image.0, "device": j.device.as_ref().map(|d| d.0.clone()),
+                    "memory_bytes": j.memory_bytes,
+                    "phase": match j.phase { JobPhase::Running => "running", JobPhase::Stopping => "stopping" }
+                })
+            })
+            .collect();
+        json!({ "deployments": deployments, "jobs": jobs })
+    }
+}
+
+/// Where a workload needing `memory_bytes` on a device offering one of `apis` goes: the fitting device with the most
+/// memory free after what is already promised there, or `pinned` when the caller named one. A refusal names what is
+/// in the way and what to do about it.
+fn place(
+    host: &Host,
+    state: &State,
+    apis: &[Compute],
+    memory_bytes: u64,
+    pinned: Option<&str>,
+    what: &str,
+) -> Result<(DeviceId, Compute), BestError> {
+    let ids: Vec<String> = host.devices.iter().map(|d| d.id.0.clone()).collect();
+    let candidates: Vec<&best_peer_gpu::Device> = match pinned {
+        Some(p) => vec![host.devices.iter().find(|d| d.id.0 == p).ok_or_else(|| {
+            BestError::bad_request(
+                "NO_SUCH_DEVICE",
+                format!(
+                    "device {p} is not on this host: get-hardware-state lists {}",
+                    list(ids.iter())
+                ),
+            )
+            .with_details(json!({ "device": p, "devices": ids }))
+        })?],
+        None => host.devices.iter().collect(),
+    };
+    // The API each candidate offers among the wanted ones, the first wanted one winning.
+    let offering: Vec<(&best_peer_gpu::Device, Compute)> = candidates
+        .iter()
+        .filter_map(|d| {
+            apis.iter()
+                .find(|w| host.fit(w, 0).iter().any(|f| f.id == d.id))
+                .map(|w| (*d, w.clone()))
+        })
+        .collect();
+    if offering.is_empty() {
+        let wanted: Vec<String> = apis.iter().map(api_name).collect();
+        let offered: Vec<Value> = candidates
+            .iter()
+            .map(|d| json!({ "id": d.id.0, "compute": d.compute }))
+            .collect();
+        return Err(BestError::bad_request(
+            "NO_DEVICE_FOR_ENGINE",
+            format!(
+                "{what} runs on {} and no device here offers one: get-hardware-state says what they offer",
+                wanted.join(", ")
+            ),
+        )
+        .with_details(json!({ "wanted": wanted, "devices": offered })));
+    }
+    let room = |d: &best_peer_gpu::Device| {
+        d.memory
+            .free_bytes
+            .min(d.memory.total_bytes.saturating_sub(state.reserved_on(&d.id)))
+    };
+    let best = offering
+        .iter()
+        .filter(|(d, _)| room(d) >= memory_bytes)
+        .max_by_key(|(d, _)| room(d));
+    if let Some((d, c)) = best {
+        return Ok((d.id.clone(), c.clone()));
+    }
+    let devices: Vec<Value> = offering
+        .iter()
+        .map(|(d, _)| {
+            json!({
+                "id": d.id.0, "name": d.name, "free_bytes": d.memory.free_bytes, "total_bytes": d.memory.total_bytes,
+                "promised_bytes": state.reserved_on(&d.id), "room_bytes": room(d), "holders": state.holders_on(&d.id)
+            })
+        })
+        .collect();
+    let told: Vec<String> = offering
+        .iter()
+        .map(|(d, _)| {
+            format!(
+                "{} ({}) has {} free of {} with {} promised",
+                d.id.0,
+                d.name,
+                d.memory.free_bytes,
+                d.memory.total_bytes,
+                state.reserved_on(&d.id)
+            )
+        })
+        .collect();
+    Err(BestError::bad_request(
+        "INSUFFICIENT_MEMORY",
+        format!(
+            "no device has {memory_bytes} bytes for {what}: {}. Undeploy a model (UndeployModel) or stop a job (StopJob) named in the details, or ask for less memory_bytes",
+            told.join("; ")
+        ),
+    )
+    .with_details(json!({ "memory_bytes": memory_bytes, "devices": devices })))
+}
+
+fn api_name(c: &Compute) -> String {
+    match c {
+        Compute::Cuda(_) => "cuda".into(),
+        Compute::Rocm(_) => "rocm".into(),
+        Compute::OneApi(_) => "one-api".into(),
+        Compute::Metal => "metal".into(),
+        Compute::Vulkan => "vulkan".into(),
+        Compute::Cpu => "cpu".into(),
+    }
+}
+
+fn fix_for_runtime(e: &RuntimeError) -> &'static str {
+    match e {
+        RuntimeError::ImageNotFound(_) => "the registry has no such image: check the name and the tag",
+        RuntimeError::NoSuchContainer(_) => "the container is already gone",
+        RuntimeError::DeviceUnavailable(_) => {
+            "the container engine cannot hand over that device: check the container toolkit on the host"
+        }
+        RuntimeError::Unreachable(_) => "the container engine is not running on the host: start it",
+        RuntimeError::Engine(_) => "read the container engine's logs on the host",
+    }
+}
+
+fn fix_for_engine(e: &EngineError) -> &'static str {
+    match e {
+        EngineError::NotReady { .. } => "the engine did not come up in time: read its container's logs on the host",
+        EngineError::ModelNotFound(_) => "the engine's library has no model by that name: check the name",
+        EngineError::Engine(_) => "read the engine's logs on the host",
+    }
+}
+
+fn parse<T: serde::de::DeserializeOwned>(data: &Value) -> Result<T, BestError> {
+    serde_json::from_value(data.clone())
+        .map_err(|e| BestError::internal(format!("the command passed its schema but could not be read: {e}")))
+}
+
+fn list<'a, S: AsRef<str> + 'a>(items: impl Iterator<Item = &'a S>) -> String {
+    let v: Vec<&str> = items.map(AsRef::as_ref).collect();
+    if v.is_empty() {
+        "none".into()
+    } else {
+        v.join(", ")
+    }
+}
+
+fn new_id(prefix: &str) -> String {
+    format!("{prefix}-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
+}
+
+/// The host part of a base URL: what the engines' published ports are reached at.
+pub fn host_of(endpoint: &str) -> String {
+    let rest = endpoint.split("://").nth(1).unwrap_or(endpoint);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if let Some(end) = authority.strip_prefix('[').and_then(|a| a.find(']')) {
+        return authority[..end + 2].to_string();
+    }
+    authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority)
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_engines_host_is_the_endpoints_host() {
+        assert_eq!(host_of("http://127.0.0.1:7777"), "127.0.0.1");
+        assert_eq!(host_of("https://peer.example.com"), "peer.example.com");
+        assert_eq!(host_of("https://peer.example.com:8443/base"), "peer.example.com");
+        assert_eq!(host_of("http://[::1]:7777"), "[::1]");
+    }
+}

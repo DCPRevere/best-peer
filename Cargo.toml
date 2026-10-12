@@ -1,6 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/gpu", "crates/runtime", "crates/door", "crates/peer"]
+members = [
+    "crates/gpu",
+    "crates/runtime",
+    "crates/engine",
+    "crates/door",
+    "crates/host",
+    "crates/docker",
+    "crates/native",
+    "crates/engine-http",
+    "crates/peer",
+]
 
 [workspace.package]
 version = "0.1.0"

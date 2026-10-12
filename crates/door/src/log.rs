@@ -145,6 +145,27 @@ impl EventLog {
         stored
     }
 
+    /// What the log already knows of `sender`'s command `id` with payload hash `hash`: a duplicate, a conflict, or
+    /// nothing. Nothing is recorded; a command is recorded by [`EventLog::accept_command`] once admitted.
+    pub fn known_command(&self, sender: &str, id: &str, hash: &str) -> Option<Accept> {
+        let accepted = self.accepted.lock().unwrap();
+        match accepted.get(&(sender.to_string(), id.to_string())) {
+            Some(a) if a.hash == hash => Some(Accept::Duplicate {
+                correlation: a.correlation.clone(),
+            }),
+            Some(_) => Some(Accept::Conflict),
+            None => None,
+        }
+    }
+
+    /// Every event the log holds, oldest first, for a peer rebuilding its state from the facts it told.
+    pub fn replay(&self, mut f: impl FnMut(&Envelope)) {
+        let events = self.events.lock().unwrap();
+        for s in events.iter() {
+            f(&s.envelope);
+        }
+    }
+
     /// Records that `sender` sent a command with `id`, payload hash `hash` and correlation `correlation`, or says
     /// why it is not new. One sender's ids are theirs alone: another sender's identical id is a different command.
     pub fn accept_command(&self, sender: &str, id: &str, hash: &str, correlation: &str) -> Accept {

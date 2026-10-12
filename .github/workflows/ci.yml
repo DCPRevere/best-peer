@@ -25,12 +25,13 @@ jobs:
 
       # The validator is a gate from the first commit: a manifest the spec refuses fails the build. The data
       # directory is shared with the later steps through the job environment, so `best-peer approve` finds the same
-      # admin token the server wrote.
+      # admin token the server wrote. The peer runs on the fakes: CI never needs an engine or a GPU.
       - name: best-validate, anonymous
         run: |
           data="$(mktemp -d)"
           echo "BEST_PEER_DATA=$data" >> "$GITHUB_ENV"
-          BEST_PEER_DATA="$data" ./target/release/best-peer &
+          echo "BEST_PEER_RUNTIME=fake" >> "$GITHUB_ENV"
+          BEST_PEER_DATA="$data" BEST_PEER_RUNTIME=fake ./target/release/best-peer &
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:7777/.well-known/best >/dev/null && break; sleep 1; done
           npx -y @behavioralstate/best-validate@0.4.2 http://127.0.0.1:7777
 
