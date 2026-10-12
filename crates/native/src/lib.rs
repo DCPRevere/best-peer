@@ -1,26 +1,31 @@
 //! [`Runtime`] for engines that already run on the host, outside any container: Ollama installed as a service, a
 //! vLLM started by hand. There is nothing to pull and nothing to start: a deploy's "container" is the engine's own
 //! port on the host, and a stop ends the peer's claim on it, not the engine. Whether the engine answers there is the
-//! `Engine` adapter's question, asked on readiness. A job needs a container engine and is refused with that fix.
-//! Thin; proven on a host by hand, never unit-tested.
+//! `Engine` adapter's question, asked on readiness; whether anything still listens on a claimed port is this
+//! runtime's, asked when the peer squares its state with what runs: an engine that stopped is gone, with its
+//! deployment. A job needs a container engine and is refused with that fix. Thin; proven on a host by hand, never
+//! unit-tested.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use best_peer_runtime::{ContainerId, Event, ImageRef, Progress, Published, Runtime, RuntimeError, Spec, Started};
 use tokio::sync::broadcast;
 
-#[derive(Default)]
 pub struct NativeRuntime {
+    /// Where the engines' ports are reached from here.
+    host: String,
     claimed: Mutex<BTreeMap<ContainerId, Spec>>,
     tx: Option<broadcast::Sender<Event>>,
 }
 
 impl NativeRuntime {
-    pub fn new() -> Self {
+    pub fn new(host: &str) -> Self {
         let (tx, _) = broadcast::channel(16);
         Self {
+            host: host.to_string(),
             claimed: Mutex::new(BTreeMap::new()),
             tx: Some(tx),
         }
@@ -75,8 +80,31 @@ impl Runtime for NativeRuntime {
         Ok(())
     }
 
+    /// A claimed port with something listening on it. One nobody listens on any more is the engine gone: the claim
+    /// is dropped, so the port can be claimed again once the engine is back.
     async fn running(&self) -> Result<Vec<ContainerId>, RuntimeError> {
-        Ok(self.claimed.lock().unwrap().keys().cloned().collect())
+        let claimed: Vec<(ContainerId, u16)> = self
+            .claimed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, spec)| spec.ports.first().map(|&port| (id.clone(), port)))
+            .collect();
+        let mut alive = Vec::new();
+        for (id, port) in claimed {
+            let listening = tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::net::TcpStream::connect((self.host.as_str(), port)),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok());
+            if listening {
+                alive.push(id);
+            } else {
+                self.claimed.lock().unwrap().remove(&id);
+            }
+        }
+        Ok(alive)
     }
 
     fn events(&self) -> broadcast::Receiver<Event> {

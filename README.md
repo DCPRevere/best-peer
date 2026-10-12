@@ -85,8 +85,10 @@ honest about what it promises: its events say what the machine runs, never what 
 Where the boundary lies: the door's credential ends at the door. The endpoint answers whoever reaches its port, with
 whatever access the engine itself enforces (none, in Ollama as installed), on the interfaces the peer binds the
 container's port to, or, in `native` mode, the ones the installed engine listens on. The door promises that the
-endpoint serves the model from `DeploymentReady` until `Undeployed`, `DeploymentEnded` or `OutOfMemory` is told,
-and `get-workloads` shows it meanwhile; what is said there, how fast and to whom, is the engine's.
+endpoint serves the model from `DeploymentReady` until the deployment ends: an `undeploy-model` accepted (its
+phase is `ending` in `get-workloads` from then, and `Undeployed` follows), or `DeploymentEnded` or `OutOfMemory`
+telling what the engine did on its own, within 30 s of it where the engine told nothing itself (an installed engine
+that stopped). What is said at the endpoint, how fast and to whom, is the engine's.
 
 ## Commands over time
 

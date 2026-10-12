@@ -118,10 +118,10 @@ fn main() {
 /// the Docker Engine on this host and refuses to start when it cannot; `native` deploys to engines already running
 /// on this host outside any container (an installed Ollama), with no jobs; `fake` serves the whole surface against
 /// the in-memory fakes, for CI and for a machine with no engine.
-async fn engines(bind_ip: &str) -> (Arc<dyn Runtime>, Arc<dyn Engine>) {
+async fn engines(bind_ip: &str, engine_host: &str) -> (Arc<dyn Runtime>, Arc<dyn Engine>) {
     match std::env::var("BEST_PEER_RUNTIME").as_deref() {
         Ok("native") => (
-            Arc::new(best_peer_native::NativeRuntime::new()),
+            Arc::new(best_peer_native::NativeRuntime::new(engine_host)),
             Arc::new(best_peer_engine_http::HttpEngine::new()),
         ),
         Ok("fake") => {
@@ -179,7 +179,8 @@ async fn serve() {
     } else {
         "0.0.0.0"
     };
-    let (runtime, engine) = engines(bind_ip).await;
+    let engine_host = std::env::var("BEST_PEER_ENGINE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let (runtime, engine) = engines(bind_ip, &engine_host).await;
     let images = Images {
         ollama: std::env::var("BEST_PEER_OLLAMA_IMAGE").ok(),
         vllm: std::env::var("BEST_PEER_VLLM_IMAGE").ok(),
@@ -192,7 +193,6 @@ async fn serve() {
         load: seconds("BEST_PEER_LOAD_SECONDS", 3600),
         ..Patience::default()
     };
-    let engine_host = std::env::var("BEST_PEER_ENGINE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let peer = peer(&endpoint, &engine_host, gpu, runtime, engine, log, images, patience).await;
     let door = Arc::new(door(&endpoint, peer, auth));
     // What the last run accepted and never completed is run now, before anyone can send more.
@@ -721,9 +721,11 @@ mod tests {
         assert_eq!(oom["deployment"], dep);
         assert_eq!(oom["device"], "gpu-0");
         assert!(oom["fix"].as_str().unwrap().contains("memory_bytes"));
+        // Failed once it was ready: the deploy completed with DeploymentReady, so this is the deployment's end.
         bed.runtime.fail(&bed.container_of(&dep2), "exit 137").unwrap();
-        let events = bed.events_of("d2", "DeploymentFailed").await;
+        let events = bed.events_of("d2", "DeploymentEnded").await;
         assert_eq!(events.last().unwrap().data["reason"], "exit 137");
+        assert!(!events.iter().any(|e| e.r#type == "DeploymentFailed"));
         assert!(bed.query("get-workloads").await["deployments"]
             .as_array()
             .unwrap()

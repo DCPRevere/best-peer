@@ -9,4 +9,4 @@ repository.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 best-peer-runtime = { path = "../runtime" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net"] }

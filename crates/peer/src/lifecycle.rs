@@ -826,11 +826,20 @@ impl Peer {
             }
             (RuntimeEvent::Failed { reason, .. }, Owner::Deployment(dep)) => {
                 if self.claim_deployment(&dep.id) {
-                    self.tell(
-                        &em,
-                        "DeploymentFailed",
-                        json!({ "deployment": dep.id, "model": dep.model, "reason": reason, "fix": "read the container's logs on the host" }),
-                    );
+                    if dep.endpoint.is_some() {
+                        // The deploy's outcome stands; what it made has ended, and that is the deployment's own fact.
+                        self.tell(
+                            &em,
+                            "DeploymentEnded",
+                            json!({ "deployment": dep.id, "model": dep.model, "exit_code": null, "reason": reason }),
+                        );
+                    } else {
+                        self.tell(
+                            &em,
+                            "DeploymentFailed",
+                            json!({ "deployment": dep.id, "model": dep.model, "reason": reason, "fix": "read the container's logs on the host" }),
+                        );
+                    }
                 }
             }
             (RuntimeEvent::Failed { reason, .. }, Owner::Job(job)) => {
