@@ -174,7 +174,10 @@ jobs:
           {
             echo "# best-peer $version"
             echo
-            message=$(git for-each-ref "refs/tags/$tag" --format='%(contents)' | sed -E '/^-----BEGIN (PGP|SSH) SIGNATURE-----/,$d' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+            # The message scripts/release.sh was given: it is the body of the release commit as well as the tag's
+            # annotation, and the commit is read because the checkout action refetches the triggering tag as a
+            # lightweight one, which loses the annotation.
+            message=$(git log -1 --format=%b "$GITHUB_SHA" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
             if [[ -n "$message" ]]; then echo "$message"; echo; fi
             if [[ -n "$previous" ]]; then
               echo "## Commits since $previous"
