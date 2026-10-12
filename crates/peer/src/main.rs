@@ -35,16 +35,42 @@ async fn well_known(State(peer): State<Peer>) -> impl IntoResponse {
     )
 }
 
+/// Where to listen and what to advertise, from `BEST_PEER_LISTEN` (ip:port, default loopback) and
+/// `BEST_PEER_ENDPOINT` (the consumer-facing base URL). The endpoint defaults to the listen address only when that
+/// address is one a consumer can use: a peer listening on every interface has no address of its own to advertise,
+/// so it refuses to start until told what it is called.
+pub fn config(listen: Option<&str>, endpoint: Option<&str>) -> Result<(SocketAddr, String), String> {
+    let listen_text = listen.unwrap_or("127.0.0.1:7777");
+    let listen: SocketAddr = listen_text
+        .parse()
+        .map_err(|_| format!("BEST_PEER_LISTEN must be ip:port, not {listen_text:?}"))?;
+    let endpoint = match endpoint {
+        Some(e) => e.trim_end_matches('/').to_string(),
+        None if listen.ip().is_unspecified() => {
+            return Err(format!(
+                "BEST_PEER_LISTEN is {listen}, an address no consumer can reach: set BEST_PEER_ENDPOINT to the URL this peer is reached at"
+            ))
+        }
+        None => format!("http://{listen}"),
+    };
+    Ok((listen, endpoint))
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-    let listen: SocketAddr = std::env::var("BEST_PEER_LISTEN")
-        .unwrap_or_else(|_| "127.0.0.1:7777".into())
-        .parse()
-        .expect("BEST_PEER_LISTEN is host:port");
-    let endpoint = std::env::var("BEST_PEER_ENDPOINT").unwrap_or_else(|_| format!("http://{listen}"));
+    let (listen, endpoint) = match config(
+        std::env::var("BEST_PEER_LISTEN").ok().as_deref(),
+        std::env::var("BEST_PEER_ENDPOINT").ok().as_deref(),
+    ) {
+        Ok(c) => c,
+        Err(why) => {
+            eprintln!("{why}");
+            std::process::exit(2);
+        }
+    };
     let peer = Peer {
         endpoint,
         gpu: Arc::new(best_peer_gpu::Fake::new().with_driver("fake")),
@@ -90,6 +116,21 @@ mod tests {
             body["best"]["services"][manifest::SERVICE]["http"]["endpoint"],
             "http://peer.test"
         );
+    }
+
+    #[test]
+    fn the_endpoint_defaults_to_the_listen_address_only_when_a_consumer_can_reach_it() {
+        let (listen, endpoint) = config(None, None).unwrap();
+        assert_eq!(listen.to_string(), "127.0.0.1:7777");
+        assert_eq!(endpoint, "http://127.0.0.1:7777");
+        let (_, endpoint) = config(Some("0.0.0.0:7777"), Some("https://peer.example.com/")).unwrap();
+        assert_eq!(endpoint, "https://peer.example.com");
+        let why = config(Some("0.0.0.0:7777"), None).unwrap_err();
+        assert!(why.contains("BEST_PEER_ENDPOINT"), "{why}");
+        let why = config(Some("[::]:7777"), None).unwrap_err();
+        assert!(why.contains("BEST_PEER_ENDPOINT"), "{why}");
+        let why = config(Some("localhost:7777"), None).unwrap_err();
+        assert!(why.contains("ip:port"), "{why}");
     }
 
     #[tokio::test]

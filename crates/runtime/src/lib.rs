@@ -83,10 +83,13 @@ pub trait Runtime: Send + Sync {
     fn events(&self) -> broadcast::Receiver<Event>;
 }
 
-/// An in-memory [`Runtime`] for tests: images the test declares exist, containers that start at once, and the events
-/// a real engine would emit, in order. A test can make a container fail or run out of memory.
+/// An in-memory [`Runtime`] for tests: images the engine already holds, images a registry would serve, containers
+/// that start at once, and the events a real engine would emit, in order. Like a real engine, it starts only an image
+/// it holds locally: a `pull` moves an image from the registry to the engine, and a door that skips the pull fails
+/// here as it would there. A test can make a container fail or run out of memory.
 pub struct Fake {
-    images: Mutex<Vec<ImageRef>>,
+    local: Mutex<Vec<ImageRef>>,
+    registry: Mutex<Vec<ImageRef>>,
     containers: Mutex<BTreeMap<ContainerId, Spec>>,
     devices: Vec<DeviceId>,
     next: Mutex<u32>,
@@ -94,11 +97,12 @@ pub struct Fake {
 }
 
 impl Fake {
-    /// A fake whose engine can see `devices` and already holds `images`.
-    pub fn new(devices: Vec<DeviceId>, images: Vec<ImageRef>) -> Self {
+    /// A fake whose engine can see `devices` and already holds `local` images.
+    pub fn new(devices: Vec<DeviceId>, local: Vec<ImageRef>) -> Self {
         let (tx, _) = broadcast::channel(256);
         Self {
-            images: Mutex::new(images),
+            local: Mutex::new(local),
+            registry: Mutex::new(Vec::new()),
             containers: Mutex::new(BTreeMap::new()),
             devices,
             next: Mutex::new(0),
@@ -106,9 +110,9 @@ impl Fake {
         }
     }
 
-    /// Lets a test declare an image the registry has, so a later `pull` succeeds.
+    /// Declares an image the registry serves, so a `pull` of it succeeds; it is not local until pulled.
     pub fn registry_has(&self, image: ImageRef) {
-        self.images.lock().unwrap().push(image);
+        self.registry.lock().unwrap().push(image);
     }
 
     /// Drives a running container out of memory, as the engine would report it.
@@ -144,19 +148,23 @@ impl Fake {
 #[async_trait]
 impl Runtime for Fake {
     async fn pull(&self, image: &ImageRef) -> Result<(), RuntimeError> {
-        if !self.images.lock().unwrap().contains(image) {
+        if !self.registry.lock().unwrap().contains(image) {
             return Err(RuntimeError::ImageNotFound(image.0.clone()));
         }
         let _ = self.tx.send(Event::ImagePulling {
             image: image.clone(),
             progress_pct: Some(50),
         });
+        let mut local = self.local.lock().unwrap();
+        if !local.contains(image) {
+            local.push(image.clone());
+        }
         let _ = self.tx.send(Event::ImagePulled { image: image.clone() });
         Ok(())
     }
 
     async fn start(&self, spec: Spec) -> Result<ContainerId, RuntimeError> {
-        if !self.images.lock().unwrap().contains(&spec.image) {
+        if !self.local.lock().unwrap().contains(&spec.image) {
             return Err(RuntimeError::ImageNotFound(spec.image.0.clone()));
         }
         if let Some(d) = spec.devices.iter().find(|d| !self.devices.contains(d)) {
@@ -171,11 +179,12 @@ impl Runtime for Fake {
         let ports = spec
             .ports
             .iter()
-            .map(|&p| Published {
-                container: p,
-                host: 30000 + p,
+            .map(|&p| {
+                p.checked_add(30000)
+                    .map(|host| Published { container: p, host })
+                    .ok_or_else(|| RuntimeError::Engine(format!("no host port for container port {p}")))
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         self.containers.lock().unwrap().insert(id.clone(), spec);
         let _ = self.tx.send(Event::Started { id: id.clone(), ports });
         Ok(id)
@@ -222,10 +231,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_image_the_engine_does_not_hold_cannot_start_until_it_is_pulled() {
+        let rt = Fake::new(vec!["gpu-0".into()], vec![]);
+        let image = ImageRef("vllm/vllm-openai:v0.8".into());
+        rt.registry_has(image.clone());
+        let err = rt.start(spec("vllm/vllm-openai:v0.8", "gpu-0")).await.unwrap_err();
+        assert!(matches!(err, RuntimeError::ImageNotFound(ref i) if i == "vllm/vllm-openai:v0.8"));
+        rt.pull(&image).await.unwrap();
+        rt.start(spec("vllm/vllm-openai:v0.8", "gpu-0")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_container_port_with_no_host_port_is_refused_not_wrapped() {
+        let rt = fake();
+        let mut s = spec("ollama/ollama:0.6", "gpu-0");
+        s.ports = vec![65000];
+        assert!(matches!(rt.start(s).await.unwrap_err(), RuntimeError::Engine(_)));
+    }
+
+    #[tokio::test]
     async fn the_lifecycle_is_told_as_events_in_order() {
         let rt = fake();
         let mut events = rt.events();
         let image = ImageRef("ollama/ollama:0.6".into());
+        rt.registry_has(image.clone());
         rt.pull(&image).await.unwrap();
         let id = rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap();
         rt.stop(&id).await.unwrap();

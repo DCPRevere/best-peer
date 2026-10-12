@@ -105,9 +105,24 @@ fn compatible(offered: &Compute, wanted: &Compute) -> bool {
     }
 }
 
+/// `offered` is the same version as `wanted` or newer. Versions are dotted numbers; a missing part is zero, so
+/// `12.4` and `12.4.0` are equal. A version that is not dotted numbers never satisfies anything: an unreadable
+/// version is a refusal, not a zero.
 fn version_at_least(offered: &str, wanted: &str) -> bool {
-    let parse = |v: &str| v.split('.').map(|p| p.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>();
-    parse(offered) >= parse(wanted)
+    let (Some(o), Some(w)) = (parse_version(offered), parse_version(wanted)) else {
+        return false;
+    };
+    let len = o.len().max(w.len());
+    let pad = |v: Vec<u32>| {
+        let mut v = v;
+        v.resize(len, 0);
+        v
+    };
+    pad(o) >= pad(w)
+}
+
+fn parse_version(v: &str) -> Option<Vec<u32>> {
+    v.split('.').map(|p| p.parse::<u32>().ok()).collect()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -117,6 +132,11 @@ pub enum GpuError {
     NoDriver(String),
     #[error("the accelerator library failed: {0}")]
     Library(String),
+    #[error("no device {0} on this host")]
+    NoSuchDevice(String),
+    /// A value that cannot be: the field and why, so the caller can fix it.
+    #[error("{field}: {why}")]
+    Invalid { field: &'static str, why: String },
 }
 
 /// What the door needs from the hardware. One method, because the door only ever asks for the whole picture.
@@ -164,11 +184,21 @@ impl Fake {
         }
     }
 
-    /// Moves a device's free memory, as a deploy or a release would.
-    pub fn set_free(&self, id: &DeviceId, free_bytes: u64) {
-        if let Some(d) = self.devices.lock().unwrap().get_mut(id) {
-            d.memory.free_bytes = free_bytes.min(d.memory.total_bytes);
+    /// Moves a device's free memory, as a deploy or a release would. An unknown device or more free than total is
+    /// refused by name: a test that mistypes an id must fail, not pass vacuously.
+    pub fn set_free(&self, id: &DeviceId, free_bytes: u64) -> Result<(), GpuError> {
+        let mut devices = self.devices.lock().unwrap();
+        let d = devices
+            .get_mut(id)
+            .ok_or_else(|| GpuError::NoSuchDevice(id.0.clone()))?;
+        if free_bytes > d.memory.total_bytes {
+            return Err(GpuError::Invalid {
+                field: "free_bytes",
+                why: format!("{free_bytes} exceeds the device's total of {}", d.memory.total_bytes),
+            });
         }
+        d.memory.free_bytes = free_bytes;
+        Ok(())
     }
 }
 
@@ -218,7 +248,7 @@ mod tests {
     #[test]
     fn fit_picks_by_compute_api_and_free_memory_most_free_first() {
         let fake = host();
-        fake.set_free(&"gpu-0".into(), 4 * GB);
+        fake.set_free(&"gpu-0".into(), 4 * GB).unwrap();
         let snap = fake.snapshot().unwrap();
         let fit = snap.fit(&Compute::Cuda("12.0".into()), 8 * GB);
         assert_eq!(fit.iter().map(|d| d.id.0.as_str()).collect::<Vec<_>>(), vec!["gpu-1"]);
@@ -239,11 +269,35 @@ mod tests {
     }
 
     #[test]
-    fn set_free_never_exceeds_total() {
+    fn equal_versions_of_different_length_fit_and_an_unreadable_version_never_does() {
+        let snap = host().snapshot().unwrap();
+        assert_eq!(snap.fit(&Compute::Cuda("12.4.0".into()), GB).len(), 2);
+        assert_eq!(snap.fit(&Compute::Cuda("12.4.1".into()), GB).len(), 0);
+        assert_eq!(snap.fit(&Compute::Cuda("abc".into()), GB).len(), 0);
+        assert_eq!(snap.fit(&Compute::Cuda("12.x".into()), GB).len(), 0);
+        let odd = Fake::new().with_device(Fake::cuda_card("gpu-9", "Odd", 8, "12.4-rc1"));
+        assert_eq!(odd.snapshot().unwrap().fit(&Compute::Cuda("1.0".into()), GB).len(), 0);
+    }
+
+    #[test]
+    fn set_free_refuses_an_unknown_device_and_more_than_the_total_by_name() {
         let fake = host();
-        fake.set_free(&"gpu-1".into(), 1000 * GB);
+        assert!(matches!(
+            fake.set_free(&"gpu-7".into(), GB).unwrap_err(),
+            GpuError::NoSuchDevice(ref id) if id == "gpu-7"
+        ));
+        assert!(matches!(
+            fake.set_free(&"gpu-1".into(), 1000 * GB).unwrap_err(),
+            GpuError::Invalid {
+                field: "free_bytes",
+                ..
+            }
+        ));
         let snap = fake.snapshot().unwrap();
         let b = snap.devices.iter().find(|d| d.id.0 == "gpu-1").unwrap();
-        assert_eq!(b.memory.free_bytes, b.memory.total_bytes);
+        assert_eq!(
+            b.memory.free_bytes, b.memory.total_bytes,
+            "a refused call changes nothing"
+        );
     }
 }
