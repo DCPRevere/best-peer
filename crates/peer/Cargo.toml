@@ -1,0 +1,25 @@
+[package]
+name = "best-peer"
+description = "A BEST peer: one binary that puts a GPU host behind a Behavioral State Protocol door."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "best-peer"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+best-peer-gpu = { path = "../gpu" }
+best-peer-runtime = { path = "../runtime" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

@@ -1,0 +1,11 @@
+[package]
+name = "best-peer-gpu"
+description = "The accelerator abstraction best-peer owns: a vendor-neutral snapshot of a host's devices, with a fake for tests. Adapters (NVML, ROCm, ...) are separate crates and are never unit-tested."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
