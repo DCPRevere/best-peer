@@ -351,9 +351,9 @@ pub fn event_defs() -> Vec<EventDef> {
         event(
             "deployment-ready",
             "DeploymentReady",
-            "The model answers at the endpoint: an OpenAI-compatible base URL to send prompts to, outside this door.",
+            "The model answers at the endpoint: an OpenAI-compatible base URL to send prompts to, outside this door, with the engine's own API and access. The model name goes in the request.",
             &["deployment", "model", "engine", "endpoint"],
-            json!({ "deployment": s("The deployment"), "model": s("The model"), "engine": s("ollama or vllm"), "endpoint": s("The OpenAI-compatible base URL, such as http://host:41434/v1") }),
+            json!({ "deployment": s("The deployment"), "model": s("The model name to put in the request"), "engine": s("ollama or vllm"), "endpoint": s("The OpenAI-compatible base URL, such as http://host:41434/v1; this door's credential is not presented there") }),
         ),
         event(
             "deployment-failed",

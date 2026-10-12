@@ -67,10 +67,26 @@ The facts follow on the event stream under the command's correlation id, in orde
 `DeploymentStarted`, `WeightsLoading`, then `DeploymentReady` with the OpenAI-compatible endpoint prompts go to, or
 `DeploymentFailed`. What the engine does on its own later (`OutOfMemory`, `DeploymentEnded`) is told under the same
 correlation id. `run-job` runs an image once and tells `JobStarted` and `JobFinished` with the exit code;
-`undeploy-model` and `stop-job` end them. Prompts never pass through the door: BEST carries the control path only.
+`undeploy-model` and `stop-job` end them.
 
 The peer's state is the fold of the events it told. After a restart it is rebuilt from the log and squared with what
 the engine still runs; a workload that ended while the peer was down is told so then.
+
+## The data path
+
+BEST carries the control path: the commands, the facts they produce and the state those facts fold to. The
+conversation with the model is not on it. `DeploymentReady` names the endpoint, an OpenAI-compatible base URL on the
+door's host, and the model name to put in the request; from then on a client prompts the engine there directly,
+with the engine's own API, and the door neither sees, proxies nor records a token. Two reasons. Streaming tokens
+through a protocol made for facts would add a hop and a format to every answer for nothing: a token is not a fact
+about the machine, and every client already speaks the API the engines expose. And the boundary keeps the door
+honest about what it promises: its events say what the machine runs, never what the model answered.
+
+Where the boundary lies: the door's credential ends at the door. The endpoint answers whoever reaches its port, with
+whatever access the engine itself enforces (none, in Ollama as installed), on the interfaces the peer binds the
+container's port to, or, in `native` mode, the ones the installed engine listens on. The door promises that the
+endpoint serves the model from `DeploymentReady` until `Undeployed`, `DeploymentEnded` or `OutOfMemory` is told,
+and `get-workloads` shows it meanwhile; what is said there, how fast and to whom, is the engine's.
 
 ## Commands over time
 
