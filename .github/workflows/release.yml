@@ -2,8 +2,8 @@ name: release
 
 # A release is a tag `v<version>` on a commit of `main`, made by `scripts/release.sh`. The tag must say what
 # `Cargo.toml` says; the binaries must say it too. Three targets are built from the locked tree, archived with the
-# README and the licence, summed, attested (SLSA build provenance) and published with notes made from the tag's
-# message and the commits since the previous release. Run by hand (workflow_dispatch) it builds and keeps the archives
+# README and the licence, summed, attested (SLSA build provenance) and published with notes made from the release
+# commit's message and the commits since the previous release. Run by hand (workflow_dispatch) it builds and keeps the archives
 # as run artifacts without publishing anything: that is how a change to this file is tried.
 
 on:
@@ -164,7 +164,7 @@ jobs:
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/best-peer-*
-      - name: Release notes, from the tag's message and the commits since the previous release
+      - name: Release notes, from the release commit's message and the commits since the previous release
         id: notes
         run: |
           set -euo pipefail

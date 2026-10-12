@@ -6,8 +6,8 @@
 #   scripts/release.sh 0.2.0 -m "The NVML adapter: a CUDA host says what it has and a deploy lands on the card."
 #
 # It refuses to run anywhere but a clean main that is level with origin, bumps the workspace version, refreshes the
-# lockfile, commits "Release <version>", tags it with the message (annotated, so the message heads the release
-# notes), and pushes main and the tag. The message is required: a release says what it is.
+# lockfile, commits "Release <version>" with the message as its body (that body heads the release notes), tags it
+# with the same message, and pushes main and the tag. The message is required: a release says what it is.
 set -euo pipefail
 
 usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
