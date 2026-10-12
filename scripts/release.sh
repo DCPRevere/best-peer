@@ -15,7 +15,7 @@ usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 version=""; message=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    -m) message="${2:-}"; shift 2 ;;
+    -m) [ $# -ge 2 ] || { echo "-m needs the message"; exit 2; }; message="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) if [ -z "$version" ]; then version="$1"; shift; else echo "unexpected argument $1"; usage; fi ;;
   esac
@@ -27,24 +27,30 @@ done
 cd "$(git rev-parse --show-toplevel)"
 [ "$(git rev-parse --abbrev-ref HEAD)" = main ] || { echo "releases are cut from main"; exit 1; }
 [ -z "$(git status --porcelain)" ] || { echo "the tree is not clean"; exit 1; }
-git fetch -q origin main
+git fetch -q --tags origin main
 [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || { echo "main is not level with origin/main: push (through the review gate) or pull first"; exit 1; }
 git rev-parse -q --verify "refs/tags/v$version" > /dev/null && { echo "v$version already exists"; exit 1; }
+[ -z "$(git ls-remote --tags origin "refs/tags/v$version")" ] || { echo "v$version already exists on origin"; exit 1; }
 current=$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
 [ "$current" != "$version" ] || { echo "Cargo.toml already says $version; a release is a new version"; exit 1; }
 latest=$(git tag --list 'v*' --sort=-version:refname | head -1)
 [ -z "$latest" ] || echo "latest release: $latest"
 
 # The one line under [workspace.package]; every crate inherits it. Perl, because sed differs between GNU and BSD.
+# Until the commit is made, a failure puts the tree back as it was.
+trap 'git checkout -q -- Cargo.toml Cargo.lock; echo "nothing changed"' ERR
 CURRENT="$current" VERSION="$version" perl -pi -e 'if (!$done && s/^version = "\Q$ENV{CURRENT}\E"$/version = "$ENV{VERSION}"/) { $done = 1 }' Cargo.toml
-grep -q "^version = \"$version\"$" Cargo.toml || { echo "could not set the version in Cargo.toml"; git checkout Cargo.toml; exit 1; }
+grep -q "^version = \"$version\"$" Cargo.toml || { echo "could not set the version in Cargo.toml"; false; }
 cargo update --workspace --offline -q 2>/dev/null || cargo update --workspace -q
 cargo build --release --locked -p best-peer -q
-[ "$(./target/release/best-peer --version)" = "best-peer $version" ] || { echo "the binary does not say $version"; exit 1; }
+[ "$(./target/release/best-peer --version)" = "best-peer $version" ] || { echo "the binary does not say $version"; false; }
 
 git add Cargo.toml Cargo.lock
 git commit -q -m "Release $version" -m "$message"
 git tag -a "v$version" -m "$message"
+# From here a failure is a push that did not go through: the commit and the tag are local, and this is the way back.
+trap 'echo "the push failed: main and v'"$version"' are only local. To try again: fix the cause, then git push origin main && git push origin v'"$version"'. To undo: git tag -d v'"$version"' && git reset --hard origin/main"' ERR
 git push origin main
 git push origin "v$version"
+trap - ERR
 echo "v$version pushed: https://github.com/behavioralstate/best-peer/actions/workflows/release.yml"
