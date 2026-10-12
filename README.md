@@ -43,6 +43,10 @@ curl http://127.0.0.1:7777/.well-known/best
 npx -y @behavioralstate/best-validate http://127.0.0.1:7777
 ```
 
+Or take a [release](https://github.com/behavioralstate/best-peer/releases): one binary per machine (Linux x86_64,
+static; Windows x86_64; macOS Apple silicon), with `SHA256SUMS` and a build provenance attestation
+(`gh attestation verify <archive> --repo behavioralstate/best-peer`). `best-peer --version` says which it is.
+
 `BEST_PEER_LISTEN` (default `127.0.0.1:7777`) is where it listens; `BEST_PEER_ENDPOINT` is the consumer-facing base URL
 the manifest advertises, required when the peer listens on every interface. `BEST_PEER_DATA` (default `~/.best-peer`)
 holds the event log, the credentials as hashes, and the admin token.

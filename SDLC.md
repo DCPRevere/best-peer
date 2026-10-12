@@ -41,10 +41,19 @@
 - **Before the push, the review gate**: `/best-review`, the owner-run review of everything `main` holds that origin
   does not. Every finding is fixed on `main` with a test or set aside with its reason in the report; nothing is dropped
   silently.
-- **The push is the release.** There is no deployment yet: a peer is built from `main` and run on a host by hand.
+- **The push is what runs.** A host run by the owner builds `main` and runs it; the sha is its version.
+- **A release is a tag.** `scripts/release.sh <version> -m "<what it is>"` bumps the one version in `Cargo.toml`
+  (every crate inherits it), commits `Release <version>`, tags `v<version>` with the message and pushes both; the
+  `release` workflow refuses a tag that is not on `main` or does not match `Cargo.toml`, runs the checks on the
+  locked tree, builds the binary for Linux x86_64 (static), Windows x86_64 and macOS Apple silicon, checks each says
+  the version, and publishes the archives with checksums, a build provenance attestation and notes made from the
+  tag's message and the commits since the previous release. A release is cut when someone other than the owner
+  will run the binary, or when a slice's issue says a host needs it; before 1.0 the minor goes up with a capability
+  and the patch with a fix. A change to the workflow is tried with its `workflow_dispatch`, which builds and keeps
+  the archives as run artifacts and publishes nothing.
 
 ## 5. What we do not do
 
-- No release versions until a peer is installed somewhere: the sha is the version.
+- No release of a commit the review gate has not passed; no tag made by hand.
 - No force-pushes, no push with an unfixed review finding or a red check.
 - No plan file, no `TODO`, no dated narrative: open work is an issue.

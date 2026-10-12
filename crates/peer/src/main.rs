@@ -107,8 +107,11 @@ fn main() {
     match args.first().map(String::as_str) {
         None => serve(),
         Some("approve") => approve(args.get(1).map(String::as_str)),
+        Some("--version" | "-V" | "version") => println!("best-peer {}", env!("CARGO_PKG_VERSION")),
         Some(other) => {
-            eprintln!("unknown command {other:?}: run with no arguments to serve, or `best-peer approve <code>`");
+            eprintln!(
+                "unknown command {other:?}: run with no arguments to serve, `best-peer approve <code>`, or `best-peer --version`"
+            );
             std::process::exit(2);
         }
     }
