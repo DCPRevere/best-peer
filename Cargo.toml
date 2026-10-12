@@ -6,6 +6,7 @@ members = [
     "crates/engine",
     "crates/door",
     "crates/host",
+    "crates/nvml",
     "crates/docker",
     "crates/native",
     "crates/engine-http",

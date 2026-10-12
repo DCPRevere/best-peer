@@ -13,6 +13,9 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+mod combined;
+pub use combined::Combined;
+
 /// A stable, vendor-opaque identifier for one device: the NVML UUID, a PCI bus id, whatever the adapter can keep
 /// stable across restarts. It is what a runtime is handed to expose the device to a container.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

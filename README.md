@@ -29,6 +29,7 @@ is that record, made with the published connector and a client that had nothing 
 | `crates/engine` | The inference engine abstraction (`Engine`): which engines serve a model (Ollama, vLLM), what to run for each, and how a served model is made ready, with progress. Ships the `Fake`. |
 | `crates/peer` | The `best-peer` binary: the door over the three abstractions, with the peer's own commands, queries and events, its state folded from the events it told, and `best-peer approve`, the operator's side of sign-in. |
 | `crates/host` | The host itself as a device: a `Gpu` adapter reporting the CPU and system memory, so a peer with no accelerator serves the whole lifecycle. |
+| `crates/nvml` | The `Gpu` adapter for NVIDIA cards through NVML: memory, temperature, power, utilisation and the CUDA version, read live; the peer refuses to start without the driver unless told the host has none. |
 | `crates/docker` | The `Runtime` adapter over the Docker Engine API: NVIDIA devices handed over through the container toolkit by their NVML UUID. |
 | `crates/native` | The `Runtime` adapter for engines already running on the host outside any container (an installed Ollama): a deploy binds to the engine's own port; jobs need Docker. |
 | `crates/engine-http` | The `Engine` adapter over the engines' own HTTP APIs. |
@@ -51,6 +52,11 @@ static; Windows x86_64; macOS Apple silicon), with `SHA256SUMS` and a build prov
 `BEST_PEER_LISTEN` (default `127.0.0.1:7777`) is where it listens; `BEST_PEER_ENDPOINT` is the consumer-facing base URL
 the manifest advertises, required when the peer listens on every interface. `BEST_PEER_DATA` (default `~/.best-peer`)
 holds the event log, the credentials as hashes, and the admin token.
+
+`BEST_PEER_GPU` (default `nvml`) is how the peer sees the hardware: through the NVIDIA driver's own library, every
+card with its memory, temperature, power, utilisation and the CUDA version the driver offers, read live at every
+query, and the host CPU with the system memory listed after the cards; a host without the driver is refused at
+start, with the fix. `none` says this host has no accelerator, and the CPU is the one device.
 
 The container engine is Docker on the same host, reached through its socket or named pipe; the peer refuses to start
 without it unless `BEST_PEER_RUNTIME` says otherwise: `native` deploys to an engine already running on the host

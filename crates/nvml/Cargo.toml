@@ -1,0 +1,11 @@
+[package]
+name = "best-peer-nvml"
+description = "The Gpu adapter for NVIDIA devices through NVML: each card with its memory, temperature, power, utilisation and CUDA version, read live. Thin; proven on a GPU host by hand, never unit-tested."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+best-peer-gpu = { path = "../gpu" }
+nvml-wrapper = "0.13"

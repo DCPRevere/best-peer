@@ -117,6 +117,27 @@ fn main() {
     }
 }
 
+/// The hardware the peer places workloads on, by `BEST_PEER_GPU`: `nvml` (the default) reads the NVIDIA cards
+/// through the driver's own library and refuses to start without it, since a GPU host that cannot see its cards is
+/// misconfigured; `none` says this host has no accelerator, and the CPU with the system memory is the one device.
+/// With cards, the host CPU is listed after them, so a CPU deploy is placed there too.
+fn accelerator(kind: Option<&str>) -> Result<Arc<dyn Gpu>, String> {
+    let host = best_peer_host::HostCpu::new();
+    match kind {
+        None | Some("nvml") => {
+            let cards = best_peer_nvml::NvmlGpu::init().map_err(|e| {
+                format!("{e}; this peer needs the NVIDIA driver, or BEST_PEER_GPU=none to serve on the CPU alone")
+            })?;
+            Ok(Arc::new(best_peer_gpu::Combined::new(vec![
+                Box::new(cards),
+                Box::new(host),
+            ])))
+        }
+        Some("none") => Ok(Arc::new(host)),
+        Some(other) => Err(format!("BEST_PEER_GPU must be nvml or none, not {other:?}")),
+    }
+}
+
 /// The container engine and the inference engine's client, by `BEST_PEER_RUNTIME`: `docker` (the default) talks to
 /// the Docker Engine on this host and refuses to start when it cannot; `native` deploys to engines already running
 /// on this host outside any container (an installed Ollama), with no jobs; `fake` serves the whole surface against
@@ -175,7 +196,7 @@ async fn serve() {
     let log = Arc::new(
         EventLog::open(&dir).unwrap_or_else(|e| fail(&format!("cannot keep the event log in {}: {e}", dir.display()))),
     );
-    let gpu: Arc<dyn Gpu> = Arc::new(best_peer_host::HostCpu::new());
+    let gpu = accelerator(std::env::var("BEST_PEER_GPU").ok().as_deref()).unwrap_or_else(|why| fail(&why));
     // The engines' ports are bound where the door is reached: this machine only, unless the door is open to others.
     let bind_ip = if listen.ip().is_loopback() {
         "127.0.0.1"
@@ -281,6 +302,18 @@ mod tests {
     use best_peer_door::{Envelope, FakeApprover, Filter};
     use best_peer_runtime::ContainerId;
     use http_body_util::BodyExt;
+
+    #[test]
+    fn the_hardware_switch_names_its_values_and_none_is_the_host_alone() {
+        let host = accelerator(Some("none")).unwrap().snapshot().unwrap();
+        assert_eq!(host.devices.len(), 1);
+        assert_eq!(host.devices[0].id.0, "cpu-0");
+        assert!(host.driver.is_none());
+        match accelerator(Some("rocm")) {
+            Err(why) => assert!(why.contains("nvml or none"), "{why}"),
+            Ok(_) => panic!("an unknown value was accepted"),
+        }
+    }
     use serde_json::{json, Value};
     use tower::ServiceExt;
 

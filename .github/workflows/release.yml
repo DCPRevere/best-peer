@@ -88,8 +88,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+          # glibc, not musl: the NVIDIA driver's library is loaded at run time, which a static binary cannot do.
+          # Built on the oldest runner so the binary runs on any distribution with glibc 2.35 or newer.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -108,9 +110,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: musl toolchain, for a Linux binary that runs on any distribution
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked -p best-peer --target ${{ matrix.target }}
       - name: The binary says the version the tag says
         shell: bash
@@ -193,7 +192,7 @@ jobs:
             echo
             echo "| Machine | Archive |"
             echo "|---|---|"
-            echo "| Linux x86_64 (static, any distribution) | \`best-peer-$version-x86_64-unknown-linux-musl.tar.gz\` |"
+            echo "| Linux x86_64 (glibc 2.35 or newer) | \`best-peer-$version-x86_64-unknown-linux-gnu.tar.gz\` |"
             echo "| Windows x86_64 | \`best-peer-$version-x86_64-pc-windows-msvc.zip\` |"
             echo "| macOS Apple silicon | \`best-peer-$version-aarch64-apple-darwin.tar.gz\` |"
             echo

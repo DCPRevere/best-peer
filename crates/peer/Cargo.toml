@@ -19,6 +19,7 @@ best-peer-engine-http = { path = "../engine-http" }
 best-peer-gpu = { path = "../gpu" }
 best-peer-host = { path = "../host" }
 best-peer-native = { path = "../native" }
+best-peer-nvml = { path = "../nvml" }
 best-peer-runtime = { path = "../runtime" }
 serde = { workspace = true }
 serde_json = { workspace = true }
