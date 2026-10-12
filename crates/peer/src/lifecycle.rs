@@ -983,10 +983,13 @@ fn place(
             .free_bytes
             .min(d.memory.total_bytes.saturating_sub(state.reserved_on(&d.id)))
     };
+    // The engine's APIs are listed in the order it prefers them (an accelerator before the CPU, which always has the
+    // most room): the first API any fitting device offers wins, and among those the device with the most room.
+    let rank = |c: &Compute| apis.iter().position(|w| w == c).unwrap_or(apis.len());
     let best = offering
         .iter()
         .filter(|(d, _)| room(d) >= memory_bytes)
-        .max_by_key(|(d, _)| room(d));
+        .min_by_key(|(d, c)| (rank(c), std::cmp::Reverse(room(d))));
     if let Some((d, c)) = best {
         return Ok((d.id.clone(), c.clone()));
     }
@@ -1088,6 +1091,27 @@ pub fn host_of(endpoint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_card_with_room_wins_over_the_host_cpu_whatever_the_ram() {
+        let mut cpu = best_peer_gpu::Fake::cuda_card("cpu-0", "host", 120, "0");
+        cpu.compute = vec![Compute::Cpu];
+        let host = Host {
+            driver: None,
+            devices: vec![cpu, best_peer_gpu::Fake::cuda_card("GPU-a", "card", 24, "12.8")],
+            observed_at: std::time::SystemTime::now(),
+        };
+        let state = State::default();
+        let ollama = best_peer_engine::Kind::Ollama.runs_on();
+        let (id, api) = place(&host, &state, &ollama, 4 << 30, None, "ollama").unwrap();
+        assert_eq!((id.0.as_str(), api), ("GPU-a", Compute::Cuda("0".into())));
+        // Only when no card has the room does the CPU take it.
+        let (id, api) = place(&host, &state, &ollama, 30 << 30, None, "ollama").unwrap();
+        assert_eq!((id.0.as_str(), api), ("cpu-0", Compute::Cpu));
+        // A job with no stated API goes to the card too.
+        let (id, _) = place(&host, &state, &any_compute(), 1 << 30, None, "a job").unwrap();
+        assert_eq!(id.0, "GPU-a");
+    }
 
     #[test]
     fn the_engines_host_is_the_endpoints_host() {

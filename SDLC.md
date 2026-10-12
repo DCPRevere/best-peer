@@ -47,7 +47,8 @@
   inherits it), commits `Release <version>`, which holds nothing but the version and is the one commit that skips
   the gate, tags `v<version>` with the message and pushes both. The `release` workflow refuses a tag that is not on
   `main`, not on a `Release <version>` commit or not equal to `Cargo.toml`, waits for `ci` to pass on that commit,
-  runs the checks on the locked tree, builds the binary for Linux x86_64 (static), Windows x86_64 and macOS Apple
+  runs the checks on the locked tree, builds the binary for Linux x86_64 (glibc 2.35 or newer: the driver's library is loaded at run time, which a
+  static binary cannot do), Windows x86_64 and macOS Apple
   silicon, checks each says the version, and publishes the archives with checksums, a build provenance attestation
   and notes made from the tag's message and the commits since the previous release. A release is cut when someone
   other than the owner will run the binary, or when a slice's issue says a host needs it; before 1.0 the minor goes

@@ -33,12 +33,13 @@ impl Gpu for NvmlGpu {
     fn snapshot(&self) -> Result<Host, GpuError> {
         let lib = |e: NvmlError| GpuError::Library(e.to_string());
         let driver = self.nvml.sys_driver_version().map_err(lib)?;
-        // The CUDA version the driver offers, as "major.minor": what a workload's "needs CUDA 12.4" is matched against.
+        // The CUDA version the driver offers, as "major.minor": what a workload's "needs CUDA 12.4" is matched
+        // against. A driver that cannot say is an error here, not a card without CUDA: nothing is placed on a guess.
         let cuda = self
             .nvml
             .sys_cuda_driver_version()
-            .ok()
-            .map(|v| format!("{}.{}", cuda_driver_version_major(v), cuda_driver_version_minor(v)));
+            .map(|v| format!("{}.{}", cuda_driver_version_major(v), cuda_driver_version_minor(v)))
+            .map_err(|e| GpuError::Library(format!("the driver did not say its CUDA version: {e}")))?;
         let count = self.nvml.device_count().map_err(lib)?;
         let mut devices = Vec::with_capacity(count as usize);
         for index in 0..count {
@@ -46,11 +47,6 @@ impl Gpu for NvmlGpu {
             // The UUID is stable across restarts and is what the container runtime is handed.
             let id = d.uuid().map_err(lib)?;
             let memory = d.memory_info().map_err(lib)?;
-            let mut compute = Vec::new();
-            if let Some(cuda) = &cuda {
-                compute.push(Compute::Cuda(cuda.clone()));
-            }
-            compute.push(Compute::Vulkan);
             devices.push(Device {
                 id: DeviceId(id),
                 vendor: Vendor::Nvidia,
@@ -59,7 +55,7 @@ impl Gpu for NvmlGpu {
                     total_bytes: memory.total,
                     free_bytes: memory.free,
                 },
-                compute,
+                compute: vec![Compute::Cuda(cuda.clone()), Compute::Vulkan],
                 // Where a card does not report a reading, the field says so rather than guessing.
                 temperature_c: d.temperature(TemperatureSensor::Gpu).ok().map(|t| t as f32),
                 power_w: d.power_usage().ok().map(|mw| mw as f32 / 1000.0),

@@ -64,8 +64,11 @@ card=$(echo "$hw" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(n
 
 say "deploy $model with ollama on $card, 4 GB:"
 envelope=$(python3 -c 'import json,sys,datetime; print(json.dumps({"specversion":"1.0","id":"gpu-proof-deploy","source":"https://proof.local/agent","type":"DeployModel","datacontenttype":"application/json","dataschema":sys.argv[1]+"/commands/deploy-model/1.0","time":datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),"data":{"model":sys.argv[2],"engine":"ollama","memory_bytes":4*2**30,"device":sys.argv[3]}}))' "$base" "$model" "$card")
-accepted=$(curl -s -H "X-Api-Key: $key" -H "Content-Type: application/cloudevents+json" -d "$envelope" "$base/commands")
-say "  $accepted"
+accepted=$(curl -s -w '\n%{http_code}' -H "X-Api-Key: $key" -H "Content-Type: application/cloudevents+json" -d "$envelope" "$base/commands")
+status=$(echo "$accepted" | tail -1)
+say "  $status $(echo "$accepted" | head -1)"
+# A refusal is the outcome: it names the field and the fix, and no event follows.
+[ "$status" = 201 ] || { say "the deploy was refused; that is the proof's result on this host"; say "get-workloads: $(curl -sf -H "X-Api-Key: $key" "$base/queries/get-workloads")"; exit 1; }
 outcome=$(wait_outcome gpu-proof-deploy)
 events gpu-proof-deploy | grep -v -E ' (ImagePulling|WeightsLoading) ' ; say "  progress events: $(events gpu-proof-deploy | grep -c -E ' (ImagePulling|WeightsLoading) ')"
 say "  outcome: $outcome"

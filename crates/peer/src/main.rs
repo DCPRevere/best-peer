@@ -125,8 +125,13 @@ fn accelerator(kind: Option<&str>) -> Result<Arc<dyn Gpu>, String> {
     let host = best_peer_host::HostCpu::new();
     match kind {
         None | Some("nvml") => {
-            let cards = best_peer_nvml::NvmlGpu::init().map_err(|e| {
-                format!("{e}; this peer needs the NVIDIA driver, or BEST_PEER_GPU=none to serve on the CPU alone")
+            let cards = best_peer_nvml::NvmlGpu::init().map_err(|e| match e {
+                best_peer_gpu::GpuError::NoDriver(_) => {
+                    format!("{e}; this peer needs the NVIDIA driver, or BEST_PEER_GPU=none to serve on the CPU alone")
+                }
+                other => format!(
+                    "the NVIDIA driver is here but could not be used: {other}; fix that, or BEST_PEER_GPU=none serves on the CPU alone"
+                ),
             })?;
             Ok(Arc::new(best_peer_gpu::Combined::new(vec![
                 Box::new(cards),
