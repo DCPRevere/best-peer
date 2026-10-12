@@ -11,6 +11,9 @@ use time::OffsetDateTime;
 
 use crate::error::BestError;
 
+/// The most characters an `id` or `correlationid` may have: an identifier, not a payload.
+const MAX_ID: usize = 256;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     pub specversion: String,
@@ -65,11 +68,24 @@ impl Envelope {
         if self.specversion != "1.0" {
             return refuse("specversion", "\"1.0\"");
         }
-        if self.id.trim().is_empty() {
-            return refuse("id", "a non-empty unique message id; it is the idempotency key");
+        if self.id.trim().is_empty() || self.id.len() > MAX_ID {
+            return refuse(
+                "id",
+                "a non-empty unique message id of at most 256 characters; it is the idempotency key",
+            );
         }
-        if self.source.trim().is_empty() {
-            return refuse("source", "a URI-reference naming the caller's origin");
+        if self.source.trim().is_empty() || self.source.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return refuse("source", "a URI-reference naming the caller's origin, with no spaces");
+        }
+        if self
+            .correlationid
+            .as_deref()
+            .is_some_and(|c| c.trim().is_empty() || c.len() > MAX_ID)
+        {
+            return refuse(
+                "correlationid",
+                "omitted, or a non-empty identifier of at most 256 characters",
+            );
         }
         if !is_pascal_case(&self.r#type) {
             return refuse(
@@ -151,6 +167,9 @@ mod tests {
             ("specversion", Box::new(|e| e.specversion = "0.3".into())),
             ("id", Box::new(|e| e.id = " ".into())),
             ("source", Box::new(|e| e.source = "".into())),
+            ("source", Box::new(|e| e.source = "not a uri".into())),
+            ("correlationid", Box::new(|e| e.correlationid = Some("".into()))),
+            ("id", Box::new(|e| e.id = "x".repeat(257))),
             ("type", Box::new(|e| e.r#type = "pull-image".into())),
             ("datacontenttype", Box::new(|e| e.datacontenttype = "text/plain".into())),
             ("dataschema", Box::new(|e| e.dataschema = None)),

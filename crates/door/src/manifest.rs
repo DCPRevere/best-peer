@@ -22,7 +22,7 @@ pub fn manifest(door: &Door) -> Value {
     let active = |has: bool| if has { "active" } else { "planned" };
     let mut events = cap(
         "io.best.agents.events",
-        "The lifecycle of every model and job, as it happens.",
+        "What the peer did, as it happened: every command's outcome, correlated to it.",
         "events",
         "active",
     );
@@ -51,10 +51,10 @@ pub fn manifest(door: &Door) -> Value {
                 }
             },
             "capabilities": [
-                cap("io.best.agents.commands", "Pull images, deploy and undeploy models, run and stop jobs.", "commands", active(door.catalogue.has_commands())),
+                cap("io.best.agents.commands", "What this peer can be asked to do; the catalogue lists each command.", "commands", active(door.catalogue.has_commands())),
                 events,
-                cap("io.best.agents.queries", "The host's accelerators and what is deployed and running on them.", "queries", active(door.catalogue.has_queries())),
-                cap("io.best.agents.workflows", "Recipes from an empty host to a model answering prompts.", "workflows", "active")
+                cap("io.best.agents.queries", "What this peer knows right now; the catalogue lists each query.", "queries", active(door.catalogue.has_queries())),
+                cap("io.best.agents.workflows", "Recipes that chain this peer's commands and queries; none is published yet.", "workflows", "planned")
             ]
         }
     })

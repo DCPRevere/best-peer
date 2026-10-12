@@ -38,14 +38,16 @@ pub fn config(listen: Option<&str>, endpoint: Option<&str>) -> Result<(SocketAdd
     Ok((listen, endpoint))
 }
 
-/// The peer's data directory: `BEST_PEER_DATA`, else `.best-peer` in the home directory.
+/// The peer's data directory: `BEST_PEER_DATA`, else `.best-peer` in the home directory. Never a relative path:
+/// the server and the operator's shell must resolve the same directory, or `best-peer approve` finds no token.
 fn data_dir() -> PathBuf {
     if let Ok(d) = std::env::var("BEST_PEER_DATA") {
         return PathBuf::from(d);
     }
-    std::env::home_dir()
-        .map(|h| h.join(".best-peer"))
-        .unwrap_or_else(|| PathBuf::from(".best-peer"))
+    match std::env::home_dir() {
+        Some(h) => h.join(".best-peer"),
+        None => fail("no home directory to keep the peer's data in: set BEST_PEER_DATA to an absolute path"),
+    }
 }
 
 /// The door of this peer over the given hardware and engine.
@@ -103,17 +105,26 @@ async fn serve() {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .unwrap_or_else(|e| fail(&format!("cannot listen on {listen}: {e}")));
+    if door.endpoint.starts_with("http://") && !listen.ip().is_loopback() {
+        tracing::warn!(endpoint = %door.endpoint, "the endpoint is cleartext and not loopback: credentials will travel unencrypted; put TLS in front before anyone but you uses it");
+    }
     tracing::info!(%listen, endpoint = %door.endpoint, data = %dir.display(), "best-peer is serving its door");
-    axum::serve(listener, best_peer_door::router(door))
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
-        })
-        .await
-        .unwrap_or_else(|e| fail(&format!("serving failed: {e}")));
+    let server = axum::serve(listener, best_peer_door::router(door)).with_graceful_shutdown(async {
+        tokio::signal::ctrl_c().await.ok();
+    });
+    // An open event stream never ends by itself, so a graceful stop would wait for it forever: a few seconds, then out.
+    let deadline = async {
+        tokio::signal::ctrl_c().await.ok();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    };
+    tokio::select! {
+        r = server => r.unwrap_or_else(|e| fail(&format!("serving failed: {e}"))),
+        _ = deadline => tracing::info!("stopping with event streams still open"),
+    }
 }
 
-/// `best-peer approve <code>`: presents this machine's admin token to the running peer for the code the person was
-/// shown. The token never leaves the machine; the peer is reached at `BEST_PEER_ENDPOINT` or the default address.
+/// `best-peer approve <code>`: presents this machine's admin token to the peer running on it, for the code the
+/// person was shown. The token goes to the listen address only, never to the public endpoint.
 fn approve(code: Option<&str>) {
     let Some(code) = code else {
         fail("usage: best-peer approve <code>, the code the agent showed the person")
@@ -123,16 +134,37 @@ fn approve(code: Option<&str>) {
         .map(|t| t.trim().to_string())
         .unwrap_or_else(|e| {
             fail(&format!(
-                "no admin token in {}: is the peer running on this machine? ({e})",
+                "no admin token in {}: is the peer running on this machine with the same BEST_PEER_DATA? ({e})",
                 dir.display()
             ))
         });
-    let endpoint = std::env::var("BEST_PEER_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:7777".into());
-    let url = format!("{}/auth/approve", endpoint.trim_end_matches('/'));
+    let listen = std::env::var("BEST_PEER_LISTEN").unwrap_or_else(|_| "127.0.0.1:7777".into());
+    let url = format!("http://{listen}/auth/approve");
     match ureq::post(&url).send_form([("user_code", code), ("proof", token.as_str())]) {
-        Ok(_) => println!("approved {code}: the agent's next poll gets its credential"),
+        Ok(mut res) => {
+            let admitted: serde_json::Value = res
+                .body_mut()
+                .read_to_string()
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let a = &admitted["admitted"];
+            let who = match a["agent_label"].as_str() {
+                Some(l) => format!("{l} ({})", a["client_id"].as_str().unwrap_or("?")),
+                None => a["client_id"].as_str().unwrap_or("?").to_string(),
+            };
+            println!(
+                "admitted {who} as connection {} with a {} credential: the agent's next poll gets it",
+                a["connection"].as_str().unwrap_or("(the host's name)"),
+                a["lifetime"].as_str().unwrap_or("durable")
+            );
+        }
+        Err(ureq::Error::StatusCode(403)) => fail(&format!(
+            "the peer refused the admin token in {}: it is not the token of the peer listening on {listen}",
+            dir.display()
+        )),
         Err(ureq::Error::StatusCode(status)) => fail(&format!(
-            "the peer refused ({status}): is {code} a live code shown by an agent?"
+            "the peer refused ({status}): is {code} a live code shown by an agent in the last ten minutes?"
         )),
         Err(e) => fail(&format!("cannot reach the peer at {url}: {e}")),
     }

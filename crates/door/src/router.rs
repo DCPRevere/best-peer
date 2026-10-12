@@ -1,12 +1,13 @@
 //! The HTTP routes the spec names (SPEC.md, HTTP Transport and the four capabilities), over a [`Door`]. The manifest
-//! and the two OAuth endpoints are public; everything else needs the credential in the `X-Api-Key` header.
+//! and the two OAuth endpoints are public; everything else needs the credential in the `X-Api-Key` header. Every
+//! error the door answers, the framework's included, is in the BEST error format.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -14,19 +15,23 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::{self, Stream, StreamExt};
+use futures::FutureExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::auth::{DeviceRequest, OAuthError, TokenRequest, AUTH_HEADER};
+use crate::auth::{Credential, DeviceRequest, OAuthError, TokenRequest, AUTH_HEADER};
 use crate::envelope::Envelope;
 use crate::error::BestError;
-use crate::log::{Accept, Filter};
+use crate::log::{Accept, Filter, MAX_PAGE};
 use crate::{manifest, Door};
 
 type Shared = Arc<Door>;
+
+/// The most a request body may carry: a command is a few kilobytes, a form a few hundred bytes.
+const MAX_BODY: usize = 256 * 1024;
 
 pub fn router(door: Shared) -> Router {
     let public = Router::new()
@@ -47,20 +52,94 @@ pub fn router(door: Shared) -> Router {
         .route("/workflows", get(workflow_index))
         .route("/workflows/:id", get(workflow))
         .layer(middleware::from_fn_with_state(door.clone(), require_key));
-    public.merge(protected).with_state(door)
+    public
+        .merge(protected)
+        .fallback(unknown_route)
+        .layer(middleware::map_response(best_shaped))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .with_state(door)
 }
 
-async fn require_key(State(door): State<Shared>, req: Request, next: Next) -> Response {
+async fn require_key(State(door): State<Shared>, mut req: Request, next: Next) -> Response {
     let key = req
         .headers()
         .get(AUTH_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .unwrap_or("");
-    if key.is_empty() || door.auth.authenticate(key).is_none() {
+    let Some(credential) = (!key.is_empty()).then(|| door.auth.authenticate(key)).flatten() else {
         return BestError::unauthorized().into_response();
-    }
+    };
+    req.extensions_mut().insert(credential);
     next.run(req).await
+}
+
+async fn unknown_route(req: Request) -> BestError {
+    BestError::not_found(
+        "NOT_FOUND",
+        format!(
+            "no such route: {} {}. The manifest at /.well-known/best lists every capability path",
+            req.method(),
+            req.uri().path()
+        ),
+    )
+}
+
+/// The framework answers some refusals on its own (a method the route lacks, a body over the limit, a query string
+/// it cannot read) in plain text; the spec wants every error in one shape, so those are rewritten here.
+async fn best_shaped(res: Response) -> Response {
+    let status = res.status();
+    if !(status.is_client_error() || status.is_server_error()) {
+        return res;
+    }
+    let is_json = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
+    if is_json {
+        return res;
+    }
+    let (parts, body) = res.into_parts();
+    let text = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+        .unwrap_or_default();
+    let (code, message): (&'static str, String) = match status {
+        StatusCode::METHOD_NOT_ALLOWED => (
+            "METHOD_NOT_ALLOWED",
+            "this route does not take that method: the manifest's endpoints say which".into(),
+        ),
+        StatusCode::PAYLOAD_TOO_LARGE => ("PAYLOAD_TOO_LARGE", format!("the body exceeds {MAX_BODY} bytes")),
+        StatusCode::BAD_REQUEST => (
+            "BAD_REQUEST",
+            if text.is_empty() {
+                "the request could not be read".into()
+            } else {
+                text
+            },
+        ),
+        StatusCode::NOT_FOUND => ("NOT_FOUND", if text.is_empty() { "no such route".into() } else { text }),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => (
+            "UNSUPPORTED_MEDIA_TYPE",
+            if text.is_empty() {
+                "unsupported Content-Type".into()
+            } else {
+                text
+            },
+        ),
+        s if s.is_server_error() => ("INTERNAL", "the door failed; try again".into()),
+        _ => ("REFUSED", if text.is_empty() { status.to_string() } else { text }),
+    };
+    let mut out = BestError::new(status, code, message).into_response();
+    for (name, value) in parts
+        .headers
+        .iter()
+        .filter(|(n, _)| *n != header::CONTENT_TYPE && *n != header::CONTENT_LENGTH)
+    {
+        out.headers_mut().insert(name.clone(), value.clone());
+    }
+    out
 }
 
 async fn well_known(State(door): State<Shared>) -> impl IntoResponse {
@@ -117,8 +196,8 @@ struct ApproveForm {
 
 async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
     let f: ApproveForm = form(&headers, &body)?;
-    door.auth.approve(f.user_code.trim(), f.proof.trim()).await?;
-    Ok(Json(json!({ "approved": true })).into_response())
+    let admitted = door.auth.approve(f.user_code.trim(), f.proof.trim()).await?;
+    Ok(Json(json!({ "approved": true, "admitted": admitted })).into_response())
 }
 
 // ----- commands ----------------------------------------------------------------------------------------------------
@@ -146,7 +225,12 @@ async fn command_document(
         .into_response())
 }
 
-async fn ingest(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, BestError> {
+async fn ingest(
+    State(door): State<Shared>,
+    Extension(sender): Extension<Credential>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, BestError> {
     let ct = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -167,7 +251,10 @@ async fn ingest(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> 
     let def = door.catalogue.command_by_type(&envelope.r#type).ok_or_else(|| {
         BestError::bad_request(
             "UNKNOWN_TYPE",
-            format!("type {} is not a command this door accepts: GET /commands lists them, and commandType is the value to send", envelope.r#type),
+            format!(
+                "type {} is not a command this door accepts: GET /commands lists them, and commandType is the value to send",
+                envelope.r#type
+            ),
         )
         .with_details(json!({ "accepted": door.catalogue.command_types() }))
     })?;
@@ -186,24 +273,37 @@ async fn ingest(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> 
 
     let correlation = envelope.effective_correlation();
     let hash = hex::encode(Sha256::digest(
-        serde_json::to_vec(&json!({ "type": envelope.r#type, "data": envelope.data })).unwrap(),
+        serde_json::to_vec(&json!({ "type": envelope.r#type, "data": envelope.data })).expect("json"),
     ));
-    match door.log.accept_command(&envelope.id, &hash) {
+    let answered = match door.log.accept_command(&sender.hash, &envelope.id, &hash, &correlation) {
         Accept::Conflict => {
             return Err(BestError::conflict(format!(
                 "id {} was already used for a different command: a new command needs a new id",
                 envelope.id
             )))
         }
-        Accept::Duplicate => {}
+        Accept::Duplicate { correlation: original } => original,
         Accept::New => {
             let emitter = door.emitter(&correlation);
-            tokio::spawn((def.handler)(envelope.clone(), emitter));
+            let handler = (def.handler)(envelope.clone(), emitter.clone());
+            let command_type = envelope.r#type.clone();
+            tokio::spawn(async move {
+                if let Err(panic) = std::panic::AssertUnwindSafe(handler).catch_unwind().await {
+                    let reason = panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "the handler panicked".into());
+                    tracing::error!(command = %command_type, %reason, "a command handler panicked");
+                    emitter.emit("CommandFailed", json!({ "type": command_type, "reason": reason }));
+                }
+            });
+            correlation
         }
-    }
+    };
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "id": envelope.id, "correlationId": correlation })),
+        Json(json!({ "id": envelope.id, "correlationId": answered })),
     )
         .into_response())
 }
@@ -217,19 +317,26 @@ fn filter_from(q: &HashMap<String, String>) -> Result<Filter, BestError> {
     };
     let time = |param: &str| -> Result<Option<OffsetDateTime>, BestError> {
         q.get(param)
-            .map(|v| OffsetDateTime::parse(v, &Rfc3339).map_err(|_| bad(param, "an ISO 8601 timestamp")))
+            .map(|v| {
+                OffsetDateTime::parse(v, &Rfc3339)
+                    .map_err(|_| bad(param, "an ISO 8601 timestamp such as 2026-10-12T10:30:00Z"))
+            })
             .transpose()
     };
+    let limit = q
+        .get("limit")
+        .map(|v| match v.parse::<usize>() {
+            Ok(n) if (1..=MAX_PAGE).contains(&n) => Ok(n),
+            _ => Err(bad("limit", &format!("a number from 1 to {MAX_PAGE}"))),
+        })
+        .transpose()?;
     Ok(Filter {
         r#type: q.get("type").cloned(),
         correlation_id: q.get("correlationId").cloned(),
         source: q.get("source").cloned(),
         from: time("from")?,
         to: time("to")?,
-        limit: q
-            .get("limit")
-            .map(|v| v.parse::<usize>().map_err(|_| bad("limit", "a positive number")))
-            .transpose()?,
+        limit,
         after: q
             .get("after")
             .map(|v| {
@@ -253,6 +360,8 @@ async fn list_events(
     Ok(Json(body))
 }
 
+/// Replays what came after `Last-Event-ID`, then follows live; the two never overlap. A client that falls behind
+/// the buffer is cut off, so it reconnects with its last id and misses nothing silently.
 async fn stream_events(
     State(door): State<Shared>,
     headers: HeaderMap,
@@ -263,17 +372,19 @@ async fn stream_events(
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let rx = door.log.subscribe();
+    let (rx, seen_up_to) = door.log.subscribe();
     let replay = match last {
         Some(id) => door.log.since_id(&id),
         None => Vec::new(),
     };
     let f1 = filter.clone();
     let replayed = stream::iter(replay.into_iter().filter(move |s| f1.matches(s)));
-    let live = BroadcastStream::new(rx).filter_map(move |r| {
-        let keep = r.ok().filter(|s| filter.matches(s));
-        async move { keep }
-    });
+    let live = BroadcastStream::new(rx)
+        .take_while(|r| futures::future::ready(r.is_ok()))
+        .filter_map(move |r| {
+            let keep = r.ok().filter(|s| s.seq > seen_up_to && filter.matches(s));
+            async move { keep }
+        });
     let out = replayed.chain(live).map(|s| {
         Ok(SseEvent::default()
             .id(s.envelope.id.clone())
@@ -337,6 +448,7 @@ async fn execute_query(
         .catalogue
         .query_by_schema(&schema)
         .ok_or_else(|| query_not_found(&schema))?;
+    door.catalogue.validate_params(&schema, &params)?;
     Ok(Json((def.handler)(params).await?))
 }
 
@@ -377,6 +489,9 @@ mod tests {
                 impact: None,
                 handler: Arc::new(|cmd, emitter| {
                     Box::pin(async move {
+                        if cmd.data["image"] == "panic:1" {
+                            panic!("the engine exploded");
+                        }
                         emitter.emit("ImagePulled", json!({ "image": cmd.data["image"] }));
                     })
                 }),
@@ -392,7 +507,7 @@ mod tests {
                 schema: "get-peer".into(),
                 version: "1.0".into(),
                 description: "Who this peer is.".into(),
-                parameters: None,
+                parameters: Some(json!({ "type": "object", "properties": { "x": { "type": "string", "enum": ["1", "2"] } }, "additionalProperties": false })),
                 response: json!({ "type": "object", "properties": { "name": { "type": "string" } } }),
                 handler: Arc::new(|p| Box::pin(async move { Ok(json!({ "name": "peer", "echo": p.get("x") })) })),
             });
@@ -440,14 +555,14 @@ mod tests {
     }
 
     /// Registers through the device flow and returns a working key.
-    async fn sign_in(app: &Router) -> String {
+    async fn sign_in(app: &Router, client: &str, connection: &str) -> String {
         let (s, _, a) = call(
             app,
-            post_form("/auth/device", &[("client_id", "test"), ("connection", "my-peer")]),
+            post_form("/auth/device", &[("client_id", client), ("connection", connection)]),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{a}");
-        let (s, _, _) = call(
+        let (s, _, ok) = call(
             app,
             post_form(
                 "/auth/approve",
@@ -456,6 +571,7 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::OK);
+        assert_eq!(ok["admitted"]["connection"], connection);
         let (s, h, t) = call(
             app,
             post_form(
@@ -463,7 +579,7 @@ mod tests {
                 &[
                     ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                     ("device_code", a["device_code"].as_str().unwrap()),
-                    ("client_id", "test"),
+                    ("client_id", client),
                 ],
             ),
         )
@@ -479,6 +595,15 @@ mod tests {
             "datacontenttype": "application/json", "dataschema": format!("{EP}/commands/pull-image/1.0"),
             "time": "2026-10-12T10:30:00Z", "data": { "image": image }
         })
+    }
+
+    async fn settle(d: &Shared, at_least: usize) {
+        for _ in 0..200 {
+            if d.log.len() >= at_least {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     #[tokio::test]
@@ -509,9 +634,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_error_the_framework_answers_is_in_the_best_shape() {
+        let app = router(door());
+        let key = sign_in(&app, "test", "my-peer").await;
+        let (s, _, b) = call(&app, get("/nothing/here", Some(&key))).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert_eq!(b["error"]["code"], "NOT_FOUND");
+        assert!(b["error"]["message"].as_str().unwrap().contains("/nothing/here"));
+        let (s, _, b) = call(
+            &app,
+            Request::delete("/commands")
+                .header(AUTH_HEADER, &key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(b["error"]["code"], "METHOD_NOT_ALLOWED");
+        let big = "x".repeat(MAX_BODY + 1);
+        let (s, _, b) = call(
+            &app,
+            post_json("/commands", &key, "application/json", json!({ "pad": big })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(b["error"]["code"], "PAYLOAD_TOO_LARGE");
+        let (s, _, b) = call(&app, get("/events?limit=0", Some(&key))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(b["error"]["details"]["parameter"], "limit");
+        let (s, _, b) = call(&app, get("/events?limit=5000", Some(&key))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(b["error"]["message"].as_str().unwrap().contains("200"));
+    }
+
+    #[tokio::test]
     async fn sign_in_end_to_end_then_the_catalogue_opens() {
         let app = router(door());
-        let key = sign_in(&app).await;
+        let key = sign_in(&app, "test", "my-peer").await;
         let (s, _, c) = call(&app, get("/commands", Some(&key))).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(c["commands"][0]["commandType"], "PullImage");
@@ -553,7 +712,7 @@ mod tests {
     async fn a_command_is_recorded_correlated_and_its_events_are_readable() {
         let d = door();
         let app = router(d.clone());
-        let key = sign_in(&app).await;
+        let key = sign_in(&app, "test", "my-peer").await;
         let (s, _, b) = call(
             &app,
             post_json(
@@ -567,31 +726,19 @@ mod tests {
         assert_eq!(s, StatusCode::CREATED, "{b}");
         assert_eq!(b["id"], "cmd-1");
         assert_eq!(b["correlationId"], "cmd-1");
-        tokio::task::yield_now().await;
-        for _ in 0..50 {
-            if !d.log.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        settle(&d, 1).await;
         let (s, _, e) = call(&app, get("/events?correlationId=cmd-1", Some(&key))).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(e["events"][0]["type"], "ImagePulled");
         assert_eq!(e["events"][0]["correlationid"], "cmd-1");
         assert_eq!(e["events"][0]["dataschema"], format!("{EP}/events/image-pulled/1.0"));
         assert_eq!(e["events"][0]["source"], "io.best.agents");
-        // The same id again is ignored safely; the same id with another payload is a conflict.
-        let (s, _, _) = call(
-            &app,
-            post_json(
-                "/commands",
-                &key,
-                "application/json",
-                command("cmd-1", json!("ollama/ollama:0.6")),
-            ),
-        )
-        .await;
+        // The same id again is ignored safely and told the original correlation, even when the retry names another.
+        let mut retry = command("cmd-1", json!("ollama/ollama:0.6"));
+        retry["correlationid"] = json!("something-else");
+        let (s, _, b) = call(&app, post_json("/commands", &key, "application/json", retry)).await;
         assert_eq!(s, StatusCode::CREATED);
+        assert_eq!(b["correlationId"], "cmd-1");
         let (s, _, c) = call(
             &app,
             post_json(
@@ -604,13 +751,47 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::CONFLICT);
         assert_eq!(c["error"]["code"], "CONFLICT");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert_eq!(d.log.len(), 1, "the duplicate ran no handler");
+        // Another sender's identical id is their own command.
+        let other = sign_in(&app, "other", "other-peer").await;
+        let (s, _, _) = call(
+            &app,
+            post_json(
+                "/commands",
+                &other,
+                "application/json",
+                command("cmd-1", json!("ollama/ollama:0.6")),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        settle(&d, 2).await;
+        assert_eq!(d.log.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_handler_that_panics_leaves_a_failure_event_not_silence() {
+        let d = door();
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        let (s, _, _) = call(
+            &app,
+            post_json("/commands", &key, "application/json", command("boom", json!("panic:1"))),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        settle(&d, 1).await;
+        let (events, _) = d.log.list(&Filter::default());
+        assert_eq!(events[0].r#type, "CommandFailed");
+        assert_eq!(events[0].correlationid.as_deref(), Some("boom"));
+        assert!(events[0].data["reason"].as_str().unwrap().contains("exploded"));
     }
 
     #[tokio::test]
     async fn every_refusal_says_what_to_send_instead() {
         let app = router(door());
-        let key = sign_in(&app).await;
+        let key = sign_in(&app, "test", "my-peer").await;
         let mut unknown = command("c2", json!("x"));
         unknown["type"] = json!("Explode");
         let (s, _, e) = call(&app, post_json("/commands", &key, "application/json", unknown)).await;
@@ -640,6 +821,11 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(e["error"]["code"], "INVALID_ENVELOPE");
+        let mut empty_corr = command("c5", json!("x"));
+        empty_corr["correlationid"] = json!("");
+        let (s, _, e) = call(&app, post_json("/commands", &key, "application/json", empty_corr)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(e["error"]["details"]["attribute"], "correlationid");
         let (s, _, e) = call(&app, get("/commands/nope/1.0", Some(&key))).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert_eq!(e["error"]["code"], "SCHEMA_NOT_FOUND");
@@ -650,23 +836,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queries_are_catalogued_documented_executed_and_unknown_ones_are_404() {
+    async fn queries_are_catalogued_documented_executed_with_their_parameters_checked() {
         let app = router(door());
-        let key = sign_in(&app).await;
+        let key = sign_in(&app, "test", "my-peer").await;
         let (_, _, c) = call(&app, get("/queries", Some(&key))).await;
         assert_eq!(c["queries"][0]["dataschema"], format!("{EP}/queries/get-peer/1.0"));
         let (s, _, d) = call(&app, get("/queries/get-peer/1.0", Some(&key))).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(d["response"]["type"], "object");
+        assert_eq!(d["parameters"]["properties"]["x"]["type"], "string");
         let (s, _, r) = call(&app, get("/queries/get-peer?x=1", Some(&key))).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(r["echo"], "1");
+        let (s, _, e) = call(&app, get("/queries/get-peer?x=9", Some(&key))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(e["error"]["code"], "INVALID_PARAMETER");
+        assert_eq!(e["error"]["details"]["errors"][0]["parameter"], "x");
+        let (s, _, e) = call(&app, get("/queries/get-peer?y=1", Some(&key))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
         let (s, _, e) = call(&app, get("/queries/nope", Some(&key))).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert_eq!(e["error"]["code"], "SCHEMA_NOT_FOUND");
-        let (s, _, e) = call(&app, get("/events?limit=zero", Some(&key))).await;
-        assert_eq!(s, StatusCode::BAD_REQUEST);
-        assert_eq!(e["error"]["details"]["parameter"], "limit");
         let (s, _, w) = call(&app, get("/workflows", Some(&key))).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(w["workflows"], json!([]));
@@ -675,10 +865,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_stream_replays_after_the_last_seen_id_then_follows_live() {
+    async fn the_stream_replays_after_the_last_seen_id_then_follows_live_without_overlap() {
         let d = door();
         let app = router(d.clone());
-        let key = sign_in(&app).await;
+        let key = sign_in(&app, "test", "my-peer").await;
         let first = d.log.append(Envelope::event(
             "io.best.agents",
             "A",
@@ -740,6 +930,10 @@ mod tests {
         let frame = String::from_utf8_lossy(&frame);
         assert!(frame.contains(&format!("id: {}", live.envelope.id)), "{frame}");
         assert!(frame.contains("\"type\":\"C\""), "{frame}");
+        assert!(
+            !frame.contains("\"type\":\"B\""),
+            "B was replayed, not repeated: {frame}"
+        );
         assert!(!frame.contains("Other"), "the filter holds on the live part: {frame}");
     }
 }

@@ -98,6 +98,8 @@ struct Compiled {
 pub struct Catalogue {
     commands: Vec<Compiled>,
     queries: Vec<QueryDef>,
+    /// The compiled `parameters` schema of each query that declares one, by schema name.
+    query_parameters: HashMap<String, jsonschema::Validator>,
     events: Vec<EventDef>,
 }
 
@@ -115,9 +117,53 @@ impl Catalogue {
         self
     }
 
+    /// Adds a query. Its `parameters` schema, when it has one, is compiled here, once.
     pub fn query(mut self, def: QueryDef) -> Self {
+        if let Some(p) = &def.parameters {
+            let validator = jsonschema::validator_for(p).unwrap_or_else(|e| {
+                panic!(
+                    "query {}/{}: parameters schema is not valid: {e}",
+                    def.schema, def.version
+                )
+            });
+            self.query_parameters.insert(def.schema.clone(), validator);
+        }
         self.queries.push(def);
         self
+    }
+
+    /// Validates a query's string parameters against its declared `parameters` schema; a query that declares none
+    /// takes whatever it is given. Every violation is reported with the parameter it concerns.
+    pub fn validate_params(&self, schema: &str, params: &HashMap<String, String>) -> Result<(), BestError> {
+        let Some(validator) = self.query_parameters.get(schema) else {
+            return Ok(());
+        };
+        let instance = Value::Object(
+            params
+                .iter()
+                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                .collect(),
+        );
+        let errors: Vec<Value> = validator
+            .iter_errors(&instance)
+            .map(|e| {
+                let path = e.instance_path().to_string();
+                let parameter = path.trim_start_matches('/').to_string();
+                json!({ "parameter": if parameter.is_empty() { schema.to_string() } else { parameter }, "message": e.to_string() })
+            })
+            .collect();
+        if errors.is_empty() {
+            return Ok(());
+        }
+        Err(BestError::bad_request(
+            "INVALID_PARAMETER",
+            format!(
+                "{}: {}. Read the parameters at GET /queries/{schema}/<version> and send what they ask.",
+                errors[0]["parameter"].as_str().unwrap_or(schema),
+                errors[0]["message"].as_str().unwrap_or("")
+            ),
+        )
+        .with_details(json!({ "errors": errors })))
     }
 
     pub fn event(mut self, def: EventDef) -> Self {

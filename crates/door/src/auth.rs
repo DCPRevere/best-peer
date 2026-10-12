@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use crate::envelope::now_rfc3339;
 use crate::guidance;
@@ -26,9 +28,19 @@ use crate::guidance;
 pub const AUTH_HEADER: &str = "X-Api-Key";
 /// What a key looks like, so a leak is recognisable in a transcript.
 const KEY_PREFIX: &str = "bp_";
+/// How long an agent has to get the person to approve.
 const DEVICE_CODE_TTL: Duration = Duration::from_secs(600);
+/// How long after that an expired code is still remembered, so a late poll is told `expired_token` rather than
+/// `invalid_grant` (RFC 8628 §3.5 tells them apart).
+const EXPIRED_GRACE: Duration = Duration::from_secs(3600);
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const SESSION_LIFETIME: Duration = Duration::from_secs(8 * 3600);
+/// Registrations that may be pending at once, in all; the device endpoint is public, so it has a ceiling.
+const MAX_PENDING: usize = 64;
+/// Registrations one client may have pending at once.
+const MAX_PENDING_PER_CLIENT: usize = 5;
+const MAX_CLIENT_ID: usize = 100;
+const MAX_AGENT_LABEL: usize = 200;
 /// Letters and digits a person can read back without ambiguity.
 const USER_CODE_ALPHABET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ23456789";
 
@@ -45,6 +57,14 @@ impl OAuthError {
         Self {
             status: 400,
             error: "invalid_request",
+            description: description.into(),
+        }
+    }
+
+    fn grant(error: &'static str, description: impl Into<String>) -> Self {
+        Self {
+            status: 400,
+            error,
             description: description.into(),
         }
     }
@@ -74,6 +94,15 @@ pub enum Lifetime {
     Session,
 }
 
+impl Lifetime {
+    fn as_str(self) -> &'static str {
+        match self {
+            Lifetime::Durable => "durable",
+            Lifetime::Session => "session",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Pending {
     pub device_code: String,
@@ -85,6 +114,22 @@ pub struct Pending {
     created: Instant,
     last_poll: Option<Instant>,
     approved: bool,
+}
+
+impl Pending {
+    fn expired(&self) -> bool {
+        self.created.elapsed() >= DEVICE_CODE_TTL
+    }
+}
+
+/// What was admitted, for whoever approved to read back.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct Admitted {
+    pub user_code: String,
+    pub client_id: String,
+    pub connection: Option<String>,
+    pub agent_label: Option<String>,
+    pub lifetime: &'static str,
 }
 
 /// The device authorization answer (RFC 8628 §3.2) plus BEST's `note`.
@@ -133,30 +178,53 @@ pub struct LocalApprover {
 }
 
 impl LocalApprover {
-    /// Reads the admin token in `dir`, writing a fresh one first when there is none.
+    /// Reads the admin token in `dir`, writing a fresh one first when there is none. The file is created readable
+    /// by its owner only, and an existing one is tightened to that.
     pub fn open(dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("admin-token");
         let token = match std::fs::read_to_string(&path) {
-            Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-            _ => {
-                let token = random_token(32);
-                let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&path)?;
-                f.write_all(token.as_bytes())?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-                }
-                token
+            Ok(t) if !t.trim().is_empty() => {
+                restrict(&path)?;
+                t.trim().to_string()
             }
+            Ok(_) => Self::write_fresh(&path)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::write_fresh(&path)?,
+            Err(e) => return Err(e),
         };
         Ok(Self { token })
+    }
+
+    fn write_fresh(path: &Path) -> std::io::Result<String> {
+        let token = random_token(32);
+        let mut options = OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut f = options.open(path)?;
+        f.write_all(token.as_bytes())?;
+        f.flush()?;
+        restrict(path)?;
+        Ok(token)
     }
 
     pub fn from_token(token: &str) -> Self {
         Self { token: token.into() }
     }
+}
+
+#[cfg(unix)]
+fn restrict(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[async_trait]
@@ -224,19 +292,28 @@ impl Auth {
         }
     }
 
-    /// Credentials kept in `dir/credentials.jsonl`, hashes only.
+    /// Credentials kept in `dir/credentials.jsonl`, hashes only. A line that cannot be read (a torn write) is
+    /// skipped, never fatal.
     pub fn open(dir: &Path, endpoint: &str, approver: Box<dyn Approver>) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let auth = Self::ephemeral(endpoint, approver);
         let path = dir.join("credentials.jsonl");
         if path.exists() {
-            for line in std::fs::read_to_string(&path)?.lines() {
-                if let Ok(c) = serde_json::from_str::<Credential>(line) {
-                    auth.credentials.lock().unwrap().push(c);
+            let text = String::from_utf8_lossy(&std::fs::read(&path)?).into_owned();
+            let mut credentials = auth.credentials.lock().unwrap();
+            for line in text.lines() {
+                match serde_json::from_str::<Credential>(line) {
+                    Ok(c) => credentials.push(c),
+                    Err(e) if !line.trim().is_empty() => {
+                        tracing::warn!(error = %e, "a credential line could not be read and is skipped")
+                    }
+                    Err(_) => {}
                 }
             }
         }
-        *auth.credentials_file.lock().unwrap() = Some(OpenOptions::new().create(true).append(true).open(&path)?);
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        restrict(&path)?;
+        *auth.credentials_file.lock().unwrap() = Some(file);
         Ok(auth)
     }
 
@@ -255,21 +332,29 @@ impl Auth {
     /// The credential the key opens, if it is one this door issued and it has not expired.
     pub fn authenticate(&self, key: &str) -> Option<Credential> {
         let hash = hash_key(key);
-        let now = now_rfc3339();
+        let now = OffsetDateTime::now_utc();
         self.credentials
             .lock()
             .unwrap()
             .iter()
             .find(|c| bool::from(c.hash.as_bytes().ct_eq(hash.as_bytes())))
-            .filter(|c| c.expires_at.as_ref().is_none_or(|e| e.as_str() > now.as_str()))
+            .filter(|c| match &c.expires_at {
+                None => true,
+                Some(e) => OffsetDateTime::parse(e, &Rfc3339).is_ok_and(|e| e > now),
+            })
             .cloned()
     }
 
     /// RFC 8628 §3.1–3.2 with BEST's parameters: a `connection` of another shape is refused with the shape.
     pub fn start_device(&self, req: DeviceRequest) -> Result<DeviceAnswer, OAuthError> {
         let client_id = match req.client_id.as_deref().map(str::trim) {
-            Some(c) if !c.is_empty() => c.to_string(),
-            _ => {
+            Some(c) if !c.is_empty() && c.len() <= MAX_CLIENT_ID => c.to_string(),
+            Some(_) => {
+                return Err(OAuthError::invalid_request(format!(
+                    "client_id must be the name of the consumer software, at most {MAX_CLIENT_ID} characters"
+                )))
+            }
+            None => {
                 return Err(OAuthError::invalid_request(
                     "client_id is required: the name of the consumer software",
                 ))
@@ -282,6 +367,11 @@ impl Auth {
                 ));
             }
         }
+        if req.agent_label.as_ref().is_some_and(|l| l.len() > MAX_AGENT_LABEL) {
+            return Err(OAuthError::invalid_request(format!(
+                "agent_label must be at most {MAX_AGENT_LABEL} characters: what the approver reads"
+            )));
+        }
         let lifetime = match req.credential_lifetime.as_deref() {
             None | Some("durable") => Lifetime::Durable,
             Some("session") => Lifetime::Session,
@@ -292,20 +382,38 @@ impl Auth {
             }
         };
         self.expire_pending();
+        let mut pending = self.pending.lock().unwrap();
+        let live = pending.values().filter(|p| !p.expired()).count();
+        let mine = pending
+            .values()
+            .filter(|p| !p.expired() && p.client_id == client_id)
+            .count();
+        if live >= MAX_PENDING || mine >= MAX_PENDING_PER_CLIENT {
+            return Err(OAuthError {
+                status: 503,
+                error: "temporarily_unavailable",
+                description: format!(
+                    "too many registrations are waiting for approval ({mine} from {client_id}); finish or let one expire ({} s) before asking again",
+                    DEVICE_CODE_TTL.as_secs()
+                ),
+            });
+        }
         let device_code = random_token(32);
         let user_code = random_user_code();
-        let pending = Pending {
-            device_code: device_code.clone(),
-            user_code: user_code.clone(),
-            client_id,
-            connection: req.connection,
-            agent_label: req.agent_label,
-            lifetime,
-            created: Instant::now(),
-            last_poll: None,
-            approved: false,
-        };
-        self.pending.lock().unwrap().insert(device_code.clone(), pending);
+        pending.insert(
+            device_code.clone(),
+            Pending {
+                device_code: device_code.clone(),
+                user_code: user_code.clone(),
+                client_id,
+                connection: req.connection,
+                agent_label: req.agent_label,
+                lifetime,
+                created: Instant::now(),
+                last_poll: None,
+                approved: false,
+            },
+        );
         Ok(DeviceAnswer {
             device_code,
             user_code: user_code.clone(),
@@ -317,25 +425,38 @@ impl Auth {
         })
     }
 
-    /// The page the person opens: the code and what to do with it.
+    /// The page the person opens: the code, who is asking, what they would get, and what to do.
     pub fn verification_page(&self, user_code: Option<&str>) -> String {
-        let code = user_code.unwrap_or("");
-        let known = self
+        let code = user_code.map(normalise_user_code).unwrap_or_default();
+        let asking = self
             .pending
             .lock()
             .unwrap()
             .values()
-            .any(|p| p.user_code == code && !p.approved);
+            .find(|p| p.user_code == code && !p.approved && !p.expired())
+            .cloned();
         let body = if code.is_empty() {
             "<p>Enter the code your agent showed you in the address: <code>?user_code=XXXX-XXXX</code>.</p>".to_string()
-        } else if !known {
+        } else if let Some(p) = asking {
+            let who = match &p.agent_label {
+                Some(l) => format!("{} ({})", html_escape(l), html_escape(&p.client_id)),
+                None => html_escape(&p.client_id),
+            };
+            let connection = p
+                .connection
+                .as_deref()
+                .map(html_escape)
+                .unwrap_or_else(|| host_of(&self.endpoint));
             format!(
-                "<p>Code <code>{code}</code> is unknown, already used, or expired. Ask your agent to start again.</p>"
+                "<p>An agent asks to be admitted with code <code>{}</code>.</p><dl><dt>Who</dt><dd>{who}</dd><dt>Connection name</dt><dd>{connection}</dd><dt>Credential</dt><dd>{}</dd></dl><p>{}</p>",
+                html_escape(&code),
+                p.lifetime.as_str(),
+                html_escape(&self.approver.instructions(&code))
             )
         } else {
             format!(
-                "<p>An agent asks to be admitted with code <code>{code}</code>.</p><p>{}</p>",
-                html_escape(&self.approver.instructions(code))
+                "<p>Code <code>{}</code> is unknown, already used, or expired. Ask your agent to start again.</p>",
+                html_escape(&code)
             )
         };
         format!(
@@ -343,35 +464,43 @@ impl Auth {
         )
     }
 
-    /// Marks a registration approved, on the approver's word.
-    pub async fn approve(&self, user_code: &str, proof: &str) -> Result<(), OAuthError> {
+    /// Marks a registration approved, on the approver's word, and says what was admitted.
+    pub async fn approve(&self, user_code: &str, proof: &str) -> Result<Admitted, OAuthError> {
         self.expire_pending();
+        let code = normalise_user_code(user_code);
         let exists = self
             .pending
             .lock()
             .unwrap()
             .values()
-            .any(|p| p.user_code == user_code && !p.approved);
+            .any(|p| p.user_code == code && !p.approved && !p.expired());
         if !exists {
             return Err(OAuthError::invalid_request(format!(
-                "no pending registration has the code {user_code}"
+                "no pending registration has the code {code}: it is unknown, already approved, or older than {} s",
+                DEVICE_CODE_TTL.as_secs()
             )));
         }
-        self.approver.admit(user_code, proof).await?;
-        if let Some(p) = self
-            .pending
-            .lock()
-            .unwrap()
+        self.approver.admit(&code, proof).await?;
+        let mut pending = self.pending.lock().unwrap();
+        let p = pending
             .values_mut()
-            .find(|p| p.user_code == user_code)
-        {
-            p.approved = true;
-        }
-        Ok(())
+            .find(|p| p.user_code == code && !p.approved && !p.expired())
+            .ok_or_else(|| {
+                OAuthError::invalid_request(format!("the registration {code} expired while being approved"))
+            })?;
+        p.approved = true;
+        Ok(Admitted {
+            user_code: code,
+            client_id: p.client_id.clone(),
+            connection: p.connection.clone(),
+            agent_label: p.agent_label.clone(),
+            lifetime: p.lifetime.as_str(),
+        })
     }
 
-    /// RFC 8628 §3.4–3.5: the token answer once approved, `authorization_pending` or `slow_down` until then, and
-    /// `expired_token` or `invalid_grant` for a code that is not live. A `device_code` is redeemed once.
+    /// RFC 8628 §3.4–3.5: the token answer once approved, `authorization_pending` or `slow_down` until then,
+    /// `expired_token` for a code whose time ran out, `invalid_grant` for one this door never issued or already
+    /// redeemed. A `device_code` is redeemed once, by the client that started it.
     pub fn token(&self, req: TokenRequest) -> Result<Value, OAuthError> {
         if req.grant_type.as_deref() != Some("urn:ietf:params:oauth:grant-type:device_code") {
             return Err(OAuthError {
@@ -383,37 +512,45 @@ impl Auth {
         let Some(device_code) = req.device_code.filter(|d| !d.is_empty()) else {
             return Err(OAuthError::invalid_request("device_code is required"));
         };
+        let Some(client_id) = req.client_id.filter(|c| !c.trim().is_empty()) else {
+            return Err(OAuthError::invalid_request(
+                "client_id is required: the name the registration was started with",
+            ));
+        };
         self.expire_pending();
         let mut pending = self.pending.lock().unwrap();
         let Some(p) = pending.get_mut(&device_code) else {
-            return Err(OAuthError {
-                status: 400,
-                error: "invalid_grant",
-                description: "unknown device_code".into(),
-            });
+            return Err(OAuthError::grant("invalid_grant", "unknown device_code"));
         };
-        if req.client_id.as_deref().is_some_and(|c| c != p.client_id) {
-            return Err(OAuthError {
-                status: 400,
-                error: "invalid_grant",
-                description: "client_id is not the one that started this registration".into(),
-            });
+        if p.expired() {
+            pending.remove(&device_code);
+            return Err(OAuthError::grant(
+                "expired_token",
+                format!(
+                    "the registration expired after {} s; start again",
+                    DEVICE_CODE_TTL.as_secs()
+                ),
+            ));
+        }
+        if client_id != p.client_id {
+            return Err(OAuthError::grant(
+                "invalid_grant",
+                "client_id is not the one that started this registration",
+            ));
         }
         if p.last_poll.is_some_and(|t| t.elapsed() < POLL_INTERVAL) {
             p.last_poll = Some(Instant::now());
-            return Err(OAuthError {
-                status: 400,
-                error: "slow_down",
-                description: format!("poll no faster than every {} seconds", POLL_INTERVAL.as_secs()),
-            });
+            return Err(OAuthError::grant(
+                "slow_down",
+                format!("poll no faster than every {} seconds", POLL_INTERVAL.as_secs()),
+            ));
         }
         p.last_poll = Some(Instant::now());
         if !p.approved {
-            return Err(OAuthError {
-                status: 400,
-                error: "authorization_pending",
-                description: "the person has not approved yet".into(),
-            });
+            return Err(OAuthError::grant(
+                "authorization_pending",
+                "the person has not approved yet",
+            ));
         }
         let p = pending.remove(&device_code).expect("just found");
         drop(pending);
@@ -438,7 +575,7 @@ impl Auth {
             "auth_header": AUTH_HEADER,
             "name": name,
             "tenant_id": host_of(&self.endpoint),
-            "note": format!("{} This peer admitted you on the word of whoever controls it; the same person can revoke this credential on the machine.", guidance::TOKEN_TEXT),
+            "note": format!("{} This peer admitted you on the word of whoever controls the machine it runs on.", guidance::TOKEN_TEXT),
             "endpoint": self.endpoint,
             "manifest": format!("{}/.well-known/best", self.endpoint),
             "ready_check": format!("{}/queries", self.endpoint),
@@ -472,22 +609,33 @@ impl Auth {
         self.credentials.lock().unwrap().clone()
     }
 
+    /// Keeps a credential, in memory and, when there is a file, on disk: one line, one write. A disk error is
+    /// logged and the credential still works until the peer restarts; it never panics a request.
     fn store(&self, c: &Credential) {
         if let Some(f) = self.credentials_file.lock().unwrap().as_mut() {
-            let line = serde_json::to_string(c).unwrap();
-            f.write_all(line.as_bytes())
-                .and_then(|_| f.write_all(b"\n"))
-                .expect("credentials are writable");
-            f.flush().expect("credentials flush");
+            let mut line = serde_json::to_string(c).expect("a credential serialises");
+            line.push('\n');
+            if let Err(e) = f.write_all(line.as_bytes()).and_then(|_| f.flush()) {
+                tracing::error!(error = %e, "a credential could not be written to disk; it lasts until restart");
+            }
         }
         self.credentials.lock().unwrap().push(c.clone());
     }
 
+    /// Forgets registrations that expired longer ago than the grace period keeps them for `expired_token`.
     fn expire_pending(&self) {
         self.pending
             .lock()
             .unwrap()
-            .retain(|_, p| p.created.elapsed() < DEVICE_CODE_TTL);
+            .retain(|_, p| p.created.elapsed() < DEVICE_CODE_TTL + EXPIRED_GRACE);
+    }
+
+    #[cfg(test)]
+    fn age(&self, device_code: &str, by: Duration) {
+        if let Some(p) = self.pending.lock().unwrap().get_mut(device_code) {
+            p.created = p.created.checked_sub(by).expect("a test ages within Instant's range");
+            p.last_poll = None;
+        }
     }
 }
 
@@ -503,6 +651,11 @@ pub fn is_connection_name(s: &str) -> bool {
 
 pub fn hash_key(key: &str) -> String {
     hex::encode(Sha256::digest(key.as_bytes()))
+}
+
+/// A person types the code as they read it: case and spacing do not matter.
+fn normalise_user_code(s: &str) -> String {
+    s.trim().to_ascii_uppercase()
 }
 
 fn random_token(bytes: usize) -> String {
@@ -536,13 +689,14 @@ fn host_of(endpoint: &str) -> String {
 }
 
 fn rfc3339_in(d: Duration) -> String {
-    (time::OffsetDateTime::now_utc() + d)
-        .format(&time::format_description::well_known::Rfc3339)
-        .expect("rfc3339")
+    (OffsetDateTime::now_utc() + d).format(&Rfc3339).expect("rfc3339")
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 #[cfg(test)]
@@ -586,8 +740,9 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_of_another_shape_is_refused_with_the_shape() {
-        let err = auth()
+    fn a_request_of_another_shape_is_refused_with_the_shape() {
+        let a = auth();
+        let err = a
             .start_device(DeviceRequest {
                 client_id: Some("x".into()),
                 connection: Some("Not One Word".into()),
@@ -600,6 +755,14 @@ mod tests {
             "{}",
             err.description
         );
+        let long = a
+            .start_device(DeviceRequest {
+                client_id: Some("x".into()),
+                agent_label: Some("l".repeat(201)),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(long.description.contains("agent_label"), "{}", long.description);
         assert!(is_connection_name("acme-payroll-dev"));
         assert!(!is_connection_name("-x"));
         assert!(!is_connection_name(""));
@@ -609,22 +772,27 @@ mod tests {
     async fn pending_then_approved_then_a_credential_that_opens_the_door_once() {
         let auth = auth();
         let a = start(&auth, Some("my-peer"));
-        let pending = poll(&auth, &a.device_code).unwrap_err();
-        assert_eq!(pending.error, "authorization_pending");
+        assert_eq!(poll(&auth, &a.device_code).unwrap_err().error, "authorization_pending");
         assert_eq!(poll(&auth, &a.device_code).unwrap_err().error, "slow_down");
         assert_eq!(
             auth.approve(&a.user_code, "wrong").await.unwrap_err().error,
             "access_denied"
         );
-        auth.approve(&a.user_code, "ok").await.unwrap();
-        // The slow_down poll counted as a poll; wait out the interval in test time by resetting.
-        auth.pending.lock().unwrap().get_mut(&a.device_code).unwrap().last_poll = None;
+        let admitted = auth.approve(&a.user_code.to_ascii_lowercase(), "ok").await.unwrap();
+        assert_eq!(admitted.connection.as_deref(), Some("my-peer"));
+        assert_eq!(admitted.agent_label.as_deref(), Some("a test"));
+        assert_eq!(admitted.lifetime, "durable");
+        auth.age(&a.device_code, Duration::ZERO);
         let answer = poll(&auth, &a.device_code).unwrap();
         let key = answer["access_token"].as_str().unwrap().to_string();
         assert!(key.starts_with("bp_"));
         assert_eq!(answer["name"], "my-peer");
         assert_eq!(answer["auth_header"], "X-Api-Key");
         assert!(answer["note"].as_str().unwrap().starts_with(guidance::TOKEN_TEXT));
+        assert!(
+            !answer["note"].as_str().unwrap().contains("revoke"),
+            "no promise the peer cannot keep"
+        );
         assert_eq!(answer["mcp"]["my-peer"]["env"]["BEST_API_KEY"], key);
         assert!(
             !answer["http"].to_string().contains(&key),
@@ -642,6 +810,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_token_is_redeemed_only_by_the_client_that_started_and_only_in_time() {
+        let auth = auth();
+        let a = start(&auth, None);
+        let other = auth.token(TokenRequest {
+            grant_type: Some("urn:ietf:params:oauth:grant-type:device_code".into()),
+            device_code: Some(a.device_code.clone()),
+            client_id: Some("someone-else".into()),
+        });
+        assert_eq!(other.unwrap_err().error, "invalid_grant");
+        let none = auth.token(TokenRequest {
+            grant_type: Some("urn:ietf:params:oauth:grant-type:device_code".into()),
+            device_code: Some(a.device_code.clone()),
+            client_id: None,
+        });
+        assert_eq!(none.unwrap_err().error, "invalid_request");
+        auth.age(&a.device_code, DEVICE_CODE_TTL + Duration::from_secs(1));
+        assert_eq!(poll(&auth, &a.device_code).unwrap_err().error, "expired_token");
+        assert_eq!(
+            poll(&auth, &a.device_code).unwrap_err().error,
+            "invalid_grant",
+            "told once, then forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_registration_cannot_be_approved_and_the_page_says_so() {
+        let auth = auth();
+        let a = start(&auth, None);
+        auth.age(&a.device_code, DEVICE_CODE_TTL + Duration::from_secs(1));
+        assert!(auth.verification_page(Some(&a.user_code)).contains("unknown"));
+        assert_eq!(
+            auth.approve(&a.user_code, "ok").await.unwrap_err().error,
+            "invalid_request"
+        );
+    }
+
     #[tokio::test]
     async fn a_session_credential_expires_and_a_missing_connection_is_named_after_the_host() {
         let auth = auth();
@@ -656,8 +861,20 @@ mod tests {
         let answer = poll(&auth, &a.device_code).unwrap();
         assert_eq!(answer["name"], "peer.test");
         assert_eq!(answer["expires_in"], 8 * 3600);
-        let c = auth.credentials();
-        assert!(c[0].expires_at.is_some());
+        let key = answer["access_token"].as_str().unwrap();
+        assert!(auth.authenticate(key).is_some(), "live for eight hours");
+        auth.store(&Credential {
+            name: "stale".into(),
+            hash: hash_key("bp_stale"),
+            client_id: "x".into(),
+            agent_label: None,
+            issued_at: "2020-01-01T00:00:00Z".into(),
+            expires_at: Some("2020-01-01T08:00:00.5Z".into()),
+        });
+        assert!(
+            auth.authenticate("bp_stale").is_none(),
+            "an expired credential opens nothing"
+        );
     }
 
     #[test]
@@ -674,17 +891,50 @@ mod tests {
     }
 
     #[test]
-    fn the_verification_page_knows_a_live_code_and_tells_the_person_what_to_do() {
+    fn the_verification_page_says_who_asks_what_they_get_and_escapes_what_it_shows() {
         let auth = auth();
-        let a = start(&auth, None);
+        let a = auth
+            .start_device(DeviceRequest {
+                client_id: Some("claude".into()),
+                connection: Some("my-peer".into()),
+                agent_label: Some("Claude on <Ada's> phone".into()),
+                credential_lifetime: Some("session".into()),
+            })
+            .unwrap();
         let page = auth.verification_page(Some(&a.user_code));
         assert!(page.contains(&a.user_code));
+        assert!(page.contains("Claude on &lt;Ada's&gt; phone (claude)"), "{page}");
+        assert!(page.contains("<dd>my-peer</dd>"));
+        assert!(page.contains("<dd>session</dd>"));
         assert!(page.contains("fake approver: approve"));
-        assert!(auth.verification_page(Some("ZZZZ-ZZZZ")).contains("unknown"));
+        let hostile = auth.verification_page(Some("<script>x</script>"));
+        assert!(!hostile.contains("<script>"), "{hostile}");
+        assert!(hostile.contains("unknown"));
+    }
+
+    #[test]
+    fn the_device_endpoint_has_a_ceiling_per_client_and_in_all() {
+        let auth = auth();
+        for _ in 0..MAX_PENDING_PER_CLIENT {
+            start(&auth, None);
+        }
+        let err = auth
+            .start_device(DeviceRequest {
+                client_id: Some("best-validate".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.error, "temporarily_unavailable");
+        assert_eq!(err.status, 503);
+        auth.start_device(DeviceRequest {
+            client_id: Some("another".into()),
+            ..Default::default()
+        })
+        .unwrap();
     }
 
     #[tokio::test]
-    async fn credentials_survive_a_restart_as_hashes_only() {
+    async fn credentials_survive_a_restart_as_hashes_only_and_a_torn_line_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let first = Auth::open(
             dir.path(),
@@ -699,8 +949,10 @@ mod tests {
             .unwrap()
             .to_string();
         drop(first);
-        let file = std::fs::read_to_string(dir.path().join("credentials.jsonl")).unwrap();
+        let path = dir.path().join("credentials.jsonl");
+        let file = std::fs::read_to_string(&path).unwrap();
         assert!(!file.contains(&key), "the key is never written");
+        std::fs::write(&path, format!("{file}{{\"name\":\"torn")).unwrap();
         let again = Auth::open(
             dir.path(),
             "http://peer.test",
@@ -708,6 +960,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(again.authenticate(&key).unwrap().name, "kept");
+        assert_eq!(again.credentials().len(), 1);
     }
 
     #[test]
@@ -718,5 +971,15 @@ mod tests {
         assert_eq!(a.token, b.token);
         assert!(a.token.len() >= 40);
         assert!(a.instructions("ABCD-EFGH").contains("best-peer approve ABCD-EFGH"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("admin-token"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }

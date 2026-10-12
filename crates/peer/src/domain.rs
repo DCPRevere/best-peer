@@ -44,7 +44,12 @@ pub fn catalogue(gpu: Arc<dyn Gpu>, runtime: Arc<dyn Runtime>) -> Catalogue {
             }),
             handler: Arc::new(move |_params| {
                 let gpu = gpu.clone();
-                Box::pin(async move { hardware_state(gpu.as_ref()) })
+                Box::pin(async move {
+                    // A real adapter talks to a driver synchronously; that never blocks the door's workers.
+                    tokio::task::spawn_blocking(move || hardware_state(gpu.as_ref()))
+                        .await
+                        .map_err(|e| BestError::internal(format!("the hardware query did not complete: {e}")))?
+                })
             }),
         })
         .command(CommandDef {

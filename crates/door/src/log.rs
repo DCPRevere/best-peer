@@ -1,11 +1,11 @@
 //! The event log: every fact the door has told, in order, kept on disk and streamed live. `GET /events` reads it,
 //! `GET /events/stream` follows it, and a reconnecting client replays from `Last-Event-ID`. The log also keeps the
-//! commands it accepted, so an envelope `id` is an idempotency key across restarts.
+//! commands it accepted, per sender, so an envelope `id` is an idempotency key across restarts.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::Path;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ use tokio::sync::broadcast;
 
 use crate::envelope::Envelope;
 
-/// An event with its position in the log; the position is the SSE event id's order and the pagination cursor.
+/// An event with its position in the log; the position is the stream's order and the pagination cursor.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Stored {
     pub seq: u64,
@@ -34,6 +34,9 @@ pub struct Filter {
     /// The cursor from a previous page: the `seq` after which to read.
     pub after: Option<u64>,
 }
+
+/// The most events one page carries; a larger `limit` is refused, never clamped.
+pub const MAX_PAGE: usize = 200;
 
 impl Filter {
     pub fn matches(&self, s: &Stored) -> bool {
@@ -63,30 +66,31 @@ impl Filter {
     }
 }
 
-/// The verdict on a command's `id` (SPEC.md, Ingestion Semantics: duplicates are ignored, a reused id with a
-/// different payload is a conflict).
+/// The verdict on a command's `id` from one sender (SPEC.md, Ingestion Semantics: duplicates are ignored, a reused
+/// id with a different payload is a conflict). A duplicate carries the correlation the original was given, so the
+/// answer to a retry points at the same events.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Accept {
     New,
-    Duplicate,
+    Duplicate { correlation: String },
     Conflict,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct AcceptedLine {
+    sender: String,
     id: String,
     hash: String,
+    correlation: String,
 }
 
 pub struct EventLog {
     events: Mutex<Vec<Stored>>,
-    accepted: Mutex<HashMap<String, String>>,
+    accepted: Mutex<HashMap<(String, String), AcceptedLine>>,
     events_file: Mutex<Option<File>>,
     accepted_file: Mutex<Option<File>>,
     tx: broadcast::Sender<Stored>,
 }
-
-const MAX_PAGE: usize = 200;
 
 impl EventLog {
     /// An in-memory log that forgets everything on restart; for tests and for a peer run without a data directory.
@@ -101,20 +105,25 @@ impl EventLog {
         }
     }
 
-    /// A log kept in `dir` (`events.jsonl`, `accepted.jsonl`), loaded now and appended to from here on.
+    /// A log kept in `dir` (`events.jsonl`, `accepted.jsonl`), loaded now and appended to from here on. A line that
+    /// cannot be read (a torn write) is skipped and logged, never fatal.
     pub fn open(dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let log = Self::ephemeral();
         let events_path = dir.join("events.jsonl");
         let accepted_path = dir.join("accepted.jsonl");
         for line in read_lines(&events_path)? {
-            if let Ok(s) = serde_json::from_str::<Stored>(&line) {
-                log.events.lock().unwrap().push(s);
+            match serde_json::from_str::<Stored>(&line) {
+                Ok(s) => log.events.lock().unwrap().push(s),
+                Err(e) => tracing::warn!(error = %e, "an event line could not be read and is skipped"),
             }
         }
         for line in read_lines(&accepted_path)? {
-            if let Ok(a) = serde_json::from_str::<AcceptedLine>(&line) {
-                log.accepted.lock().unwrap().insert(a.id, a.hash);
+            match serde_json::from_str::<AcceptedLine>(&line) {
+                Ok(a) => {
+                    log.accepted.lock().unwrap().insert((a.sender.clone(), a.id.clone()), a);
+                }
+                Err(e) => tracing::warn!(error = %e, "an accepted-command line could not be read and is skipped"),
             }
         }
         *log.events_file.lock().unwrap() = Some(append_to(&events_path)?);
@@ -122,49 +131,46 @@ impl EventLog {
         Ok(log)
     }
 
-    /// Appends an event and tells every subscriber. The write to disk happens before anyone hears of it.
+    /// Appends an event and tells every subscriber, in the order of the log. The write to disk happens before anyone
+    /// hears of it; a disk error is logged and the event still reaches subscribers, since a fact told cannot be
+    /// untold.
     pub fn append(&self, envelope: Envelope) -> Stored {
         let mut events = self.events.lock().unwrap();
         let seq = events.last().map(|s| s.seq + 1).unwrap_or(1);
         let stored = Stored { seq, envelope };
-        if let Some(f) = self.events_file.lock().unwrap().as_mut() {
-            let line = serde_json::to_string(&stored).expect("an envelope serialises");
-            f.write_all(line.as_bytes())
-                .and_then(|_| f.write_all(b"\n"))
-                .expect("the event log is writable");
-            f.flush().expect("the event log flushes");
-        }
+        write_line(&self.events_file, &stored, "event");
         events.push(stored.clone());
-        drop(events);
         let _ = self.tx.send(stored.clone());
+        drop(events);
         stored
     }
 
-    /// Records that a command with `id` and payload hash `hash` was accepted, or says why it was not.
-    pub fn accept_command(&self, id: &str, hash: &str) -> Accept {
+    /// Records that `sender` sent a command with `id`, payload hash `hash` and correlation `correlation`, or says
+    /// why it is not new. One sender's ids are theirs alone: another sender's identical id is a different command.
+    pub fn accept_command(&self, sender: &str, id: &str, hash: &str, correlation: &str) -> Accept {
         let mut accepted = self.accepted.lock().unwrap();
-        match accepted.get(id) {
-            Some(h) if h == hash => Accept::Duplicate,
+        let key = (sender.to_string(), id.to_string());
+        match accepted.get(&key) {
+            Some(a) if a.hash == hash => Accept::Duplicate {
+                correlation: a.correlation.clone(),
+            },
             Some(_) => Accept::Conflict,
             None => {
-                if let Some(f) = self.accepted_file.lock().unwrap().as_mut() {
-                    let line = serde_json::to_string(&AcceptedLine {
-                        id: id.into(),
-                        hash: hash.into(),
-                    })
-                    .unwrap();
-                    f.write_all(line.as_bytes())
-                        .and_then(|_| f.write_all(b"\n"))
-                        .expect("the accepted log is writable");
-                    f.flush().expect("the accepted log flushes");
-                }
-                accepted.insert(id.into(), hash.into());
+                let line = AcceptedLine {
+                    sender: sender.into(),
+                    id: id.into(),
+                    hash: hash.into(),
+                    correlation: correlation.into(),
+                };
+                write_line(&self.accepted_file, &line, "accepted command");
+                accepted.insert(key, line);
                 Accept::New
             }
         }
     }
 
-    /// A page of the log, oldest first, and the cursor for the next page when there is one.
+    /// A page of the log, oldest first, and the cursor for the next page when there is one. `limit` is what the
+    /// caller asked for and already checked (1 to [`MAX_PAGE`]); the default is 50.
     pub fn list(&self, filter: &Filter) -> (Vec<Envelope>, Option<String>) {
         let limit = filter.limit.unwrap_or(50).clamp(1, MAX_PAGE);
         let events = self.events.lock().unwrap();
@@ -193,8 +199,11 @@ impl EventLog {
         }
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Stored> {
-        self.tx.subscribe()
+    /// The live feed, with the position of the last event already in the log, so a subscriber that also replays can
+    /// skip what it has seen: subscribe first, then read, and the two never overlap or miss.
+    pub fn subscribe(&self) -> (broadcast::Receiver<Stored>, u64) {
+        let events = self.events.lock().unwrap();
+        (self.tx.subscribe(), events.last().map(|s| s.seq).unwrap_or(0))
     }
 
     pub fn len(&self) -> usize {
@@ -206,14 +215,30 @@ impl EventLog {
     }
 }
 
+/// One record, one line, one write; a failure is logged, never a panic that would poison the log for everyone.
+fn write_line<T: Serialize>(file: &Mutex<Option<File>>, record: &T, what: &str) {
+    if let Some(f) = file.lock().unwrap().as_mut() {
+        let mut line = serde_json::to_string(record).expect("a record serialises");
+        line.push('\n');
+        if let Err(e) = f.write_all(line.as_bytes()).and_then(|_| f.flush()) {
+            tracing::error!(error = %e, "{what} could not be written to disk; it lasts until restart");
+        }
+    }
+}
+
 fn read_lines(path: &Path) -> std::io::Result<Vec<String>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    BufReader::new(File::open(path)?).lines().collect()
+    let text = String::from_utf8_lossy(&std::fs::read(path)?).into_owned();
+    Ok(text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
-fn append_to(path: &PathBuf) -> std::io::Result<File> {
+fn append_to(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
@@ -278,12 +303,22 @@ mod tests {
     }
 
     #[test]
-    fn an_id_is_an_idempotency_key_and_a_different_payload_is_a_conflict() {
+    fn an_id_is_an_idempotency_key_per_sender_and_a_different_payload_is_a_conflict() {
         let log = EventLog::ephemeral();
-        assert_eq!(log.accept_command("x", "h1"), Accept::New);
-        assert_eq!(log.accept_command("x", "h1"), Accept::Duplicate);
-        assert_eq!(log.accept_command("x", "h2"), Accept::Conflict);
-        assert_eq!(log.accept_command("y", "h2"), Accept::New);
+        assert_eq!(log.accept_command("alice", "x", "h1", "corr-1"), Accept::New);
+        assert_eq!(
+            log.accept_command("alice", "x", "h1", "corr-2"),
+            Accept::Duplicate {
+                correlation: "corr-1".into()
+            },
+            "the retry is told the original correlation"
+        );
+        assert_eq!(log.accept_command("alice", "x", "h2", "corr-3"), Accept::Conflict);
+        assert_eq!(
+            log.accept_command("bob", "x", "h1", "corr-4"),
+            Accept::New,
+            "another sender's id is their own"
+        );
     }
 
     #[test]
@@ -305,30 +340,42 @@ mod tests {
     }
 
     #[test]
-    fn the_log_survives_a_restart_with_its_order_and_its_accepted_ids() {
+    fn the_log_survives_a_restart_with_its_order_and_its_accepted_ids_and_skips_a_torn_line() {
         let dir = tempfile::tempdir().unwrap();
         let first = EventLog::open(dir.path()).unwrap();
         first.append(ev("A", "c"));
         first.append(ev("B", "c"));
-        assert_eq!(first.accept_command("cmd-1", "h"), Accept::New);
+        assert_eq!(first.accept_command("alice", "cmd-1", "h", "c"), Accept::New);
         drop(first);
+        let path = dir.path().join("events.jsonl");
+        let mut torn = std::fs::read_to_string(&path).unwrap();
+        torn.push_str("{\"seq\":3,\"envelope\":{\"specversion");
+        std::fs::write(&path, torn).unwrap();
         let again = EventLog::open(dir.path()).unwrap();
         let (events, _) = again.list(&Filter::default());
         assert_eq!(
             events.iter().map(|e| e.r#type.as_str()).collect::<Vec<_>>(),
             vec!["A", "B"]
         );
-        assert_eq!(again.accept_command("cmd-1", "h"), Accept::Duplicate);
+        assert_eq!(
+            again.accept_command("alice", "cmd-1", "h", "c"),
+            Accept::Duplicate {
+                correlation: "c".into()
+            }
+        );
         let c = again.append(ev("C", "c"));
         assert_eq!(c.seq, 3);
     }
 
     #[tokio::test]
-    async fn a_subscriber_hears_what_is_appended_after_it_subscribed() {
+    async fn a_subscriber_hears_what_is_appended_after_it_subscribed_and_knows_where_the_log_was() {
         let log = EventLog::ephemeral();
         log.append(ev("Before", "c"));
-        let mut rx = log.subscribe();
+        let (mut rx, last) = log.subscribe();
+        assert_eq!(last, 1);
         log.append(ev("After", "c"));
-        assert_eq!(rx.recv().await.unwrap().envelope.r#type, "After");
+        let got = rx.recv().await.unwrap();
+        assert_eq!(got.envelope.r#type, "After");
+        assert_eq!(got.seq, 2);
     }
 }
