@@ -28,7 +28,9 @@
 
 - Tests first where one applies, against the fakes: the lifecycle, the refusals, the events, the manifest.
 - `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`; then the served
-  manifest through `best-validate`. CI runs the same four, and a manifest the spec refuses fails the build.
+  manifest through `best-validate`, anonymous and then signed in: an agent registered through the device flow,
+  admitted with the real `best-peer approve`, and the validator probing every active capability with that credential.
+  CI runs the same, and a surface the spec refuses fails the build.
 
 ## 4. Ship
 

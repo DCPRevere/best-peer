@@ -19,12 +19,28 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --release -p best-peer
 
-      # The validator is a gate from the first commit: a manifest the spec refuses fails the build.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: best-validate against the served manifest
+
+      # The validator is a gate from the first commit: a manifest the spec refuses fails the build.
+      - name: best-validate, anonymous
         run: |
+          export BEST_PEER_DATA="$(mktemp -d)"
           ./target/release/best-peer &
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:7777/.well-known/best >/dev/null && break; sleep 1; done
           npx -y @behavioralstate/best-validate@0.4.2 http://127.0.0.1:7777
+
+      # Then as an admitted agent: the device flow, approval with this machine's admin token through the real
+      # `best-peer approve`, the credential redeemed, and the validator probing every active capability with it.
+      - name: best-validate, signed in, with the registration probe
+        run: |
+          base=http://127.0.0.1:7777
+          device=$(curl -sf -X POST "$base/auth/device" -d client_id=ci -d connection=ci-peer -d agent_label=ci)
+          user_code=$(echo "$device" | python3 -c 'import json,sys; print(json.load(sys.stdin)["user_code"])')
+          device_code=$(echo "$device" | python3 -c 'import json,sys; print(json.load(sys.stdin)["device_code"])')
+          ./target/release/best-peer approve "$user_code"
+          token=$(curl -sf -X POST "$base/auth/token" -d grant_type=urn:ietf:params:oauth:grant-type:device_code -d "device_code=$device_code" -d client_id=ci)
+          key=$(echo "$token" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+          echo "$token" | python3 -c 'import json,sys; t=json.load(sys.stdin); assert t["name"]=="ci-peer" and t["auth_header"]=="X-Api-Key" and t["note"].startswith("The credential is a secret."), t'
+          npx -y @behavioralstate/best-validate@0.4.2 "$base" --api-key "$key" --auth-type apikey --auth-header X-Api-Key --probe-registration

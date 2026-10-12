@@ -1,0 +1,367 @@
+//! The catalogue: every command, query and event the door offers, with its schema compiled once, its description an
+//! agent can act on, and the handler the peer plugs in. The catalogue is the source of every `dataschema`; a caller's
+//! `dataschema` is never fetched (SPEC.md, Ingestion Semantics).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use futures::future::BoxFuture;
+use serde_json::{json, Value};
+
+use crate::envelope::Envelope;
+use crate::error::BestError;
+use crate::log::EventLog;
+
+/// What a command handler gets to tell the world: every event it emits carries the command's correlation id and this
+/// door's `source`, so any consumer can match it to the submission.
+#[derive(Clone)]
+pub struct Emitter {
+    log: Arc<EventLog>,
+    source: String,
+    correlation: String,
+    dataschemas: Arc<HashMap<String, String>>,
+}
+
+impl Emitter {
+    pub fn new(log: Arc<EventLog>, source: &str, correlation: &str, dataschemas: Arc<HashMap<String, String>>) -> Self {
+        Self {
+            log,
+            source: source.into(),
+            correlation: correlation.into(),
+            dataschemas,
+        }
+    }
+
+    /// Appends an event of `r#type` with `data`. A type the catalogue declares gets its `dataschema`; another is
+    /// untyped, which the spec allows.
+    pub fn emit(&self, r#type: &str, data: Value) -> Envelope {
+        let dataschema = self.dataschemas.get(r#type).cloned();
+        let event = Envelope::event(&self.source, r#type, data, Some(self.correlation.clone()), dataschema);
+        self.log.append(event.clone());
+        event
+    }
+
+    pub fn correlation(&self) -> &str {
+        &self.correlation
+    }
+}
+
+/// A command handler runs after the command is durably recorded; its outcome is events, never a return value
+/// (SPEC.md: BEST defines no synchronous command response). A failure is an event too.
+pub type CommandHandler = Arc<dyn Fn(Envelope, Emitter) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// A query handler answers now, from current state, with the result body or a refusal.
+pub type QueryHandler =
+    Arc<dyn Fn(HashMap<String, String>) -> BoxFuture<'static, Result<Value, BestError>> + Send + Sync>;
+
+pub struct CommandDef {
+    /// Kebab-case schema name: the `{schema}` path segment.
+    pub schema: String,
+    pub version: String,
+    /// The envelope `type` to send, PascalCase.
+    pub command_type: String,
+    pub description: String,
+    /// JSON Schema (draft 2020-12) for `data`.
+    pub data_schema: Value,
+    /// PascalCase event types this command can raise, failures included.
+    pub produces: Vec<String>,
+    /// The spec's high-impact annotation, when the command deserves one.
+    pub impact: Option<Value>,
+    pub handler: CommandHandler,
+}
+
+pub struct QueryDef {
+    pub schema: String,
+    pub version: String,
+    pub description: String,
+    /// JSON Schema for the accepted query-string parameters; none when the query takes none.
+    pub parameters: Option<Value>,
+    /// JSON Schema for the result body.
+    pub response: Value,
+    pub handler: QueryHandler,
+}
+
+pub struct EventDef {
+    pub schema: String,
+    pub version: String,
+    pub event_type: String,
+    pub description: String,
+    pub data_schema: Value,
+}
+
+struct Compiled {
+    def: CommandDef,
+    validator: jsonschema::Validator,
+}
+
+#[derive(Default)]
+pub struct Catalogue {
+    commands: Vec<Compiled>,
+    queries: Vec<QueryDef>,
+    events: Vec<EventDef>,
+}
+
+impl Catalogue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a command. Its data schema is compiled here, once; a schema that is not valid JSON Schema is a
+    /// programming error and is refused at startup, not at the first command.
+    pub fn command(mut self, def: CommandDef) -> Self {
+        let validator = jsonschema::validator_for(&def.data_schema)
+            .unwrap_or_else(|e| panic!("command {}/{}: data schema is not valid: {e}", def.schema, def.version));
+        self.commands.push(Compiled { def, validator });
+        self
+    }
+
+    pub fn query(mut self, def: QueryDef) -> Self {
+        self.queries.push(def);
+        self
+    }
+
+    pub fn event(mut self, def: EventDef) -> Self {
+        self.events.push(def);
+        self
+    }
+
+    pub fn command_by_type(&self, r#type: &str) -> Option<&CommandDef> {
+        self.commands
+            .iter()
+            .find(|c| c.def.command_type == r#type)
+            .map(|c| &c.def)
+    }
+
+    pub fn command_by_schema(&self, schema: &str, version: &str) -> Option<&CommandDef> {
+        self.commands
+            .iter()
+            .find(|c| c.def.schema == schema && c.def.version == version)
+            .map(|c| &c.def)
+    }
+
+    pub fn query_by_schema(&self, schema: &str) -> Option<&QueryDef> {
+        self.queries.iter().find(|q| q.schema == schema)
+    }
+
+    pub fn event_by_schema(&self, schema: &str, version: &str) -> Option<&EventDef> {
+        self.events.iter().find(|e| e.schema == schema && e.version == version)
+    }
+
+    pub fn command_types(&self) -> Vec<&str> {
+        self.commands.iter().map(|c| c.def.command_type.as_str()).collect()
+    }
+
+    pub fn has_commands(&self) -> bool {
+        !self.commands.is_empty()
+    }
+
+    pub fn has_queries(&self) -> bool {
+        !self.queries.is_empty()
+    }
+
+    /// Validates a command's `data` against the catalogue's schema for its type. Every violation is reported, with
+    /// its path, so a caller fixes them all at once.
+    pub fn validate_data(&self, r#type: &str, data: &Value) -> Result<(), BestError> {
+        let c = self
+            .commands
+            .iter()
+            .find(|c| c.def.command_type == r#type)
+            .expect("looked up by caller");
+        let errors: Vec<Value> = c
+            .validator
+            .iter_errors(data)
+            .map(|e| {
+                let path = e.instance_path().to_string();
+                json!({ "path": if path.is_empty() { "data".to_string() } else { format!("data{path}") }, "message": e.to_string() })
+            })
+            .collect();
+        if errors.is_empty() {
+            return Ok(());
+        }
+        let first = errors[0]["path"].as_str().unwrap_or("data").to_string();
+        Err(BestError::bad_request(
+            "SCHEMA_VALIDATION",
+            format!(
+                "{first}: {}. Read the schema at the catalogue's dataschema for {} and send what it asks.",
+                errors[0]["message"].as_str().unwrap_or(""),
+                c.def.schema
+            ),
+        )
+        .with_details(json!({ "errors": errors })))
+    }
+
+    /// Event type → absolute dataschema URI, for the emitter.
+    pub fn event_dataschemas(&self, endpoint: &str) -> HashMap<String, String> {
+        self.events
+            .iter()
+            .map(|e| {
+                (
+                    e.event_type.clone(),
+                    format!("{endpoint}/events/{}/{}", e.schema, e.version),
+                )
+            })
+            .collect()
+    }
+
+    /// `GET /commands`
+    pub fn command_catalogue(&self, endpoint: &str) -> Value {
+        let commands: Vec<Value> = self
+            .commands
+            .iter()
+            .map(|c| {
+                let d = &c.def;
+                let mut entry = json!({
+                    "schema": d.schema,
+                    "version": d.version,
+                    "commandType": d.command_type,
+                    "dataschema": format!("{endpoint}/commands/{}/{}", d.schema, d.version),
+                    "description": d.description,
+                });
+                if let Some(impact) = &d.impact {
+                    entry["impact"] = impact.clone();
+                }
+                entry
+            })
+            .collect();
+        json!({ "commands": commands })
+    }
+
+    /// `GET /commands/{schema}/{version}`: the data schema with the spec's top-level members beside it.
+    pub fn command_document(&self, endpoint: &str, def: &CommandDef) -> Value {
+        let mut doc = def.data_schema.clone();
+        let o = doc.as_object_mut().expect("a schema is an object");
+        o.insert("$schema".into(), json!("https://json-schema.org/draft/2020-12/schema"));
+        o.insert(
+            "$id".into(),
+            json!(format!("{endpoint}/commands/{}/{}", def.schema, def.version)),
+        );
+        o.entry("title").or_insert(json!(def.command_type));
+        o.entry("description").or_insert(json!(def.description));
+        o.insert("commandType".into(), json!(def.command_type));
+        if !def.produces.is_empty() {
+            o.insert("produces".into(), json!(def.produces));
+        }
+        if let Some(impact) = &def.impact {
+            o.insert("impact".into(), impact.clone());
+        }
+        doc
+    }
+
+    /// `GET /queries`
+    pub fn query_catalogue(&self, endpoint: &str) -> Value {
+        let queries: Vec<Value> = self
+            .queries
+            .iter()
+            .map(|q| {
+                json!({
+                    "schema": q.schema,
+                    "version": q.version,
+                    "dataschema": format!("{endpoint}/queries/{}/{}", q.schema, q.version),
+                    "description": q.description,
+                })
+            })
+            .collect();
+        json!({ "queries": queries })
+    }
+
+    /// `GET /queries/{schema}/{version}`
+    pub fn query_document(&self, def: &QueryDef) -> Value {
+        let mut doc = json!({ "description": def.description, "response": def.response });
+        if let Some(p) = &def.parameters {
+            doc["parameters"] = p.clone();
+        }
+        doc
+    }
+
+    /// The catalogue entries `GET /events` may carry beside the log.
+    pub fn event_catalogue(&self, endpoint: &str) -> Vec<Value> {
+        self.events
+            .iter()
+            .map(|e| {
+                json!({
+                    "schema": e.schema,
+                    "version": e.version,
+                    "dataschema": format!("{endpoint}/events/{}/{}", e.schema, e.version),
+                    "description": e.description,
+                })
+            })
+            .collect()
+    }
+
+    pub fn event_document(&self, endpoint: &str, def: &EventDef) -> Value {
+        let mut doc = def.data_schema.clone();
+        let o = doc.as_object_mut().expect("a schema is an object");
+        o.insert("$schema".into(), json!("https://json-schema.org/draft/2020-12/schema"));
+        o.insert(
+            "$id".into(),
+            json!(format!("{endpoint}/events/{}/{}", def.schema, def.version)),
+        );
+        o.entry("title").or_insert(json!(def.event_type));
+        o.entry("description").or_insert(json!(def.description));
+        doc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn noop() -> CommandHandler {
+        Arc::new(|_, _| Box::pin(async {}))
+    }
+
+    fn pull_image() -> CommandDef {
+        CommandDef {
+            schema: "pull-image".into(),
+            version: "1.0".into(),
+            command_type: "PullImage".into(),
+            description: "Makes an image present on the peer.".into(),
+            data_schema: json!({
+                "type": "object",
+                "required": ["image"],
+                "properties": { "image": { "type": "string", "minLength": 1 } },
+                "additionalProperties": false
+            }),
+            produces: vec!["ImagePulled".into(), "ImagePullFailed".into()],
+            impact: None,
+            handler: noop(),
+        }
+    }
+
+    #[test]
+    fn validation_reports_every_violation_with_its_path_and_says_where_the_schema_is() {
+        let c = Catalogue::new().command(pull_image());
+        c.validate_data("PullImage", &json!({"image": "ollama/ollama:0.6"}))
+            .unwrap();
+        let err = c
+            .validate_data("PullImage", &json!({"imag": "x", "image": ""}))
+            .unwrap_err();
+        assert_eq!(err.code, "SCHEMA_VALIDATION");
+        let errors = err.details["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors.iter().any(|e| e["path"] == "data/image"), "{errors:?}");
+        assert!(err.message.contains("pull-image"), "{}", err.message);
+    }
+
+    #[test]
+    fn the_catalogue_entry_and_the_schema_document_carry_the_same_members() {
+        let c = Catalogue::new().command(pull_image());
+        let cat = c.command_catalogue("http://peer.test");
+        let entry = &cat["commands"][0];
+        assert_eq!(entry["dataschema"], "http://peer.test/commands/pull-image/1.0");
+        assert_eq!(entry["commandType"], "PullImage");
+        let doc = c.command_document("http://peer.test", c.command_by_schema("pull-image", "1.0").unwrap());
+        assert_eq!(doc["commandType"], "PullImage");
+        assert_eq!(doc["$id"], entry["dataschema"]);
+        assert_eq!(doc["produces"][1], "ImagePullFailed");
+        assert_eq!(doc["required"][0], "image");
+    }
+
+    #[test]
+    #[should_panic(expected = "data schema is not valid")]
+    fn an_invalid_schema_is_refused_at_startup() {
+        let mut d = pull_image();
+        d.data_schema = json!({ "type": 12 });
+        let _ = Catalogue::new().command(d);
+    }
+}

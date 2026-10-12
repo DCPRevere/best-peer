@@ -1,0 +1,32 @@
+[package]
+name = "best-peer-door"
+description = "The BEST surface of a peer, written from the spec: manifest, catalogues, schema documents, command ingest with refusals and idempotency, the event log and its stream, queries, workflows, and sign-in by the device flow with an approver the peer owns."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+axum = "0.7"
+base64 = "0.23"
+futures = "0.3"
+hex = "0.4"
+jsonschema = { version = "0.58", default-features = false }
+rand = "0.10"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = "0.7"
+sha2 = "0.11"
+subtle = "2"
+thiserror = { workspace = true }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

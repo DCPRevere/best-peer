@@ -1,0 +1,15 @@
+//! The sign-in guidance of BEST 0.9.17, verbatim from the spec's discovery schema (`$defs/signInGuidance/0.9.17`).
+//! These words are the spec's, not ours: a service carries them unchanged at each step of a registration. Generated
+//! from `protocol/v1/schemas/discovery.json`; regenerate when the manifest's BEST version moves.
+
+/// The version whose words these are.
+pub const GUIDANCE_VERSION: &str = "0.9.17";
+
+/// The `note` of the authentication block that declares `deviceAuthorizationUrl`.
+pub const MANIFEST_TEXT: &str = "For you, the agent, not the person: read this manifest with an HTTP request; never show it to them or open it in a browser. When the person asks you to sign them in, first name the connection: one word of lowercase letters, digits and hyphens, made from what they called this service (acme payroll dev becomes acme-payroll-dev; its host if they gave no name), and ask them to confirm it before you go on. Then POST a form to deviceAuthorizationUrl with client_id set to your software's name and connection set to that name, and give them the link it answers (verification_uri_complete, or verification_uri and user_code) to open in their own browser, where they sign in and approve you. Never open that link yourself or in a browser you control, never sign in for them, and never ask for a password. Then poll tokenUrl, no faster than interval. Its answer carries a secret credential and, in name, the connection's name: save the credential straight to your client's credential store or to a file only the person can read, under that name, and never put it in a message, a command or any output: read the rest of the answer without it.";
+
+/// The `note` of the device authorization answer.
+pub const DEVICE_TEXT: &str = "Give the person this link, verification_uri_complete (or verification_uri and user_code), to open in their own browser, where they sign in and approve you. Never open it yourself or in a browser you control: approving is theirs. Then poll tokenUrl no faster than interval, with a form of grant_type=urn:ietf:params:oauth:grant-type:device_code, device_code and client_id. Its answer carries a secret credential and, in name, the connection's name: save the credential straight to your client's credential store or to a file only the person can read, under that name, and never put it in a message, a command or any output: read the rest of the answer without it.";
+
+/// The start of the `note` of the token answer; a service may add to it after.
+pub const TOKEN_TEXT: &str = "The credential is a secret. Keep it in your client's configuration or credential store, under the name in this answer, the connection the person named: another name is another sign-in, kept apart, with its own credential and its own permissions. Never repeat it in the conversation, in a message, a command or any output: read it from where you stored it. A transcript, commands and their output included, is not a secret store, and a credential that appears there is leaked and must be replaced. If your client cannot store it, say so instead of showing it.";
