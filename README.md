@@ -106,8 +106,9 @@ Every command of this peer follows one pattern, and nothing else is needed to dr
    says why; one whose workload had already started and did not survive the restart is failed with the fix.
 2. Everything that happens is an event carrying that correlation id, in the order it happened. The command's
    schema document lists what it `produces` and, among those, what `completes` it: the events after which the
-   command's outcome is known (`DeploymentReady` or `DeploymentFailed` for a deploy, `JobStarted` or `JobFailed`
-   for a job), so a consumer stops waiting for the command and a restart does not run it again; the others are
+   command's outcome is known (`DeploymentReady` for a deploy, or `DeploymentFailed`, `DeploymentEnded` or
+   `OutOfMemory` when it ended before it was ready; `JobStarted` or `JobFailed` for a job), so a consumer stops
+   waiting for the command and a restart does not run it again; the others are
    progress on the way (`ImagePulling`, `WeightsLoading`, with `progress_pct` where the engine says).
    `CommandFailed` completes any command.
 3. What the command made then has a life of its own, told under the same correlation id (`JobFinished` with the

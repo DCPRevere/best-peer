@@ -19,22 +19,28 @@ transcript.
 - **Nothing written for the agent**: the person's sentence at the top of the transcript is all it got. It read the
   manifest, both catalogues and three schema documents, and never saw this repository.
 - **The person's part**: the agent showed the link and the code; at the machine, `best-peer approve 8BB9-CB44`
-  admitted it eleven seconds later, and the agent's next poll had the credential, which it never saw.
+  admitted it (the approval's own log says 18:37:44, eleven seconds after the client started; the transcript
+  carries no clock for it), and the agent's next poll had the credential, which it never saw.
 - **The validator**: the tree the binary was built from passed `best-validate` (BEST 0.9.18, conformant, 0 failures)
   anonymous and signed in, in the gate before the push and in CI on the commit.
 
 ## What the run showed
 
 - Every step completed and nothing was refused: sign-in; the hardware state; the deploy (the engine image pulled in
-  3.5 minutes, then `DeploymentReady` with the endpoint); a prompt answered at the endpoint with no door credential;
-  a job run to `JobFinished` with exit code 0; the undeploy; an empty `get-workloads`.
-- The agent read `completes` in the schema documents and polled `get_events` by `type` for those events instead of
-  holding the stream; both work, and `completes` is what told it which types to wait for.
+  3 minutes 6 seconds, `DeploymentReady` with the endpoint 3 minutes 28 seconds after the command); a prompt
+  answered at the endpoint with no door credential; a job run to `JobFinished` with exit code 0; the undeploy; an
+  empty `get-workloads`.
+- The agent read the schema documents, which list `completes`, then followed the deploy by polling `get_events` by
+  `type` for the outcome it wanted (`DeploymentReady`, `DeploymentFailed`) rather than holding the stream; its one
+  stream sample stopped at its own event cap among the progress events. For the job it polled `JobFinished`, the
+  job's end, before `JobStarted`, the command's completion. Polling by type and correlation id was enough to drive
+  the whole lifecycle.
 - The job's output is not in the events (`JobFinished` carries the exit code only); the agent said so. Where a job's
   output goes is [behavioralstate/spec#39](https://github.com/behavioralstate/spec/issues/39).
-- The door told 333 events for the run, 326 of them progress at every percent (`ImagePulling`, `WeightsLoading`);
-  that is more than a consumer needs: [behavioralstate/spec#40](https://github.com/behavioralstate/spec/issues/40).
-- 38 tool calls, 23 model turns, 5 minutes 9 seconds.
+- The door's own log for the run (not in the transcript, which holds only what the agent asked for) has 333 events,
+  326 of them progress (`ImagePulling` 226, `WeightsLoading` 100), told at nearly every percent; that is more than a
+  consumer needs: [behavioralstate/spec#40](https://github.com/behavioralstate/spec/issues/40).
+- 38 tool calls in the transcript; 23 model turns and 5 minutes 9 seconds from the client's own log and summary.
 
 ## The transcript
 
@@ -125,7 +131,7 @@ I'll poll for approval.
      ],
      "signed_in_at": "http://127.0.0.1:7777/.well-known/best",
      "stored_under": "laptop-peer",
-     "stored_at": "C:\\Users\\Riccardo\\AppData\\Local\\Temp\\claude\\C--code-Remundo\\34e8c366-29b1-4389-89f9-e3aec849e9ca\\scratchpad\\slice7\\credentials.json",
+     "stored_at": "<a scratch folder of this machine>\\credentials.json",
      "note": "Signed in under 'laptop-peer'. Pass connection 'laptop-peer' on every call for this service — it works now and at every later start. The key itself was not returned and must never be typed into the conversation."
     }
    }
