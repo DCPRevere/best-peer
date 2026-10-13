@@ -19,6 +19,59 @@ Done means `best-validate` green on the served manifest and an agent running the
 alone, with the transcript kept in this repository: [acceptance/lifecycle-from-the-manifest.md](acceptance/lifecycle-from-the-manifest.md)
 is that record, made with the published connector and a client that had nothing but the person's sentence.
 
+## Try it on your machine
+
+The path for someone handed a release binary: a Linux PC with an NVIDIA card is the first-class case, and the
+other cases are one variable away. What the terminal shows at each step is written here so a run that differs is a
+finding worth sending back.
+
+**Before you start.** On a GPU host: the NVIDIA driver, and Docker with the NVIDIA container toolkit, so that
+`docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi` lists the card. Without a card (a laptop,
+a Mac) `BEST_PEER_GPU=none` makes the CPU the one device. Without Docker, `BEST_PEER_RUNTIME=native` deploys to an
+Ollama already installed, and `fake` serves the surface with nothing behind it.
+
+**1. Download and run.** Take the archive for your machine from the
+[releases](https://github.com/behavioralstate/best-peer/releases), unpack it, and start the peer:
+
+```bash
+tar xzf best-peer-<version>-x86_64-unknown-linux-gnu.tar.gz
+./best-peer --version
+./best-peer
+```
+
+It prints one line, `best-peer is serving its door`, with where it listens and its data folder, and then waits:
+nothing else appears until a client talks to it. If it exits instead, the message names what is missing (the
+driver, Docker) and the variable that serves without it. `http://127.0.0.1:7777/.well-known/best` in a browser is
+the manifest, the one document an agent needs.
+
+**2. Let someone reach it.** By default the peer listens on loopback, so only clients on the same machine see it.
+For a person elsewhere, listen on every interface and say the address they will reach:
+
+```bash
+BEST_PEER_LISTEN=0.0.0.0:7777 BEST_PEER_ENDPOINT=http://<address they reach>:7777 ./best-peer
+```
+
+There is no TLS and no relay in the peer, so across the internet that address is a VPN or tunnel (a Tailscale IP, a
+port forward). The model endpoint a deploy opens is published on the same interfaces with whatever access the engine
+enforces, none in Ollama as installed, so expose the peer on a network you trust.
+
+**3. Admit the agent.** The person connecting says to their client "sign me in `<name>`, start from
+`http://<address>:7777/.well-known/best`"; their client shows them a code like `8BB9-CB44`, and they send it to you.
+At your machine:
+
+```bash
+./best-peer approve 8BB9-CB44
+```
+
+Their client's next poll receives a key under that name. No accounts, no passwords: whoever controls the machine
+decides who is in, as with SSH keys.
+
+**4. What the agent does from there.** Reads the hardware state (a card shows its memory, temperature, power,
+utilisation and the CUDA version; the host CPU is listed after it), deploys a model on it, follows the events to
+`DeploymentReady`, prompts the endpoint that event names, runs a job, undeploys. The whole run, as recorded the first
+time it passed, is [acceptance/lifecycle-from-the-manifest.md](acceptance/lifecycle-from-the-manifest.md). Send back
+the terminal output of the peer, whatever happened: the release notes say what is proven and what is not yet.
+
 ## Layout
 
 | Crate | What it owns |
@@ -46,9 +99,10 @@ curl http://127.0.0.1:7777/.well-known/best
 npx -y @behavioralstate/best-validate http://127.0.0.1:7777
 ```
 
-Or take a [release](https://github.com/behavioralstate/best-peer/releases): one binary per machine (Linux x86_64 on
-glibc 2.35 or newer; Windows x86_64; macOS Apple silicon), with `SHA256SUMS` and a build provenance attestation
-(`gh attestation verify <archive> --repo behavioralstate/best-peer`). `best-peer --version` says which it is.
+Or take a [release](https://github.com/behavioralstate/best-peer/releases), as in [Try it on your machine](#try-it-on-your-machine):
+one binary per machine (Linux x86_64 on glibc 2.35 or newer; Windows x86_64; macOS Apple silicon), with `SHA256SUMS`
+and a build provenance attestation (`gh attestation verify <archive> --repo behavioralstate/best-peer`).
+`best-peer --version` says which it is.
 
 `BEST_PEER_LISTEN` (default `127.0.0.1:7777`) is where it listens; `BEST_PEER_ENDPOINT` is the consumer-facing base URL
 the manifest advertises, required when the peer listens on every interface. `BEST_PEER_DATA` (default `~/.best-peer`)

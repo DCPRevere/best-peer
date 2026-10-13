@@ -25,6 +25,9 @@
 - The accelerator abstraction is vendor-neutral: a workload asks for a compute API and memory, never for a vendor.
 - The inference data path stays on the runtime's OpenAI-compatible endpoint; BEST carries the control path only.
 - Instructions and this file state the current rule, not its history; the history is in git.
+- The README's "Try it on your machine" is the operator's path, kept true by the change that moves it: a variable, a
+  check at start, a command, the sign-in, or what the terminal shows changes that section in the same commit, and a
+  release note that says something is now proven or still open changes its last step.
 
 ## 3. Build
 
