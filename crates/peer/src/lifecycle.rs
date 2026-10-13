@@ -1086,33 +1086,47 @@ fn api_name(c: &Compute) -> String {
 }
 
 /// The pace progress is told at. An engine reports every percent, sometimes every byte; a consumer that catches up
-/// on the log reads every event told, so one workload tells its progress at steps of ten points, at once when the
-/// value is final, and at least every few seconds while the engine keeps reporting, so a slow pull is seen to
-/// move. A report without a value (the engine knows it is working, not how far) is told by time alone.
+/// on the log reads every event told, so one workload tells its progress at steps of ten points on from the last
+/// value told, at once when the value is final or went back (a new layer appeared, extraction began), and at least
+/// every few seconds while the engine keeps reporting, so a slow pull is seen to move. A report without a value
+/// (the engine knows it is working, not how far) is told by time alone and moves no baseline.
 pub struct Pace {
-    last: Mutex<Option<(Option<u8>, Instant)>>,
+    inner: Mutex<Paced>,
+}
+
+#[derive(Default)]
+struct Paced {
+    /// The last value told: what the next step is measured from.
+    value: Option<u8>,
+    /// When anything was last told.
+    at: Option<Instant>,
 }
 
 impl Pace {
     pub const STEP: u8 = 10;
     pub const AT_LEAST_EVERY: Duration = Duration::from_secs(5);
 
-    /// Whether this report is told, and if so it is the one the next is measured from.
+    /// Whether this report is told now.
     pub fn due(&self, pct: Option<u8>) -> bool {
-        let now = Instant::now();
-        let mut last = self.last.lock().unwrap();
-        let due = match *last {
-            None => true,
-            Some((told, at)) => match (told, pct) {
-                (_, Some(100)) => told != Some(100),
-                (Some(t), Some(p)) => {
-                    p >= t.saturating_add(Self::STEP) || now.duration_since(at) >= Self::AT_LEAST_EVERY
-                }
-                _ => now.duration_since(at) >= Self::AT_LEAST_EVERY,
-            },
+        self.due_at(pct, Instant::now())
+    }
+
+    /// Whether a report arriving at `now` is told, and if so it is what the next is measured from.
+    pub fn due_at(&self, pct: Option<u8>, now: Instant) -> bool {
+        let mut p = self.inner.lock().unwrap();
+        let overdue = p.at.is_none_or(|at| now.duration_since(at) >= Self::AT_LEAST_EVERY);
+        let due = match (p.value, pct) {
+            (_, None) => overdue,
+            (None, Some(_)) => true,
+            (Some(told), Some(v)) => {
+                v != told && (v == 100 || v < told || v >= told.saturating_add(Self::STEP) || overdue)
+            }
         };
         if due {
-            *last = Some((pct, now));
+            p.at = Some(now);
+            if pct.is_some() {
+                p.value = pct;
+            }
         }
         due
     }
@@ -1120,7 +1134,9 @@ impl Pace {
 
 impl Default for Pace {
     fn default() -> Self {
-        Self { last: Mutex::new(None) }
+        Self {
+            inner: Mutex::new(Paced::default()),
+        }
     }
 }
 
@@ -1165,30 +1181,49 @@ fn new_id(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::Pace;
+    use std::time::Duration;
 
     #[test]
-    fn progress_is_told_at_steps_of_ten_and_at_the_end_whatever_the_engine_reports() {
+    fn progress_is_told_at_steps_of_ten_at_the_end_and_when_it_went_back_whatever_the_engine_reports() {
+        let t0 = std::time::Instant::now();
         let pace = Pace::default();
-        let told: Vec<u8> = (0..=100).filter(|&p| pace.due(Some(p))).collect();
+        let told: Vec<u8> = (0..=100).filter(|&p| pace.due_at(Some(p), t0)).collect();
         assert_eq!(told, vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
-        // Final once: a repeated 100 is not told again.
-        assert!(!pace.due(Some(100)));
+        // A repeated final value is not told again.
+        assert!(!pace.due_at(Some(100), t0));
         // A jump straight to the end is told at once, whatever the step.
         let pace = Pace::default();
-        assert!(pace.due(Some(3)));
-        assert!(!pace.due(Some(7)));
-        assert!(pace.due(Some(100)));
-        // A value that moved back (a new layer appeared) waits for the interval, not for ever.
+        assert!(pace.due_at(Some(3), t0));
+        assert!(!pace.due_at(Some(7), t0));
+        assert!(pace.due_at(Some(100), t0));
+        // A value that went back is told at once and is the new baseline: downloads done, extraction begun.
+        assert!(pace.due_at(Some(12), t0));
+        assert!(!pace.due_at(Some(19), t0));
+        assert!(pace.due_at(Some(22), t0));
+        assert!(
+            pace.due_at(Some(100), t0),
+            "the end, again, once the pull is really there"
+        );
+        // Time: a small move is told once the interval passed, not before.
         let pace = Pace::default();
-        assert!(pace.due(Some(40)));
-        assert!(!pace.due(Some(35)));
-        assert!(!pace.due(Some(49)));
-        assert!(pace.due(Some(50)));
-        // Reports without a value are told by time alone: the first, then not until the interval passed.
+        assert!(pace.due_at(Some(40), t0));
+        assert!(!pace.due_at(Some(44), t0 + Pace::AT_LEAST_EVERY - Duration::from_millis(1)));
+        assert!(pace.due_at(Some(44), t0 + Pace::AT_LEAST_EVERY));
+        assert!(
+            !pace.due_at(Some(44), t0 + Pace::AT_LEAST_EVERY * 2),
+            "the same value is never told twice"
+        );
+        // A report without a value is told by time alone and does not move the baseline.
         let pace = Pace::default();
-        assert!(pace.due(None));
-        assert!(!pace.due(None));
-        assert!(!pace.due(Some(5)));
+        assert!(pace.due_at(None, t0));
+        assert!(!pace.due_at(None, t0));
+        assert!(pace.due_at(Some(5), t0), "the first value is told whatever came before");
+        assert!(!pace.due_at(Some(9), t0));
+        assert!(pace.due_at(None, t0 + Pace::AT_LEAST_EVERY));
+        assert!(
+            pace.due_at(Some(15), t0 + Pace::AT_LEAST_EVERY),
+            "the step is still measured from 5, not from the None"
+        );
     }
 
     use super::*;
