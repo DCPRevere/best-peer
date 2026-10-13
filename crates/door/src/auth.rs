@@ -85,6 +85,59 @@ pub struct Credential {
     pub issued_at: String,
     /// Absent for a durable credential.
     pub expires_at: Option<String>,
+    /// What the credential may do and how much it may hold, as the person set it at the approval.
+    #[serde(default, flatten)]
+    pub grant: Grant,
+}
+
+impl Credential {
+    /// Who holds a workload, as the events name it: an opaque id derived from the credential, never the key.
+    pub fn holder(&self) -> String {
+        holder_of_hash(&self.hash)
+    }
+}
+
+/// The holder id of a credential hash: its first sixteen hex characters, what a command key's sender part also
+/// yields, so a handler that has only the key names the same holder the admit saw.
+pub fn holder_of_hash(hash: &str) -> String {
+    hash.chars().take(16).collect()
+}
+
+/// What a credential may do and how much of the machine it may hold, decided by the person at the approval. A
+/// credential approved with nothing said is `all`: what every credential was before scopes existed, the owner's
+/// own box.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Grant {
+    /// The scopes the credential may use, from the service's own list (`scopes` in the manifest's authentication
+    /// block); absent means every scope and every holder's workloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
+    /// The most device memory the credential's workloads may hold together; absent means no share is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+}
+
+impl Grant {
+    /// Whether the credential may use `scope`: every scope when none was set or when `all` was.
+    pub fn allows(&self, scope: &str) -> bool {
+        match &self.scopes {
+            None => true,
+            Some(s) => s.iter().any(|x| x == "all" || x == scope),
+        }
+    }
+
+    /// Whether the credential acts for every holder: it was approved with nothing said, or with `all`.
+    pub fn is_all(&self) -> bool {
+        self.scopes.as_ref().is_none_or(|s| s.iter().any(|x| x == "all"))
+    }
+
+    /// What was granted, for a refusal to say.
+    pub fn said(&self) -> String {
+        match &self.scopes {
+            None => "all".into(),
+            Some(s) => s.join(","),
+        }
+    }
 }
 
 /// `durable` (default) or `session` (SPEC.md: a consumer that cannot keep a secret out of a conversation).
@@ -114,6 +167,8 @@ pub struct Pending {
     created: Instant,
     last_poll: Option<Instant>,
     approved: bool,
+    /// What the approval granted, once it happened.
+    grant: Grant,
 }
 
 impl Pending {
@@ -130,6 +185,7 @@ pub struct Admitted {
     pub connection: Option<String>,
     pub agent_label: Option<String>,
     pub lifetime: &'static str,
+    pub grant: Grant,
 }
 
 /// The device authorization answer (RFC 8628 §3.2) plus BEST's `note`.
@@ -278,6 +334,8 @@ pub struct Auth {
     credentials: Mutex<Vec<Credential>>,
     credentials_file: Mutex<Option<std::fs::File>>,
     pending: Mutex<HashMap<String, Pending>>,
+    /// The scopes this door has, named by the service: what an approval may grant.
+    scopes: Vec<String>,
 }
 
 impl Auth {
@@ -289,7 +347,35 @@ impl Auth {
             credentials: Mutex::new(Vec::new()),
             credentials_file: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            scopes: Vec::new(),
         }
+    }
+
+    /// The scopes this door has, as the service names them: what an approval may grant, and what the manifest's
+    /// authentication block lists.
+    pub fn with_scopes(mut self, scopes: &[&str]) -> Self {
+        self.scopes = scopes.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub fn scopes(&self) -> &[String] {
+        &self.scopes
+    }
+
+    /// The live credential with this hash, for a command accepted before a restart: gone when it expired or was
+    /// never this door's.
+    pub fn credential_by_hash(&self, hash: &str) -> Option<Credential> {
+        let now = OffsetDateTime::now_utc();
+        self.credentials
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.hash == hash)
+            .filter(|c| match &c.expires_at {
+                None => true,
+                Some(e) => OffsetDateTime::parse(e, &Rfc3339).is_ok_and(|e| e > now),
+            })
+            .cloned()
     }
 
     /// Credentials kept in `dir/credentials.jsonl`, hashes only. A line that cannot be read (a torn write) is
@@ -409,6 +495,7 @@ impl Auth {
                 connection: req.connection,
                 agent_label: req.agent_label,
                 lifetime,
+                grant: Grant::default(),
                 created: Instant::now(),
                 last_poll: None,
                 approved: false,
@@ -465,7 +552,26 @@ impl Auth {
     }
 
     /// Marks a registration approved, on the approver's word, and says what was admitted.
-    pub async fn approve(&self, user_code: &str, proof: &str) -> Result<Admitted, OAuthError> {
+    /// Admits the registration `user_code` names, with `grant` as what the credential may do, once `proof` is
+    /// the authority's. A scope the service does not have is refused by name, so a typo cannot admit more or
+    /// less than the person meant.
+    pub async fn approve(&self, user_code: &str, proof: &str, grant: Grant) -> Result<Admitted, OAuthError> {
+        if let Some(scopes) = &grant.scopes {
+            if scopes.is_empty() {
+                return Err(OAuthError::invalid_request(
+                    "may names no scope: say which, or leave it out for all",
+                ));
+            }
+            if let Some(unknown) = scopes
+                .iter()
+                .find(|s| *s != "all" && !self.scopes.iter().any(|k| k == *s))
+            {
+                return Err(OAuthError::invalid_request(format!(
+                    "no such scope {unknown}: this door has {}, and all",
+                    self.scopes.join(", ")
+                )));
+            }
+        }
         self.expire_pending();
         let code = normalise_user_code(user_code);
         let exists = self
@@ -489,12 +595,14 @@ impl Auth {
                 OAuthError::invalid_request(format!("the registration {code} expired while being approved"))
             })?;
         p.approved = true;
+        p.grant = grant.clone();
         Ok(Admitted {
             user_code: code,
             client_id: p.client_id.clone(),
             connection: p.connection.clone(),
             agent_label: p.agent_label.clone(),
             lifetime: p.lifetime.as_str(),
+            grant,
         })
     }
 
@@ -567,6 +675,7 @@ impl Auth {
             agent_label: p.agent_label,
             issued_at: now_rfc3339(),
             expires_at: expires_at.clone(),
+            grant: p.grant,
         };
         self.store(&credential);
         let mut answer = json!({
@@ -775,10 +884,16 @@ mod tests {
         assert_eq!(poll(&auth, &a.device_code).unwrap_err().error, "authorization_pending");
         assert_eq!(poll(&auth, &a.device_code).unwrap_err().error, "slow_down");
         assert_eq!(
-            auth.approve(&a.user_code, "wrong").await.unwrap_err().error,
+            auth.approve(&a.user_code, "wrong", Grant::default())
+                .await
+                .unwrap_err()
+                .error,
             "access_denied"
         );
-        let admitted = auth.approve(&a.user_code.to_ascii_lowercase(), "ok").await.unwrap();
+        let admitted = auth
+            .approve(&a.user_code.to_ascii_lowercase(), "ok", Grant::default())
+            .await
+            .unwrap();
         assert_eq!(admitted.connection.as_deref(), Some("my-peer"));
         assert_eq!(admitted.agent_label.as_deref(), Some("a test"));
         assert_eq!(admitted.lifetime, "durable");
@@ -842,7 +957,10 @@ mod tests {
         auth.age(&a.device_code, DEVICE_CODE_TTL + Duration::from_secs(1));
         assert!(auth.verification_page(Some(&a.user_code)).contains("unknown"));
         assert_eq!(
-            auth.approve(&a.user_code, "ok").await.unwrap_err().error,
+            auth.approve(&a.user_code, "ok", Grant::default())
+                .await
+                .unwrap_err()
+                .error,
             "invalid_request"
         );
     }
@@ -857,7 +975,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        auth.approve(&a.user_code, "ok").await.unwrap();
+        auth.approve(&a.user_code, "ok", Grant::default()).await.unwrap();
         let answer = poll(&auth, &a.device_code).unwrap();
         assert_eq!(answer["name"], "peer.test");
         assert_eq!(answer["expires_in"], 8 * 3600);
@@ -870,6 +988,7 @@ mod tests {
             agent_label: None,
             issued_at: "2020-01-01T00:00:00Z".into(),
             expires_at: Some("2020-01-01T08:00:00.5Z".into()),
+            grant: Grant::default(),
         });
         assert!(
             auth.authenticate("bp_stale").is_none(),
@@ -943,7 +1062,7 @@ mod tests {
         )
         .unwrap();
         let a = start(&first, Some("kept"));
-        first.approve(&a.user_code, "ok").await.unwrap();
+        first.approve(&a.user_code, "ok", Grant::default()).await.unwrap();
         let key = poll(&first, &a.device_code).unwrap()["access_token"]
             .as_str()
             .unwrap()

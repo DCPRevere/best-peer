@@ -38,6 +38,7 @@ pub fn manifest(door: &Door) -> Value {
                 "type": "apiKey",
                 "scheme": crate::auth::AUTH_HEADER,
                 "in": "header",
+                "scopes": door.auth.scopes(),
                 "tokenUrl": door.auth.token_url(),
                 "deviceAuthorizationUrl": door.auth.device_authorization_url(),
                 "note": guidance::MANIFEST_TEXT

@@ -22,7 +22,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::auth::{Credential, DeviceRequest, OAuthError, TokenRequest, AUTH_HEADER};
+use crate::auth::{Credential, DeviceRequest, Grant, OAuthError, TokenRequest, AUTH_HEADER};
 use crate::catalogue::{CommandDef, Emitter};
 use crate::envelope::Envelope;
 use crate::error::BestError;
@@ -193,11 +193,24 @@ async fn verify(State(door): State<Shared>, Query(q): Query<HashMap<String, Stri
 struct ApproveForm {
     user_code: String,
     proof: String,
+    /// The scopes granted, comma-separated; absent for all.
+    may: Option<String>,
+    /// The most device memory the credential's workloads may hold together; absent for no share.
+    memory_bytes: Option<u64>,
 }
 
 async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
     let f: ApproveForm = form(&headers, &body)?;
-    let admitted = door.auth.approve(f.user_code.trim(), f.proof.trim()).await?;
+    let grant = Grant {
+        scopes: f.may.as_deref().map(|m| {
+            m.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }),
+        memory_bytes: f.memory_bytes,
+    };
+    let admitted = door.auth.approve(f.user_code.trim(), f.proof.trim(), grant).await?;
     Ok(Json(json!({ "approved": true, "admitted": admitted })).into_response())
 }
 
@@ -297,7 +310,13 @@ async fn ingest(
         };
     }
     if let Some(admit) = &def.admit {
-        if let Err(refusal) = admit(envelope.clone(), command_key(&sender.hash, &envelope.id)).await {
+        if let Err(refusal) = admit(
+            envelope.clone(),
+            sender.clone(),
+            command_key(&sender.hash, &envelope.id),
+        )
+        .await
+        {
             door.inflight.lock().unwrap().remove(&key);
             return Err(refusal);
         }
@@ -371,7 +390,12 @@ pub async fn resume(door: &Shared) {
             continue;
         }
         if let Some(admit) = &def.admit {
-            if let Err(refusal) = admit(envelope.clone(), command_key(&owed.sender, &envelope.id)).await {
+            // The sender is the credential that sent it; one that expired or is gone since cannot be honoured.
+            let Some(who) = door.auth.credential_by_hash(&owed.sender) else {
+                fail("the command was accepted before a restart and its sender's credential is gone".into());
+                continue;
+            };
+            if let Err(refusal) = admit(envelope.clone(), who, command_key(&owed.sender, &envelope.id)).await {
                 emitter_for(door, def, &owed.sender, &envelope).emit(
                     "CommandFailed",
                     json!({ "type": envelope.r#type, "reason": format!("accepted before a restart and refused now: {}", refusal.message), "details": refusal.details }),
@@ -537,6 +561,7 @@ async fn query_document(
 
 async fn execute_query(
     State(door): State<Shared>,
+    Extension(sender): Extension<Credential>,
     Path(schema): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, BestError> {
@@ -545,7 +570,7 @@ async fn execute_query(
         .query_by_schema(&schema)
         .ok_or_else(|| query_not_found(&schema))?;
     door.catalogue.validate_params(&schema, &params)?;
-    Ok(Json((def.handler)(params).await?))
+    Ok(Json((def.handler)(sender, params).await?))
 }
 
 // ----- workflows ---------------------------------------------------------------------------------------------------
@@ -600,6 +625,11 @@ mod tests {
 
     /// A door over a log that may hold a previous door's commands and events.
     fn door_over(log: Arc<EventLog>) -> Shared {
+        door_over_with(log, None)
+    }
+
+    /// A door over `log` with the credentials of a previous door, when it is that door restarted.
+    fn door_over_with(log: Arc<EventLog>, auth: Option<Arc<Auth>>) -> Shared {
         let catalogue = Catalogue::new()
             .command(CommandDef {
                 schema: "pull-image".into(),
@@ -610,7 +640,7 @@ mod tests {
                 produces: vec!["ImagePulled".into()],
                 completes: vec!["ImagePulled".into()],
                 impact: None,
-                admit: Some(Arc::new(|cmd, key| {
+                admit: Some(Arc::new(|cmd, _who, key| {
                     Box::pin(async move {
                         let image = cmd.data["image"].as_str().unwrap_or("").to_string();
                         assert!(key.ends_with(&format!(":{}", cmd.id)), "the key ends with the envelope id");
@@ -654,9 +684,9 @@ mod tests {
                 description: "Who this peer is.".into(),
                 parameters: Some(json!({ "type": "object", "properties": { "x": { "type": "string", "enum": ["1", "2"] } }, "additionalProperties": false })),
                 response: json!({ "type": "object", "properties": { "name": { "type": "string" } } }),
-                handler: Arc::new(|p| Box::pin(async move { Ok(json!({ "name": "peer", "echo": p.get("x") })) })),
+                handler: Arc::new(|_who, p| Box::pin(async move { Ok(json!({ "name": "peer", "echo": p.get("x") })) })),
             });
-        let auth = Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() })));
+        let auth = auth.unwrap_or_else(|| Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() }))));
         Arc::new(Door::new(EP, "io.best.agents", "A test peer.", catalogue, log, auth))
     }
 
@@ -971,8 +1001,8 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(d.log.len(), 1, "one completed, the stalled one told nothing");
         assert_eq!(d.log.unfinished().len(), 1);
-        // The peer restarts over the same log.
-        let again = door_over(d.log.clone());
+        // The peer restarts over the same log, with the same credentials on disk.
+        let again = door_over_with(d.log.clone(), Some(d.auth.clone()));
         resume(&again).await;
         settle(&again, 2).await;
         let (events, _) = again.log.list(&Filter::default());
@@ -1018,9 +1048,10 @@ mod tests {
         let mut owed = d.log.unfinished();
         assert_eq!(owed.len(), 1);
         owed[0].envelope.data["image"] = json!("full:2");
-        let again = door_over(Arc::new(EventLog::ephemeral()));
+        let again = door_over_with(Arc::new(EventLog::ephemeral()), Some(d.auth.clone()));
+        let sender = crate::auth::hash_key(&key);
         again.log.accept_command(
-            "x",
+            &sender,
             "owed-3",
             &payload_hash(&owed[0].envelope),
             "owed-3",
@@ -1031,9 +1062,16 @@ mod tests {
         tampered.id = "owed-4".into();
         again
             .log
-            .accept_command("x", "owed-4", "the-hash-of-something-else", "owed-4", &tampered);
+            .accept_command(&sender, "owed-4", "the-hash-of-something-else", "owed-4", &tampered);
+        // And one whose sender's credential is gone: not this door's any more, so not run as anyone.
+        let mut orphan = owed[0].envelope.clone();
+        orphan.id = "owed-5".into();
+        orphan.data["image"] = json!("small:5");
+        again
+            .log
+            .accept_command("x", "owed-5", &payload_hash(&orphan), "owed-5", &orphan);
         resume(&again).await;
-        settle(&again, 2).await;
+        settle(&again, 3).await;
         let (events, _) = again.log.list(&Filter::default());
         let reason = |corr: &str| {
             events
@@ -1048,6 +1086,9 @@ mod tests {
         let (t, r) = reason("owed-4");
         assert_eq!(t, "CommandFailed");
         assert!(r.contains("no longer matches its record"), "{r}");
+        let (t, r) = reason("owed-5");
+        assert_eq!(t, "CommandFailed");
+        assert!(r.contains("credential is gone"), "{r}");
         assert!(again.log.unfinished().is_empty(), "a failed command is finished");
     }
 

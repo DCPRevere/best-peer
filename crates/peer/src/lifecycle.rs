@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::http::StatusCode;
+use best_peer_door::auth::{holder_of_hash, Credential};
 use best_peer_door::{BestError, Emitter, Envelope, EventLog};
 use best_peer_engine::{Engine, EngineError, Kind};
 use best_peer_gpu::{Compute, DeviceId, Gpu, Host};
@@ -349,6 +351,11 @@ impl Peer {
 
     // ----- pull-image -----------------------------------------------------------------------------------------------
 
+    /// A pull is a deploy's first step and needs the same scope.
+    pub fn admit_pull(&self, who: &Credential) -> Result<(), BestError> {
+        require(who, "deploy")
+    }
+
     pub async fn pull_image(self: Arc<Self>, cmd: Envelope, em: Emitter) {
         let image = best_peer_runtime::ImageRef(cmd.data["image"].as_str().unwrap_or_default().to_string());
         match self.pull(&em, &image).await {
@@ -367,10 +374,12 @@ impl Peer {
 
     // ----- deploy-model ---------------------------------------------------------------------------------------------
 
-    pub async fn admit_deploy(&self, cmd: Envelope, key: String) -> Result<(), BestError> {
+    pub async fn admit_deploy(&self, cmd: Envelope, who: Credential, key: String) -> Result<(), BestError> {
+        require(&who, "deploy")?;
         let data: DeployData = parse(&cmd.data)?;
         let host = self.hardware().await?;
         let mut state = self.state.lock().unwrap();
+        within_share(&state, &who, data.memory_bytes)?;
         let (device, compute) = place(
             &host,
             &state,
@@ -386,6 +395,7 @@ impl Peer {
                 device: Some(device),
                 compute: Some(compute),
                 memory_bytes: data.memory_bytes,
+                holder: who.holder(),
             },
         );
         Ok(())
@@ -400,6 +410,7 @@ impl Peer {
             id,
             device: Some(device),
             compute: Some(compute),
+            holder,
             ..
         }) = reservation
         else {
@@ -473,7 +484,7 @@ impl Peer {
         self.tell(
             &em,
             "DeploymentStarted",
-            json!({ "deployment": id, "model": data.model, "engine": data.engine, "device": device.0, "memory_bytes": data.memory_bytes, "container": started.id.0, "port": port }),
+            json!({ "deployment": id, "model": data.model, "engine": data.engine, "device": device.0, "memory_bytes": data.memory_bytes, "container": started.id.0, "port": port, "holder": holder }),
         );
         em.bind_workload(&id);
         self.replay_unowned(&started.id).await;
@@ -596,7 +607,8 @@ impl Peer {
 
     /// Admits an undeploy and claims the deployment at once, so a second undeploy admitted before the first ran is
     /// refused rather than told twice.
-    pub fn admit_undeploy(&self, cmd: Envelope) -> Result<(), BestError> {
+    pub fn admit_undeploy(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        require(who, "deploy")?;
         let id = cmd.data["deployment"].as_str().unwrap_or_default();
         let mut s = self.state.lock().unwrap();
         let live: Vec<String> = s.deployments.keys().cloned().collect();
@@ -609,6 +621,7 @@ impl Peer {
                 ),
             )
             .with_details(json!({ "deployment": id, "live": live }))),
+            Some(d) if !who.grant.is_all() && d.holder != who.holder() => Err(not_yours("deployment", id)),
             Some(d) if d.phase == Phase::Ending => Err(BestError::bad_request(
                 "ALREADY_ENDING",
                 format!("deployment {id} is already ending: its Undeployed or DeploymentFailed event follows"),
@@ -676,7 +689,8 @@ impl Peer {
 
     // ----- run-job --------------------------------------------------------------------------------------------------
 
-    pub async fn admit_run_job(&self, cmd: Envelope, key: String) -> Result<(), BestError> {
+    pub async fn admit_run_job(&self, cmd: Envelope, who: Credential, key: String) -> Result<(), BestError> {
+        require(&who, "jobs")?;
         if !self.runtime.runs_jobs() {
             return Err(BestError::bad_request(
                 "NO_CONTAINER_ENGINE",
@@ -696,6 +710,7 @@ impl Peer {
             None => None,
         };
         let mut state = self.state.lock().unwrap();
+        within_share(&state, &who, data.memory_bytes.unwrap_or(0))?;
         let placement = match (data.memory_bytes, &host) {
             (Some(needed), Some(host)) => Some(place(
                 host,
@@ -714,6 +729,7 @@ impl Peer {
                 device: placement.as_ref().map(|(d, _)| d.clone()),
                 compute: placement.map(|(_, c)| c),
                 memory_bytes: data.memory_bytes.unwrap_or(0),
+                holder: who.holder(),
             },
         );
         Ok(())
@@ -761,7 +777,7 @@ impl Peer {
                 self.tell(
                     &em,
                     "JobStarted",
-                    json!({ "job": id, "image": data.image, "device": reservation.device.as_ref().map(|d| d.0.clone()), "memory_bytes": reservation.memory_bytes, "container": started.id.0 }),
+                    json!({ "job": id, "image": data.image, "device": reservation.device.as_ref().map(|d| d.0.clone()), "memory_bytes": reservation.memory_bytes, "container": started.id.0, "holder": reservation.holder }),
                 );
                 em.bind_workload(&id);
                 self.replay_unowned(&started.id).await;
@@ -774,7 +790,8 @@ impl Peer {
 
     /// Admits a stop and claims the job at once, so a second stop admitted before the first ran is refused rather
     /// than told twice.
-    pub fn admit_stop_job(&self, cmd: Envelope) -> Result<(), BestError> {
+    pub fn admit_stop_job(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        require(who, "jobs")?;
         let id = cmd.data["job"].as_str().unwrap_or_default();
         let mut s = self.state.lock().unwrap();
         let running: Vec<String> = s.jobs.keys().cloned().collect();
@@ -787,6 +804,7 @@ impl Peer {
                 ),
             )
             .with_details(json!({ "job": id, "running": running }))),
+            Some(j) if !who.grant.is_all() && j.holder != who.holder() => Err(not_yours("job", id)),
             Some(j) if j.phase == JobPhase::Stopping => Err(BestError::bad_request(
                 "ALREADY_STOPPING",
                 format!("job {id} is already stopping: its JobStopped event follows"),
@@ -961,15 +979,18 @@ impl Peer {
     }
 
     /// `get-workloads`: what is deployed and what runs, now.
-    pub fn workloads(&self) -> Value {
+    pub fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
+        require(who, "read")?;
+        let mine = |holder: &str| who.grant.is_all() || holder == who.holder();
         let s = self.state.lock().unwrap();
         let deployments: Vec<Value> = s
             .deployments
             .values()
+            .filter(|d| mine(&d.holder))
             .map(|d| {
                 json!({
                     "deployment": d.id, "model": d.model, "engine": d.engine, "device": d.device.0,
-                    "memory_bytes": d.memory_bytes,
+                    "memory_bytes": d.memory_bytes, "holder": d.holder,
                     // Computed, not read back from the log: a deployment made by an earlier peer is on the door too.
                     "endpoint": d.endpoint.as_ref().map(|_| self.door_endpoint(&d.id, d.engine)),
                     "phase": match d.phase { Phase::Starting => "starting", Phase::Ready => "ready", Phase::Ending => "ending" }
@@ -979,16 +1000,63 @@ impl Peer {
         let jobs: Vec<Value> = s
             .jobs
             .values()
+            .filter(|j| mine(&j.holder))
             .map(|j| {
                 json!({
                     "job": j.id, "image": j.image.0, "device": j.device.as_ref().map(|d| d.0.clone()),
-                    "memory_bytes": j.memory_bytes,
+                    "memory_bytes": j.memory_bytes, "holder": j.holder,
                     "phase": match j.phase { JobPhase::Running => "running", JobPhase::Stopping => "stopping" }
                 })
             })
             .collect();
-        json!({ "deployments": deployments, "jobs": jobs })
+        Ok(
+            json!({ "deployments": deployments, "jobs": jobs, "held_bytes": s.held_by(&who.holder()), "share_bytes": who.grant.memory_bytes }),
+        )
     }
+}
+
+/// A credential that may not use `scope` is refused with what it was approved for and what to do.
+fn require(who: &Credential, scope: &str) -> Result<(), BestError> {
+    if who.grant.allows(scope) {
+        return Ok(());
+    }
+    Err(BestError::new(
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+        format!(
+            "this credential may not {scope}: it was approved for {}; ask whoever controls the machine to approve a credential that may (best-peer approve <code> --may {scope})",
+            who.grant.said()
+        ),
+    )
+    .with_details(json!({ "needs": scope, "may": who.grant.scopes })))
+}
+
+/// A deploy or a job past the credential's share is refused with what it holds and what to do.
+fn within_share(state: &State, who: &Credential, needed: u64) -> Result<(), BestError> {
+    let Some(share) = who.grant.memory_bytes else {
+        return Ok(());
+    };
+    let held = state.held_by(&who.holder());
+    if held.saturating_add(needed) <= share {
+        return Ok(());
+    }
+    Err(BestError::bad_request(
+        "SHARE_EXCEEDED",
+        format!(
+            "this credential may hold {share} bytes of device memory and holds {held}: {needed} more does not fit; undeploy or stop something of yours first (get-workloads lists them), or ask for a larger share"
+        ),
+    )
+    .with_details(json!({ "share_bytes": share, "held_bytes": held, "needed_bytes": needed, "room_bytes": share.saturating_sub(held) })))
+}
+
+/// A workload another credential holds is not this one's to end.
+fn not_yours(kind: &str, id: &str) -> BestError {
+    BestError::new(
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+        format!("{kind} {id} was started by another credential: get-workloads lists yours, and only a credential approved for all may end another's"),
+    )
+    .with_details(json!({ kind: id }))
 }
 
 /// Where a workload needing `memory_bytes` on a device offering one of `apis` goes: the fitting device with the most
@@ -1185,6 +1253,12 @@ fn list<'a, S: AsRef<str> + 'a>(items: impl Iterator<Item = &'a S>) -> String {
     } else {
         v.join(", ")
     }
+}
+
+/// The holder a command key names: its sender part is the credential's hash.
+#[allow(dead_code)]
+fn holder_of_key(key: &str) -> String {
+    holder_of_hash(key.split(':').next().unwrap_or(""))
 }
 
 fn new_id(prefix: &str) -> String {

@@ -78,7 +78,9 @@ At your machine:
 ```
 
 Their client's next poll receives a key under that name. No accounts, no passwords: whoever controls the machine
-decides who is in, as with SSH keys.
+decides who is in, as with SSH keys, and what they may do: approved with nothing more said, a key may do everything;
+`--may read,deploy --memory 40G` makes one that may read the hardware and the workloads, deploy models but run no
+job, and hold 40 GiB of device memory at most across its workloads, which it alone sees and ends.
 
 **4. What the agent does from there.** Reads the hardware state (a card shows its memory, temperature, power,
 utilisation and the CUDA version; the host CPU is listed after it), deploys a model on it, follows the events to
@@ -213,3 +215,15 @@ best-peer approve ABCD-EFGH
 That presents the machine's admin token, which only its owner can read, and the agent's next poll gets its credential:
 a key shown once, kept hashed, bound to the connection name the person gave. An operator who wants an identity
 provider instead plugs one in behind the `Approver` trait; the door never knows which stands behind it.
+
+**What a credential may do** is set at the approval and travels with the key. The manifest's authentication block
+lists the scopes: `read` (the hardware state, the workloads), `deploy` (pull-image, deploy-model, undeploy-model)
+and `jobs` (run-job, stop-job); `all` is every scope and every holder's workloads, and what a key approved with
+nothing said is, so the owner's own box changes nothing. `best-peer approve <code> --may read,deploy` grants
+scopes; `--memory 40G` sets the most device memory the key's workloads may hold together, counted across its
+deployments, jobs and commands admitted but not yet started. Every command document says which scope it needs. A
+command the key may not send is refused at ingest with `403 FORBIDDEN` and what it was approved for; a deploy or a
+job past the share is `400 SHARE_EXCEEDED` with what is held and the room left; a workload another key started is
+refused by name, since `get-workloads` shows a key its own, with `held_bytes` against `share_bytes`. `DeploymentStarted`
+and `JobStarted` name the `holder`, an opaque id of the credential, never the key. The spec has no per-command
+scope field yet, so the requirement is in the description text; that is an entry on the spec follow-ups.

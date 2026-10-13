@@ -64,11 +64,16 @@ pub fn event_dataschemas(endpoint: &str) -> HashMap<String, String> {
     c.event_dataschemas(endpoint)
 }
 
+/// What a credential may be approved for: `read` the hardware and the workloads, `deploy` models (pull, deploy,
+/// undeploy), run `jobs` (run, stop); `all` is every scope and every holder's workloads, what a credential approved
+/// with nothing said is.
+pub const SCOPES: &[&str] = &["read", "deploy", "jobs"];
+
 fn hardware_query(gpu: Arc<dyn Gpu>) -> QueryDef {
     QueryDef {
         schema: "get-hardware-state".into(),
         version: "1.0".into(),
-        description: "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power and utilisation, and the driver. Read it before deploying: a model needs an API the device offers and memory it has free; get-workloads says what already holds memory.".into(),
+        description: "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power and utilisation, and the driver. Read it before deploying: a model needs an API the device offers and memory it has free; get-workloads says what already holds memory. Needs the read scope.".into(),
         parameters: None,
         response: json!({
             "type": "object",
@@ -95,9 +100,16 @@ fn hardware_query(gpu: Arc<dyn Gpu>) -> QueryDef {
                 }
             }
         }),
-        handler: Arc::new(move |_params| {
+        handler: Arc::new(move |who, _params| {
             let gpu = gpu.clone();
             Box::pin(async move {
+                if !who.grant.allows("read") {
+                    return Err(BestError::new(
+                        axum::http::StatusCode::FORBIDDEN,
+                        "FORBIDDEN",
+                        format!("this credential may not read: it was approved for {}", who.grant.said()),
+                    ));
+                }
                 // A real adapter talks to a driver synchronously; that never blocks the door's workers.
                 tokio::task::spawn_blocking(move || hardware_state(gpu.as_ref()))
                     .await
@@ -111,7 +123,7 @@ fn workloads_query(peer: Arc<Peer>) -> QueryDef {
     QueryDef {
         schema: "get-workloads".into(),
         version: "1.0".into(),
-        description: "What this peer runs now: each deployment with its model, engine, device, the memory promised to it, its inference endpoint once ready and its phase (starting, ready, ending); each job with its image, device and phase (running, stopping). The ids here are what undeploy-model and stop-job name.".into(),
+        description: "What this peer runs for you now: each deployment with its model, engine, device, the memory promised to it, its inference endpoint once ready and its phase (starting, ready, ending); each job with its image, device and phase (running, stopping); and held_bytes, the device memory your workloads hold together, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name. Needs the read scope.".into(),
         parameters: None,
         response: json!({
             "type": "object",
@@ -119,29 +131,32 @@ fn workloads_query(peer: Arc<Peer>) -> QueryDef {
             "properties": {
                 "deployments": { "type": "array", "items": { "type": "object", "required": ["deployment", "model", "engine", "device", "memory_bytes", "phase"], "properties": {
                     "deployment": { "type": "string" }, "model": { "type": "string" }, "engine": { "type": "string", "enum": ["ollama", "vllm"] },
-                    "device": { "type": "string" }, "memory_bytes": { "type": "integer" },
+                    "device": { "type": "string" }, "memory_bytes": { "type": "integer" }, "holder": { "type": "string", "description": "The credential that deployed it, an opaque id" },
                     "endpoint": { "type": ["string", "null"], "description": "The OpenAI-compatible base URL on this door, once the deployment is ready; this door's credential opens it, as X-Api-Key or Authorization: Bearer" },
                     "phase": { "type": "string", "enum": ["starting", "ready", "ending"] }
                 } } },
                 "jobs": { "type": "array", "items": { "type": "object", "required": ["job", "image", "phase"], "properties": {
                     "job": { "type": "string" }, "image": { "type": "string" }, "device": { "type": ["string", "null"] },
-                    "memory_bytes": { "type": "integer" }, "phase": { "type": "string", "enum": ["running", "stopping"] }
-                } } }
+                    "memory_bytes": { "type": "integer" }, "holder": { "type": "string" }, "phase": { "type": "string", "enum": ["running", "stopping"] }
+                } } },
+                "held_bytes": { "type": "integer", "description": "The device memory your workloads hold together, admitted ones included" },
+                "share_bytes": { "type": ["integer", "null"], "description": "The most your credential may hold; null when no share was set" }
             }
         }),
-        handler: Arc::new(move |_params| {
+        handler: Arc::new(move |who, _params| {
             let peer = peer.clone();
-            Box::pin(async move { Ok(peer.workloads()) })
+            Box::pin(async move { peer.workloads(&who) })
         }),
     }
 }
 
 fn pull_image(peer: Arc<Peer>) -> CommandDef {
+    let admit = peer.clone();
     CommandDef {
         schema: "pull-image".into(),
         version: "1.0".into(),
         command_type: "PullImage".into(),
-        description: "Makes a container image present on this peer, so a later deploy or job can start at once. The outcome is an ImagePulled or ImagePullFailed event with this command's correlation id.".into(),
+        description: "Makes a container image present on this peer, so a later deploy or job can start at once. The outcome is an ImagePulled or ImagePullFailed event with this command's correlation id. Needs the deploy scope.".into(),
         data_schema: json!({
             "type": "object",
             "required": ["image"],
@@ -153,7 +168,10 @@ fn pull_image(peer: Arc<Peer>) -> CommandDef {
         produces: vec!["ImagePulling".into(), "ImagePulled".into(), "ImagePullFailed".into()],
         completes: completes("PullImage"),
         impact: None,
-        admit: None,
+        admit: Some(Arc::new(move |_cmd, who, _key| {
+            let peer = admit.clone();
+            Box::pin(async move { peer.admit_pull(&who) })
+        })),
         handler: Arc::new(move |cmd, emitter| {
             let peer = peer.clone();
             Box::pin(async move { peer.pull_image(cmd, emitter).await })
@@ -167,7 +185,7 @@ fn deploy_model(peer: Arc<Peer>) -> CommandDef {
         schema: "deploy-model".into(),
         version: "1.0".into(),
         command_type: "DeployModel".into(),
-        description: "Serves a model on this peer with the engine named, on a device that offers an API the engine runs on and has the memory asked for free. Refused at once, with the reason and what to do, when no device fits. Otherwise the facts follow on the stream with this command's correlation id: ImagePulling and ImagePulled, DeploymentStarted, WeightsLoading, then DeploymentReady with the OpenAI-compatible endpoint to send prompts to, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it or stops on its own, under the same correlation id.".into(),
+        description: "Serves a model on this peer with the engine named, on a device that offers an API the engine runs on and has the memory asked for free. Refused at once, with the reason and what to do, when no device fits. Otherwise the facts follow on the stream with this command's correlation id: ImagePulling and ImagePulled, DeploymentStarted, WeightsLoading, then DeploymentReady with the OpenAI-compatible endpoint to send prompts to, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it or stops on its own, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.".into(),
         data_schema: json!({
             "type": "object",
             "required": ["model", "engine", "memory_bytes"],
@@ -191,9 +209,9 @@ fn deploy_model(peer: Arc<Peer>) -> CommandDef {
         ],
         completes: completes("DeployModel"),
         impact: None,
-        admit: Some(Arc::new(move |cmd, key| {
+        admit: Some(Arc::new(move |cmd, who, key| {
             let peer = admit.clone();
-            Box::pin(async move { peer.admit_deploy(cmd, key).await })
+            Box::pin(async move { peer.admit_deploy(cmd, who, key).await })
         })),
         handler: Arc::new(move |cmd, emitter| {
             let peer = peer.clone();
@@ -208,7 +226,7 @@ fn undeploy_model(peer: Arc<Peer>) -> CommandDef {
         schema: "undeploy-model".into(),
         version: "1.0".into(),
         command_type: "UndeployModel".into(),
-        description: "Stops a deployment and frees its device memory. Refused when no such deployment is live. The outcome is an Undeployed event with this command's correlation id.".into(),
+        description: "Stops a deployment and frees its device memory. Refused when no such deployment is live, or when another credential deployed it. The outcome is an Undeployed event with this command's correlation id. Needs the deploy scope.".into(),
         data_schema: json!({
             "type": "object",
             "required": ["deployment"],
@@ -220,9 +238,9 @@ fn undeploy_model(peer: Arc<Peer>) -> CommandDef {
         produces: vec!["Undeployed".into(), "CommandFailed".into()],
         completes: completes("UndeployModel"),
         impact: None,
-        admit: Some(Arc::new(move |cmd, _key| {
+        admit: Some(Arc::new(move |cmd, who, _key| {
             let peer = admit.clone();
-            Box::pin(async move { peer.admit_undeploy(cmd) })
+            Box::pin(async move { peer.admit_undeploy(cmd, &who) })
         })),
         handler: Arc::new(move |cmd, emitter| {
             let peer = peer.clone();
@@ -237,7 +255,7 @@ fn run_job(peer: Arc<Peer>) -> CommandDef {
         schema: "run-job".into(),
         version: "1.0".into(),
         command_type: "RunJob".into(),
-        description: "Runs an image once, with the arguments given, and tells its end. With memory_bytes the job is placed on a device with that much room and handed that device; without, it runs with no device. The facts follow with this command's correlation id: ImagePulling and ImagePulled, then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed.".into(),
+        description: "Runs an image once, with the arguments given, and tells its end. With memory_bytes the job is placed on a device with that much room and handed that device; without, it runs with no device. The facts follow with this command's correlation id: ImagePulling and ImagePulled, then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed. Needs the jobs scope, and room in the credential's share when one was set and memory_bytes is given.".into(),
         data_schema: json!({
             "type": "object",
             "required": ["image"],
@@ -258,9 +276,9 @@ fn run_job(peer: Arc<Peer>) -> CommandDef {
         ],
         completes: completes("RunJob"),
         impact: None,
-        admit: Some(Arc::new(move |cmd, key| {
+        admit: Some(Arc::new(move |cmd, who, key| {
             let peer = admit.clone();
-            Box::pin(async move { peer.admit_run_job(cmd, key).await })
+            Box::pin(async move { peer.admit_run_job(cmd, who, key).await })
         })),
         handler: Arc::new(move |cmd, emitter| {
             let peer = peer.clone();
@@ -275,7 +293,7 @@ fn stop_job(peer: Arc<Peer>) -> CommandDef {
         schema: "stop-job".into(),
         version: "1.0".into(),
         command_type: "StopJob".into(),
-        description: "Stops a running job. Refused when no such job is running. The outcome is a JobStopped event with this command's correlation id.".into(),
+        description: "Stops a running job. Refused when no such job is running, or when another credential started it. The outcome is a JobStopped event with this command's correlation id. Needs the jobs scope.".into(),
         data_schema: json!({
             "type": "object",
             "required": ["job"],
@@ -287,9 +305,9 @@ fn stop_job(peer: Arc<Peer>) -> CommandDef {
         produces: vec!["JobStopped".into(), "CommandFailed".into()],
         completes: completes("StopJob"),
         impact: None,
-        admit: Some(Arc::new(move |cmd, _key| {
+        admit: Some(Arc::new(move |cmd, who, _key| {
             let peer = admit.clone();
-            Box::pin(async move { peer.admit_stop_job(cmd) })
+            Box::pin(async move { peer.admit_stop_job(cmd, &who) })
         })),
         handler: Arc::new(move |cmd, emitter| {
             let peer = peer.clone();
@@ -338,8 +356,8 @@ pub fn event_defs() -> Vec<EventDef> {
             "deployment-started",
             "DeploymentStarted",
             "The engine's container runs on the device named; the model is not yet served.",
-            &["deployment", "model", "engine", "device", "memory_bytes", "container"],
-            json!({ "deployment": s("The id later commands name"), "model": s("The model"), "engine": s("ollama or vllm"), "device": s("The device it was placed on"), "memory_bytes": n("The memory promised to it"), "container": s("The engine's container id"), "port": n("The host port the engine is reached at") }),
+            &["deployment", "model", "engine", "device", "memory_bytes", "container", "holder"],
+            json!({ "deployment": s("The id later commands name"), "holder": s("The credential that deployed it, an opaque id: what get-workloads shows as holder"), "model": s("The model"), "engine": s("ollama or vllm"), "device": s("The device it was placed on"), "memory_bytes": n("The memory promised to it"), "container": s("The engine's container id"), "port": n("The host port the engine is reached at") }),
         ),
         event(
             "weights-loading",
@@ -387,8 +405,8 @@ pub fn event_defs() -> Vec<EventDef> {
             "job-started",
             "JobStarted",
             "The job's container runs.",
-            &["job", "image", "container"],
-            json!({ "job": s("The id stop-job names"), "image": s("The image"), "device": { "type": ["string", "null"] }, "memory_bytes": n("The memory promised to it"), "container": s("The engine's container id") }),
+            &["job", "image", "container", "holder"],
+            json!({ "job": s("The id stop-job names"), "holder": s("The credential that ran it, an opaque id"), "image": s("The image"), "device": { "type": ["string", "null"] }, "memory_bytes": n("The memory promised to it"), "container": s("The engine's container id") }),
         ),
         event(
             "job-finished",

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use serde_json::{json, Value};
 
+use crate::auth::Credential;
 use crate::envelope::Envelope;
 use crate::error::BestError;
 use crate::log::EventLog;
@@ -111,11 +112,13 @@ pub type CommandHandler = Arc<dyn Fn(Envelope, Emitter) -> BoxFuture<'static, ()
 /// refused command was never accepted: its `id` is free for the corrected retry. The check may reserve what the
 /// handler will use, filed under the command's key (the second argument, the same the handler's emitter carries);
 /// the handler runs next, or never, if the peer dies in between.
-pub type AdmitHook = Arc<dyn Fn(Envelope, String) -> BoxFuture<'static, Result<(), BestError>> + Send + Sync>;
+pub type AdmitHook =
+    Arc<dyn Fn(Envelope, Credential, String) -> BoxFuture<'static, Result<(), BestError>> + Send + Sync>;
 
-/// A query handler answers now, from current state, with the result body or a refusal.
+/// A query handler answers now, from current state, with the result body or a refusal, knowing who asks: what
+/// a credential may read is the service's to decide (SPEC.md: context derives from the credential).
 pub type QueryHandler =
-    Arc<dyn Fn(HashMap<String, String>) -> BoxFuture<'static, Result<Value, BestError>> + Send + Sync>;
+    Arc<dyn Fn(Credential, HashMap<String, String>) -> BoxFuture<'static, Result<Value, BestError>> + Send + Sync>;
 
 pub struct CommandDef {
     /// Kebab-case schema name: the `{schema}` path segment.

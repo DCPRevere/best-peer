@@ -30,6 +30,8 @@ pub struct Deployment {
     /// The host port the engine is reached at.
     pub port: u16,
     pub endpoint: Option<String>,
+    /// The credential that deployed it, as `holder` in DeploymentStarted; empty for one told before holders existed.
+    pub holder: String,
     /// The correlation id of the command that deployed it: what every later fact about it carries.
     pub correlation: String,
     pub phase: Phase,
@@ -51,6 +53,8 @@ pub struct Job {
     pub container: ContainerId,
     pub correlation: String,
     pub phase: JobPhase,
+    /// The credential that ran it, as `holder` in JobStarted.
+    pub holder: String,
 }
 
 /// What an admitted command was given before its handler told the first fact: its id, and the device and memory
@@ -61,6 +65,8 @@ pub struct Reservation {
     pub device: Option<DeviceId>,
     pub compute: Option<Compute>,
     pub memory_bytes: u64,
+    /// The credential the command came from: what the started event will name as `holder`.
+    pub holder: String,
 }
 
 /// What a container belongs to.
@@ -80,6 +86,27 @@ pub struct State {
 }
 
 impl State {
+    /// The device memory promised to one holder's workloads, admitted ones included: what a share is measured
+    /// against.
+    pub fn held_by(&self, holder: &str) -> u64 {
+        let deployments = self
+            .deployments
+            .values()
+            .filter(|d| d.holder == holder)
+            .map(|d| d.memory_bytes);
+        let jobs = self
+            .jobs
+            .values()
+            .filter(|j| j.holder == holder)
+            .map(|j| j.memory_bytes);
+        let admitted = self
+            .reserved
+            .values()
+            .filter(|r| r.holder == holder)
+            .map(|r| r.memory_bytes);
+        deployments.chain(jobs).chain(admitted).sum()
+    }
+
     /// Memory on `device` promised to what is admitted, starting or running there.
     pub fn reserved_on(&self, device: &DeviceId) -> u64 {
         let deployments = self
@@ -157,6 +184,7 @@ impl State {
                         container: ContainerId(text("container")),
                         port: data["port"].as_u64().unwrap_or(0) as u16,
                         endpoint: None,
+                        holder: text("holder"),
                         correlation,
                         phase: Phase::Starting,
                     },
@@ -186,6 +214,7 @@ impl State {
                         container: ContainerId(text("container")),
                         correlation,
                         phase: JobPhase::Running,
+                        holder: text("holder"),
                     },
                 );
             }
@@ -216,6 +245,7 @@ mod tests {
                 device: Some("gpu-0".into()),
                 compute: Some(Compute::Cuda("12".into())),
                 memory_bytes: bytes,
+                holder: "h".into(),
             },
         );
     }

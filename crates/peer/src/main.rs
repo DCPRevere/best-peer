@@ -107,7 +107,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None => serve(),
-        Some("approve") => approve(args.get(1).map(String::as_str)),
+        Some("approve") => approve(&args[1..]),
         Some("--version" | "-V" | "version") => println!("best-peer {}", env!("CARGO_PKG_VERSION")),
         Some(other) => {
             eprintln!(
@@ -202,6 +202,7 @@ async fn serve() {
         .unwrap_or_else(|e| fail(&format!("cannot keep the admin token in {}: {e}", dir.display())));
     let auth = Arc::new(
         Auth::open(&dir, &endpoint, Box::new(approver))
+            .map(|a| a.with_scopes(domain::SCOPES))
             .unwrap_or_else(|e| fail(&format!("cannot keep credentials in {}: {e}", dir.display()))),
     );
     let log = Arc::new(
@@ -257,12 +258,54 @@ async fn serve() {
     }
 }
 
+/// An amount of memory as a person writes it: `40G`, `512M`, `1T`, `40GB`, or bytes.
+fn parse_memory(text: &str) -> Result<u64, String> {
+    let t = text.trim().to_ascii_uppercase();
+    let t = t.strip_suffix('B').unwrap_or(&t);
+    let (digits, unit) = match t.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => (&t[..t.len() - 1], Some(c)),
+        _ => (t, None),
+    };
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("{text:?} is not an amount of memory: write 40G, 512M, 1T or a number of bytes"))?;
+    let factor: u64 = match unit {
+        None => 1,
+        Some('K') => 1 << 10,
+        Some('M') => 1 << 20,
+        Some('G') => 1 << 30,
+        Some('T') => 1 << 40,
+        Some(u) => return Err(format!("{u} is not a unit: K, M, G or T")),
+    };
+    n.checked_mul(factor)
+        .ok_or_else(|| format!("{text:?} is more memory than exists"))
+}
+
 /// `best-peer approve <code>`: presents this machine's admin token to the peer running on it, for the code the
 /// person was shown. The token goes to the listen address only, never to the public endpoint.
-fn approve(code: Option<&str>) {
-    let Some(code) = code else {
-        fail("usage: best-peer approve <code>, the code the agent showed the person")
-    };
+fn approve(args: &[String]) {
+    const USAGE: &str = "usage: best-peer approve <code> [--may read,deploy,jobs | all] [--memory 40G]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said)";
+    let Some(code) = args.first() else { fail(USAGE) };
+    let (mut may, mut memory) = (None::<String>, None::<u64>);
+    let mut rest = args[1..].iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--may" => {
+                may = Some(
+                    rest.next()
+                        .cloned()
+                        .unwrap_or_else(|| fail("--may needs the scopes, comma-separated, or all")),
+                )
+            }
+            "--memory" => {
+                let amount = rest
+                    .next()
+                    .unwrap_or_else(|| fail("--memory needs an amount, such as 40G, 512M or a number of bytes"));
+                memory = Some(parse_memory(amount).unwrap_or_else(|why| fail(&why)));
+            }
+            other => fail(&format!("unknown argument {other:?}. {USAGE}")),
+        }
+    }
     let dir = data_dir();
     let token = std::fs::read_to_string(dir.join("admin-token"))
         .map(|t| t.trim().to_string())
@@ -274,7 +317,14 @@ fn approve(code: Option<&str>) {
         });
     let listen = std::env::var("BEST_PEER_LISTEN").unwrap_or_else(|_| "127.0.0.1:7777".into());
     let url = format!("http://{listen}/auth/approve");
-    match ureq::post(&url).send_form([("user_code", code), ("proof", token.as_str())]) {
+    let mut form: Vec<(&str, String)> = vec![("user_code", code.clone()), ("proof", token)];
+    if let Some(m) = &may {
+        form.push(("may", m.clone()));
+    }
+    if let Some(b) = memory {
+        form.push(("memory_bytes", b.to_string()));
+    }
+    match ureq::post(&url).send_form(form.iter().map(|(k, v)| (*k, v.as_str()))) {
         Ok(mut res) => {
             let admitted: serde_json::Value = res
                 .body_mut()
@@ -287,8 +337,16 @@ fn approve(code: Option<&str>) {
                 Some(l) => format!("{l} ({})", a["client_id"].as_str().unwrap_or("?")),
                 None => a["client_id"].as_str().unwrap_or("?").to_string(),
             };
+            let may = match a["grant"]["scopes"].as_array() {
+                Some(s) => s.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","),
+                None => "all".into(),
+            };
+            let share = match a["grant"]["memory_bytes"].as_u64() {
+                Some(b) => format!("{b} bytes of device memory at most"),
+                None => "no share set".into(),
+            };
             println!(
-                "admitted {who} as connection {} with a {} credential: the agent's next poll gets it",
+                "admitted {who} as connection {} with a {} credential that may {may}, {share}: the agent's next poll gets it",
                 a["connection"].as_str().unwrap_or("(the host's name)"),
                 a["lifetime"].as_str().unwrap_or("durable")
             );
@@ -367,16 +425,26 @@ mod tests {
         runtime: Arc<best_peer_runtime::Fake>,
         engine_host: &str,
     ) -> Bed {
-        bed_with(gpu, log, runtime, Arc::new(best_peer_engine::Fake::new()), engine_host).await
+        bed_with(
+            gpu,
+            log,
+            runtime,
+            Arc::new(best_peer_engine::Fake::new()),
+            engine_host,
+            None,
+        )
+        .await
     }
 
-    /// The same, with the inference engine given too.
+    /// The same, with the inference engine given too, and the credentials of a previous run when this bed is a
+    /// restart: on a host `Auth::open` reads them back from disk.
     async fn bed_with(
         gpu: Arc<best_peer_gpu::Fake>,
         log: Arc<EventLog>,
         runtime: Arc<best_peer_runtime::Fake>,
         engine: Arc<best_peer_engine::Fake>,
         engine_host: &str,
+        auth: Option<Arc<Auth>>,
     ) -> Bed {
         for image in ["ollama/ollama", "vllm/vllm-openai", "busybox", "ollama/ollama:0.6"] {
             runtime.registry_has(best_peer_runtime::ImageRef(image.into()));
@@ -396,7 +464,9 @@ mod tests {
             },
         )
         .await;
-        let auth = Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() })));
+        let auth = auth.unwrap_or_else(|| {
+            Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() })).with_scopes(domain::SCOPES))
+        });
         let door = Arc::new(super::door(EP, peer.clone(), auth.clone()));
         best_peer_door::resume(&door).await;
         let app = best_peer_door::router(door.clone()).merge(endpoint::router(peer.clone(), auth));
@@ -426,6 +496,11 @@ mod tests {
     }
 
     async fn key(app: &axum::Router) -> String {
+        key_with(app, None, None).await
+    }
+
+    /// A credential approved with `may` and `memory`, as `best-peer approve --may --memory` would.
+    async fn key_with(app: &axum::Router, may: Option<&str>, memory: Option<u64>) -> String {
         let form = |f: &[(&str, &str)]| {
             Request::post("/auth/device")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -433,12 +508,17 @@ mod tests {
                 .unwrap()
         };
         let a = body(app.clone().oneshot(form(&[("client_id", "test")])).await.unwrap()).await;
+        let memory = memory.map(|m| m.to_string());
+        let mut fields = vec![("user_code", a["user_code"].as_str().unwrap()), ("proof", "ok")];
+        if let Some(m) = may {
+            fields.push(("may", m));
+        }
+        if let Some(m) = &memory {
+            fields.push(("memory_bytes", m));
+        }
         let approve = Request::post("/auth/approve")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from(
-                serde_urlencoded::to_string([("user_code", a["user_code"].as_str().unwrap()), ("proof", "ok")])
-                    .unwrap(),
-            ))
+            .body(Body::from(serde_urlencoded::to_string(fields).unwrap()))
             .unwrap();
         assert_eq!(app.clone().oneshot(approve).await.unwrap().status(), StatusCode::OK);
         let token = Request::post("/auth/token")
@@ -920,6 +1000,7 @@ mod tests {
             Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]).reporting_every_percent()),
             Arc::new(best_peer_engine::Fake::new().reporting_every_percent()),
             "engines.local",
+            None,
         )
         .await;
         let (s, b) = bed.deploy("d1", "llama3.2:3b", "ollama", 8).await;
@@ -935,6 +1016,226 @@ mod tests {
         }
         // Eleven of each, with ImagePulled, DeploymentStarted and DeploymentReady between: tens, not hundreds.
         assert_eq!(events.len(), 11 + 1 + 1 + 11 + 1, "{:?}", types(&events));
+    }
+
+    #[test]
+    fn an_amount_of_memory_reads_as_a_person_writes_it() {
+        assert_eq!(parse_memory("40G").unwrap(), 40 << 30);
+        assert_eq!(parse_memory("40GB").unwrap(), 40 << 30);
+        assert_eq!(parse_memory("512m").unwrap(), 512 << 20);
+        assert_eq!(parse_memory("1T").unwrap(), 1 << 40);
+        assert_eq!(parse_memory("1073741824").unwrap(), 1 << 30);
+        assert!(parse_memory("lots").unwrap_err().contains("40G"));
+        assert!(parse_memory("4X").unwrap_err().contains("unit"));
+    }
+
+    #[tokio::test]
+    async fn a_credential_does_what_it_was_approved_for_holds_its_share_and_ends_only_its_own() {
+        let bed = fresh().await;
+        // A team key: may deploy, 8 GiB of device memory at most, no jobs; nothing in the door changed for the
+        // owner's own key, which was approved with nothing said.
+        let team = key_with(&bed.app, Some("read,deploy"), Some(8 * GB)).await;
+        let send = |key: String, id: &'static str, r#type: &'static str, schema: &'static str, data: Value| {
+            let app = bed.app.clone();
+            async move {
+                let req = Request::post("/commands")
+                    .header("X-Api-Key", &key)
+                    .header(header::CONTENT_TYPE, "application/cloudevents+json")
+                    .body(Body::from(
+                        json!({
+                            "specversion": "1.0", "id": id, "source": "https://team.test", "type": r#type,
+                            "datacontenttype": "application/json", "dataschema": format!("{EP}/commands/{schema}/1.0"),
+                            "time": "2026-10-13T10:30:00Z", "data": data
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+                let res = app.oneshot(req).await.unwrap();
+                let status = res.status();
+                (status, body(res).await)
+            }
+        };
+        let query = |key: String| {
+            let app = bed.app.clone();
+            async move {
+                let req = Request::get("/queries/get-workloads")
+                    .header("X-Api-Key", &key)
+                    .body(Body::empty())
+                    .unwrap();
+                body(app.oneshot(req).await.unwrap()).await
+            }
+        };
+        // The share: 6 of 8 GiB fits; 4 more does not, at ingest, with what is held and the room left.
+        let (s, b) = send(
+            team.clone(),
+            "t1",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "a:7b", "engine": "ollama", "memory_bytes": 6 * GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = send(
+            team.clone(),
+            "t2",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "b:3b", "engine": "ollama", "memory_bytes": 4 * GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "SHARE_EXCEEDED");
+        assert_eq!(b["error"]["details"]["room_bytes"], 2 * GB);
+        assert!(bed.log_of("t2").is_empty(), "a refused deploy told nothing");
+        // The device had room (24 GiB): the share, not the hardware, said no.
+        let (s, _) = send(
+            team.clone(),
+            "t3",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "c:1b", "engine": "ollama", "memory_bytes": 2 * GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        // No jobs for this key, said at ingest with what it was approved for; the command document says so too.
+        let (s, b) = send(team.clone(), "t4", "RunJob", "run-job", json!({ "image": "busybox" })).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        assert_eq!(b["error"]["code"], "FORBIDDEN");
+        assert!(b["error"]["message"].as_str().unwrap().contains("read,deploy"), "{b}");
+        let doc = body(
+            bed.app
+                .clone()
+                .oneshot(
+                    Request::get("/commands/run-job/1.0")
+                        .header("X-Api-Key", &team)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(doc["description"].as_str().unwrap().contains("jobs scope"), "{doc}");
+        // The owner's key deploys too; the team key sees only its own, the owner's sees both with the holder.
+        let owner_dep = bed.deployed("o1", "owner:7b", 4).await;
+        let team_events = bed.events_of("t1", "DeploymentReady").await;
+        let team_dep = team_events
+            .iter()
+            .find(|e| e.r#type == "DeploymentStarted")
+            .unwrap()
+            .data["deployment"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mine = query(team.clone()).await;
+        let ids: Vec<&str> = mine["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["deployment"].as_str().unwrap())
+            .collect();
+        assert!(
+            ids.contains(&team_dep.as_str()) && !ids.contains(&owner_dep.as_str()),
+            "{ids:?}"
+        );
+        assert_eq!(mine["held_bytes"], 8 * GB);
+        assert_eq!(mine["share_bytes"], 8 * GB);
+        let all = query(bed.key.clone()).await;
+        assert_eq!(all["deployments"].as_array().unwrap().len(), 3);
+        assert_eq!(all["share_bytes"], Value::Null);
+        assert!(all["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["holder"].as_str().is_some_and(|h| h.len() == 16)));
+        // Another's deployment is refused by name; its own and, for the owner, anyone's, go.
+        let (s, b) = send(
+            team.clone(),
+            "t5",
+            "UndeployModel",
+            "undeploy-model",
+            json!({ "deployment": owner_dep }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        assert!(
+            b["error"]["message"].as_str().unwrap().contains("another credential"),
+            "{b}"
+        );
+        let (s, _) = send(
+            team.clone(),
+            "t6",
+            "UndeployModel",
+            "undeploy-model",
+            json!({ "deployment": team_dep.clone() }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        bed.events_of("t6", "Undeployed").await;
+        let (s, _) = send(
+            bed.key.clone(),
+            "o2",
+            "UndeployModel",
+            "undeploy-model",
+            json!({ "deployment": owner_dep }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        // Freed memory is room again for the share.
+        bed.events_of("o2", "Undeployed").await;
+        let (s, b) = send(
+            team.clone(),
+            "t7",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "d:3b", "engine": "ollama", "memory_bytes": 5 * GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        // A scope the door does not have is refused at the approval, by name.
+        let a = body(
+            bed.app
+                .clone()
+                .oneshot(
+                    Request::post("/auth/device")
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from("client_id=test"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let res = bed
+            .app
+            .clone()
+            .oneshot(
+                Request::post("/auth/approve")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        serde_urlencoded::to_string([
+                            ("user_code", a["user_code"].as_str().unwrap()),
+                            ("proof", "ok"),
+                            ("may", "deploy,admin"),
+                        ])
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body(res).await["error_description"].as_str().unwrap().contains("admin"));
+        // The manifest lists what may be granted.
+        let m = body(
+            bed.app
+                .clone()
+                .oneshot(Request::get("/.well-known/best").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(m["best"]["authentication"]["scopes"], json!(["read", "deploy", "jobs"]));
     }
 
     #[tokio::test]
@@ -1188,11 +1489,22 @@ mod tests {
         first.events_of("j2", "JobStarted").await;
         // The peer dies. While it is down the engine loses one deployment and the job, and nobody hears.
         first.peer.halt();
+        let credentials = first.door.auth.clone();
         drop(first);
         runtime.stop(&lost_container).await.unwrap();
         runtime.stop(&job_container).await.unwrap();
         // A new peer over the same log and the same engine.
-        let again = bed(card(), log.clone(), runtime.clone()).await;
+        // The restart keeps the credentials, as a host's data directory does: the command accepted before it
+        // is still its sender's.
+        let again = bed_with(
+            card(),
+            log.clone(),
+            runtime.clone(),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            Some(credentials),
+        )
+        .await;
         let w = again.query("get-workloads").await;
         assert_eq!(w["deployments"].as_array().unwrap().len(), 1, "{w}");
         assert_eq!(w["deployments"][0]["deployment"], kept);
@@ -1227,16 +1539,26 @@ mod tests {
             "time": "2026-10-12T10:30:00Z", "data": { "model": "owed:1b", "engine": "ollama", "memory_bytes": GB }
         }))
         .unwrap();
+        // Accepted from a live credential: a restart runs it as that credential, found again in the store.
         owed_log.accept_command(
-            "some-sender",
+            &best_peer_door::auth::hash_key(&again.key),
             "d9",
             &best_peer_door::payload_hash(&envelope),
             "d9",
             &envelope,
         );
         again.peer.halt();
+        let credentials = again.door.auth.clone();
         drop(again);
-        let third = bed(card(), log.clone(), runtime.clone()).await;
+        let third = bed_with(
+            card(),
+            log.clone(),
+            runtime.clone(),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            Some(credentials),
+        )
+        .await;
         let ready = third.events_of("d9", "DeploymentReady").await;
         assert_eq!(ready.last().unwrap().data["model"], "owed:1b");
         assert!(
