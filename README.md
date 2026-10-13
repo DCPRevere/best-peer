@@ -32,7 +32,7 @@ the CPU is the one device. Then one of two ways to run models, each with what it
 | Way | What the machine needs | Settings |
 |---|---|---|
 | **Docker** (the default) | Docker Engine running and reachable by your user (`docker ps` without `sudo`, or run the peer with it), and the NVIDIA container toolkit registered with it, so that `docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi` lists the card. Room under Docker's storage for the engine image and the model weights, a few GB. | None: the peer pulls the engine image, starts the container, publishes its port. |
-| **Native** | Ollama installed and running as a service on its own port. The peer pulls the model through it and claims its port; nothing is started or stopped. No jobs: `run-job` is refused with that fix. | `BEST_PEER_RUNTIME=native`. For prompts from another machine, Ollama itself must listen beyond loopback (`OLLAMA_HOST=0.0.0.0` in its service), since the endpoint a deploy names is Ollama's own port. |
+| **Native** | Ollama installed and running as a service on its own port. The peer pulls the model through it and claims its port; nothing is started or stopped. No jobs: `run-job` is refused at ingest, with the fix. | `BEST_PEER_RUNTIME=native`. For prompts from another machine, Ollama itself must listen beyond loopback (`OLLAMA_HOST=0.0.0.0` in its service), since the endpoint a deploy names is Ollama's own port. |
 
 `BEST_PEER_RUNTIME=fake` is a third way for a machine with neither: the surface answers, nothing runs. Every other
 variable has a default that fits these two ways; [Run](#run) lists them for a setup that differs.
@@ -42,6 +42,7 @@ variable has a default that fits these two ways; [Run](#run) lists them for a se
 
 ```bash
 tar xzf best-peer-<version>-x86_64-unknown-linux-gnu.tar.gz
+cd best-peer-<version>-x86_64-unknown-linux-gnu
 ./best-peer --version
 ./best-peer
 ```
@@ -59,9 +60,11 @@ BEST_PEER_LISTEN=0.0.0.0:7777 BEST_PEER_ENDPOINT=http://<address they reach>:777
 ```
 
 There is no TLS and no relay in the peer, so across the internet that address is a VPN or tunnel (a Tailscale IP, a
-port forward), and the machine's firewall lets 7777 in along with the engine's port, since prompts go to the
-engine directly. The model endpoint a deploy opens is published on the same interfaces with whatever access the
-engine enforces, none in Ollama as installed, so expose the peer on a network you trust.
+port forward). Prompts go to the engine directly, so the firewall lets in 7777 and the engine's port: in native mode
+that is Ollama's own (11434 as installed); with Docker it is one the container engine picks per deploy, named by the
+endpoint in `DeploymentReady`, so it is opened then. Once the door listens on an interface that is not loopback, the
+engine's port is published on every interface, with whatever access the engine enforces, none in Ollama as
+installed, so expose the peer on a network you trust.
 
 **3. Admit the agent.** The person connecting says to their client "sign me in `<name>`, start from
 `http://<address>:7777/.well-known/best`"; their client shows them a code like `8BB9-CB44`, and they send it to you.

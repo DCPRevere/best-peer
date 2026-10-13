@@ -90,6 +90,12 @@ pub trait Runtime: Send + Sync {
     async fn running(&self) -> Result<Vec<ContainerId>, RuntimeError>;
     /// Every event from now on. A slow subscriber may lag; the door rebuilds from its own stream, not from this.
     fn events(&self) -> broadcast::Receiver<Event>;
+    /// Whether this engine runs a job: an image run once to its exit. One that cannot (an engine already installed
+    /// on the host, outside any container) says so here, and the door refuses the job at ingest with the fix rather
+    /// than accepting it and failing it later.
+    fn runs_jobs(&self) -> bool {
+        true
+    }
 }
 
 /// An in-memory [`Runtime`] for tests: images the engine already holds, images a registry would serve, containers
@@ -101,6 +107,8 @@ pub struct Fake {
     registry: Mutex<Vec<ImageRef>>,
     /// A registry that serves every image, for a peer run on the fakes.
     open_registry: bool,
+    /// Whether this engine runs jobs; an engine that only serves deployments says no.
+    jobs: bool,
     containers: Mutex<BTreeMap<ContainerId, Spec>>,
     devices: Vec<DeviceId>,
     next: Mutex<u32>,
@@ -115,6 +123,7 @@ impl Fake {
             local: Mutex::new(local),
             registry: Mutex::new(Vec::new()),
             open_registry: false,
+            jobs: true,
             containers: Mutex::new(BTreeMap::new()),
             devices,
             next: Mutex::new(0),
@@ -130,6 +139,12 @@ impl Fake {
     /// A registry that serves every image: the peer's fake mode, where the whole surface works and nothing runs.
     pub fn with_open_registry(mut self) -> Self {
         self.open_registry = true;
+        self
+    }
+
+    /// An engine that runs no job, as an engine installed on the host outside any container: deploys only.
+    pub fn without_jobs(mut self) -> Self {
+        self.jobs = false;
         self
     }
 
@@ -226,6 +241,10 @@ impl Runtime for Fake {
 
     fn events(&self) -> broadcast::Receiver<Event> {
         self.tx.subscribe()
+    }
+
+    fn runs_jobs(&self) -> bool {
+        self.jobs
     }
 }
 

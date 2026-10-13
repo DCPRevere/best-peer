@@ -623,6 +623,12 @@ impl Peer {
     // ----- run-job --------------------------------------------------------------------------------------------------
 
     pub async fn admit_run_job(&self, cmd: Envelope, key: String) -> Result<(), BestError> {
+        if !self.runtime.runs_jobs() {
+            return Err(BestError::bad_request(
+                "NO_CONTAINER_ENGINE",
+                "no container engine on this host: a job needs Docker (BEST_PEER_RUNTIME=docker); this peer deploys to an engine already installed, and serves no job",
+            ));
+        }
         let data: RunJobData = parse(&cmd.data)?;
         if data.device.is_some() && data.memory_bytes.is_none() {
             return Err(BestError::bad_request(

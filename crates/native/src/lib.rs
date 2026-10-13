@@ -110,4 +110,9 @@ impl Runtime for NativeRuntime {
     fn events(&self) -> broadcast::Receiver<Event> {
         self.tx().subscribe()
     }
+
+    /// A job needs a container engine; this runtime has none, so the door refuses the job at ingest.
+    fn runs_jobs(&self) -> bool {
+        false
+    }
 }

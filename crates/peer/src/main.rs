@@ -674,6 +674,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_job_on_a_runtime_that_runs_none_is_refused_at_ingest_with_the_fix_and_nothing_is_told() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]).without_jobs()),
+        )
+        .await;
+        let (s, b) = bed.send("j1", "RunJob", "run-job", json!({ "image": "busybox" })).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "NO_CONTAINER_ENGINE");
+        let msg = b["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("BEST_PEER_RUNTIME=docker"), "{msg}");
+        assert!(bed.log_of("j1").is_empty(), "a refused job told nothing");
+        // A deploy on the same runtime is still placed: only jobs are what it lacks.
+        assert_eq!(
+            bed.deploy("d1", "llama3.2:3b", "ollama", 8).await.0,
+            StatusCode::CREATED
+        );
+    }
+
+    #[tokio::test]
     async fn an_engine_no_device_can_run_and_a_device_that_is_not_here_are_refused_by_name() {
         let cpu = best_peer_gpu::Device {
             compute: vec![best_peer_gpu::Compute::Cpu],
