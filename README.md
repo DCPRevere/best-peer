@@ -129,7 +129,8 @@ and a build provenance attestation (`gh attestation verify <archive> --repo beha
 the manifest advertises, required when the peer listens on every interface. An `https://` endpoint is served by the
 peer itself, with rustls: `BEST_PEER_TLS_CERT` and `BEST_PEER_TLS_KEY` name the operator's certificate chain and
 private key (PEM files, checked for nothing beyond loading); without them the peer makes a certificate at first
-start, `tls/cert.pem` under its data folder, named at start for clients to pin. `BEST_PEER_DATA` (default
+start, `tls/cert.pem` under its data folder, named at start for clients to pin, and made again when the endpoint's
+host changes or fewer than thirty days of it remain, which the start-up line says. `BEST_PEER_DATA` (default
 `~/.best-peer`) holds the event log, the credentials as hashes, the admin token, that certificate, and the record of
 where the door is that `best-peer approve` reads, so it reaches the peer over the same TLS, pinned to that
 certificate and no other.

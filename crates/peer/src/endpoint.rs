@@ -81,6 +81,8 @@ async fn forward(gw: &Gateway, req: Request) -> Result<Response, BestError> {
         .map_err(|e| BestError::bad_request("BAD_REQUEST", format!("the path cannot be forwarded: {e}")))?;
     let (mut parts, body) = req.into_parts();
     parts.uri = uri;
+    // The engine is reached over HTTP/1.1 whatever the client negotiated with the door (h2 over TLS, as curl does).
+    parts.version = axum::http::Version::HTTP_11;
     // The engine gets the request as the client made it, less what is this hop's: the host it was sent to, the
     // credential, which ends here, and the headers that govern one connection, not the request.
     parts.headers.remove(header::HOST);

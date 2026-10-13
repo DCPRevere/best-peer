@@ -261,15 +261,18 @@ async fn serve() {
     tls::Record {
         listen,
         endpoint: door.endpoint.clone(),
-        certificate: serving.as_ref().map(|(_, cert)| cert.clone()),
+        certificate: serving.as_ref().map(|s| s.certificate.clone()),
     }
     .write(&dir)
     .unwrap_or_else(|e| fail(&format!("cannot record the door in {}: {e}", dir.display())));
     match &serving {
-        Some((_, cert)) if tls == Tls::Own => {
-            tracing::info!(certificate = %cert.display(), "https with a certificate this peer made: a client that pins it reads this file")
+        Some(s) if s.made => {
+            tracing::info!(certificate = %s.file.display(), "https with a certificate this peer made at this start: a client that pins it reads this file; one that pinned an earlier file reads it again")
         }
-        Some((_, cert)) => tracing::info!(certificate = %cert.display(), "https with the operator's certificate"),
+        Some(s) if tls == Tls::Own => {
+            tracing::info!(certificate = %s.file.display(), "https with a certificate this peer made: a client that pins it reads this file")
+        }
+        Some(s) => tracing::info!(certificate = %s.file.display(), "https with the operator's certificate"),
         None if !listen.ip().is_loopback() => {
             tracing::warn!(endpoint = %door.endpoint, "the endpoint is cleartext and not loopback: credentials will travel unencrypted; make BEST_PEER_ENDPOINT https:// before anyone but you uses it")
         }
@@ -285,7 +288,7 @@ async fn serve() {
         tracing::info!("stopping: open connections have three seconds");
         stop.graceful_shutdown(Some(Duration::from_secs(3)));
     });
-    serve_on(listener, app, serving.map(|(config, _)| config), handle)
+    serve_on(listener, app, serving.map(|s| s.config), handle)
         .await
         .unwrap_or_else(|e| fail(&format!("serving failed: {e}")));
 }
@@ -737,9 +740,10 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let listen = listener.local_addr().unwrap();
         let endpoint = format!("https://{listen}");
-        let (config, cert) = tls::serving(&Tls::Own, dir.path(), &tls::names_for(&endpoint, &listen))
+        let served = tls::serving(&Tls::Own, dir.path(), &tls::names_for(&endpoint, &listen))
             .unwrap()
             .unwrap();
+        let (config, cert) = (served.config, served.certificate.as_str());
         let peer = peer(
             &endpoint,
             "engines.local",
@@ -767,7 +771,7 @@ mod tests {
                 .body(Body::empty())
                 .unwrap()
         };
-        let (status, manifest) = tls::call(listen, Some(&cert), get("/.well-known/best")).await.unwrap();
+        let (status, manifest) = tls::call(listen, Some(cert), get("/.well-known/best")).await.unwrap();
         assert_eq!(status, StatusCode::OK);
         let auth_block = &manifest["best"]["authentication"];
         assert_eq!(auth_block["deviceAuthorizationUrl"], format!("{endpoint}/auth/device"));
@@ -784,7 +788,7 @@ mod tests {
         };
         let (status, asked) = tls::call(
             listen,
-            Some(&cert),
+            Some(cert),
             form("/auth/device", &[("client_id", "agent"), ("connection", "box")]),
         )
         .await
@@ -794,7 +798,7 @@ mod tests {
         let code = asked["user_code"].as_str().unwrap();
         let (status, admitted) = tls::call(
             listen,
-            Some(&cert),
+            Some(cert),
             form("/auth/approve", &[("user_code", code), ("proof", "ok")]),
         )
         .await
@@ -804,9 +808,10 @@ mod tests {
 
         // Another certificate, even one made the same way, is not the peer's.
         let other = tempfile::tempdir().unwrap();
-        let (_, other_cert) = tls::serving(&Tls::Own, other.path(), &tls::names_for(&endpoint, &listen))
+        let other_cert = tls::serving(&Tls::Own, other.path(), &tls::names_for(&endpoint, &listen))
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .certificate;
         let why = tls::call(listen, Some(&other_cert), get("/.well-known/best"))
             .await
             .unwrap_err();
