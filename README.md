@@ -25,10 +25,17 @@ The path for someone handed a release binary: a Linux PC with an NVIDIA card is 
 other cases are one variable away. What the terminal shows at each step is written here so a run that differs is a
 finding worth sending back.
 
-**Before you start.** On a GPU host: the NVIDIA driver, and Docker with the NVIDIA container toolkit, so that
-`docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi` lists the card. Without a card (a laptop,
-a Mac) `BEST_PEER_GPU=none` makes the CPU the one device. Without Docker, `BEST_PEER_RUNTIME=native` deploys to an
-Ollama already installed, and `fake` serves the surface with nothing behind it.
+**Before you start.** The peer reads the card through the NVIDIA driver, so a GPU host needs the driver installed
+and loaded; the peer refuses to start without it. A host with no card (a laptop, a Mac) sets `BEST_PEER_GPU=none` and
+the CPU is the one device. Then one of two ways to run models, each with what it asks of the machine:
+
+| Way | What the machine needs | Settings |
+|---|---|---|
+| **Docker** (the default) | Docker Engine running and reachable by your user (`docker ps` without `sudo`, or run the peer with it), and the NVIDIA container toolkit registered with it, so that `docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi` lists the card. Room under Docker's storage for the engine image and the model weights, a few GB. | None: the peer pulls the engine image, starts the container, publishes its port. |
+| **Native** | Ollama installed and running as a service on its own port. The peer pulls the model through it and claims its port; nothing is started or stopped. No jobs: `run-job` is refused with that fix. | `BEST_PEER_RUNTIME=native`. For prompts from another machine, Ollama itself must listen beyond loopback (`OLLAMA_HOST=0.0.0.0` in its service), since the endpoint a deploy names is Ollama's own port. |
+
+`BEST_PEER_RUNTIME=fake` is a third way for a machine with neither: the surface answers, nothing runs. Every other
+variable has a default that fits these two ways; [Run](#run) lists them for a setup that differs.
 
 **1. Download and run.** Take the archive for your machine from the
 [releases](https://github.com/behavioralstate/best-peer/releases), unpack it, and start the peer:
@@ -52,8 +59,9 @@ BEST_PEER_LISTEN=0.0.0.0:7777 BEST_PEER_ENDPOINT=http://<address they reach>:777
 ```
 
 There is no TLS and no relay in the peer, so across the internet that address is a VPN or tunnel (a Tailscale IP, a
-port forward). The model endpoint a deploy opens is published on the same interfaces with whatever access the engine
-enforces, none in Ollama as installed, so expose the peer on a network you trust.
+port forward), and the machine's firewall lets 7777 in along with the engine's port, since prompts go to the
+engine directly. The model endpoint a deploy opens is published on the same interfaces with whatever access the
+engine enforces, none in Ollama as installed, so expose the peer on a network you trust.
 
 **3. Admit the agent.** The person connecting says to their client "sign me in `<name>`, start from
 `http://<address>:7777/.well-known/best`"; their client shows them a code like `8BB9-CB44`, and they send it to you.
