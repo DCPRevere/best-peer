@@ -6,13 +6,16 @@
 //! API, or the fakes when `BEST_PEER_RUNTIME=fake` (CI, a machine with no engine).
 //!
 //! `best-peer` serves; `best-peer approve <code>` admits an agent that asked, on the word of whoever controls this
-//! machine.
+//! machine. With `BEST_PEER_MEMBERS` the same binary is a cloud door: it fronts the peers named and places on them.
 
+mod cloud;
 mod domain;
 mod endpoint;
 mod lifecycle;
+mod member;
 mod state;
 mod tls;
+mod transport;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -116,6 +119,61 @@ pub fn door(endpoint: &str, peer: Arc<Peer>, auth: Arc<Auth>) -> Door {
         peer.log.clone(),
         auth,
     )
+}
+
+/// The door of a cloud: the same surface, placed across the members.
+pub fn cloud_door(endpoint: &str, cloud: Arc<cloud::Cloud>, auth: Arc<Auth>) -> Door {
+    Door::new(
+        endpoint,
+        SERVICE,
+        "A cloud: a door that deploys models and runs jobs on the GPU peers behind it, placing each where there is room, and tells their lifecycle as events with the peer named.",
+        domain::cloud_catalogue(cloud.clone()),
+        cloud.log.clone(),
+        auth,
+    )
+}
+
+/// The cloud over the members `BEST_PEER_MEMBERS` names, reached through HTTP with the trust `BEST_PEER_TRUST`
+/// adds (the PEM files of members' own certificates), its members' credentials kept in the data directory.
+async fn cloud_app(
+    members: &str,
+    endpoint: &str,
+    dir: &std::path::Path,
+    log: Arc<EventLog>,
+    auth: Arc<Auth>,
+) -> axum::Router {
+    let list = cloud::parse_members(members).unwrap_or_else(|why| fail(&why));
+    let trust: Vec<PathBuf> = std::env::var("BEST_PEER_TRUST")
+        .ok()
+        .map(|t| {
+            t.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let transport: Arc<dyn transport::Transport> =
+        Arc::new(transport::Http::new(&trust).unwrap_or_else(|why| fail(&why)));
+    let members = list
+        .iter()
+        .map(|(name, member_endpoint)| Arc::new(member::Member::new(name, member_endpoint, None, transport.clone())))
+        .collect();
+    let cloud = Arc::new(cloud::Cloud::new(
+        endpoint,
+        SERVICE,
+        log,
+        Arc::new(domain::cloud_event_dataschemas(endpoint)),
+        Arc::new(domain::completions()),
+        members,
+        Some(dir.join("members.json")),
+    ));
+    cloud.rebuild();
+    let door = Arc::new(cloud_door(endpoint, cloud.clone(), auth.clone()));
+    best_peer_door::resume(&door).await;
+    cloud.follow();
+    tracing::info!(members = %list.iter().map(|(n, e)| format!("{n}={e}")).collect::<Vec<_>>().join(","), "this peer is a cloud door over its members");
+    best_peer_door::router(door).merge(endpoint::router(cloud, auth))
 }
 
 fn main() {
@@ -225,6 +283,51 @@ async fn serve() {
     let log = Arc::new(
         EventLog::open(&dir).unwrap_or_else(|e| fail(&format!("cannot keep the event log in {}: {e}", dir.display()))),
     );
+    let app = match std::env::var("BEST_PEER_MEMBERS").ok() {
+        Some(members) => cloud_app(&members, &endpoint, &dir, log, auth).await,
+        None => peer_app(&endpoint, log, auth).await,
+    };
+    let serving = tls::serving(&tls, &dir, &tls::names_for(&endpoint, &listen)).unwrap_or_else(|why| fail(&why));
+    let listener = std::net::TcpListener::bind(listen)
+        .and_then(|l| l.set_nonblocking(true).map(|()| l))
+        .unwrap_or_else(|e| fail(&format!("cannot listen on {listen}: {e}")));
+    // Where the door is and what it serves, for `best-peer approve` on this machine.
+    tls::Record {
+        listen,
+        endpoint: endpoint.clone(),
+        certificate: serving.as_ref().map(|s| s.certificate.clone()),
+    }
+    .write(&dir)
+    .unwrap_or_else(|e| fail(&format!("cannot record the door in {}: {e}", dir.display())));
+    match &serving {
+        Some(s) if s.made => {
+            tracing::info!(certificate = %s.file.display(), "https with a certificate this peer made at this start: a client that pins it reads this file; one that pinned an earlier file reads it again")
+        }
+        Some(s) if tls == Tls::Own => {
+            tracing::info!(certificate = %s.file.display(), "https with a certificate this peer made: a client that pins it reads this file")
+        }
+        Some(s) => tracing::info!(certificate = %s.file.display(), "https with the operator's certificate"),
+        None if !listen.ip().is_loopback() => {
+            tracing::warn!(%endpoint, "the endpoint is cleartext and not loopback: credentials will travel unencrypted; make BEST_PEER_ENDPOINT https:// before anyone but you uses it")
+        }
+        None => {}
+    }
+    tracing::info!(%listen, %endpoint, data = %dir.display(), "best-peer is serving its door");
+    let handle = axum_server::Handle::new();
+    // An open event stream never ends by itself, so a graceful stop would wait for it forever: a few seconds, then out.
+    let stop = handle.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("stopping: open connections have three seconds");
+        stop.graceful_shutdown(Some(Duration::from_secs(3)));
+    });
+    serve_on(listener, app, serving.map(|s| s.config), handle)
+        .await
+        .unwrap_or_else(|e| fail(&format!("serving failed: {e}")));
+}
+
+/// The peer over this host's hardware and engines, its door and its endpoints.
+async fn peer_app(endpoint: &str, log: Arc<EventLog>, auth: Arc<Auth>) -> axum::Router {
     let gpu = accelerator(std::env::var("BEST_PEER_GPU").ok().as_deref()).unwrap_or_else(|why| fail(&why));
     // The engines' ports are bound where the peer reaches them, whatever the door listens on: a prompt reaches an
     // engine through the door, with the door's credential. On this machine that is loopback; a container engine on
@@ -249,48 +352,11 @@ async fn serve() {
         load: seconds("BEST_PEER_LOAD_SECONDS", 3600),
         ..Patience::default()
     };
-    let peer = peer(&endpoint, &engine_host, gpu, runtime, engine, log, images, patience).await;
-    let door = Arc::new(door(&endpoint, peer.clone(), auth.clone()));
+    let peer = peer(endpoint, &engine_host, gpu, runtime, engine, log, images, patience).await;
+    let door = Arc::new(door(endpoint, peer.clone(), auth.clone()));
     // What the last run accepted and never completed is run now, before anyone can send more.
     best_peer_door::resume(&door).await;
-    let serving = tls::serving(&tls, &dir, &tls::names_for(&endpoint, &listen)).unwrap_or_else(|why| fail(&why));
-    let listener = std::net::TcpListener::bind(listen)
-        .and_then(|l| l.set_nonblocking(true).map(|()| l))
-        .unwrap_or_else(|e| fail(&format!("cannot listen on {listen}: {e}")));
-    // Where the door is and what it serves, for `best-peer approve` on this machine.
-    tls::Record {
-        listen,
-        endpoint: door.endpoint.clone(),
-        certificate: serving.as_ref().map(|s| s.certificate.clone()),
-    }
-    .write(&dir)
-    .unwrap_or_else(|e| fail(&format!("cannot record the door in {}: {e}", dir.display())));
-    match &serving {
-        Some(s) if s.made => {
-            tracing::info!(certificate = %s.file.display(), "https with a certificate this peer made at this start: a client that pins it reads this file; one that pinned an earlier file reads it again")
-        }
-        Some(s) if tls == Tls::Own => {
-            tracing::info!(certificate = %s.file.display(), "https with a certificate this peer made: a client that pins it reads this file")
-        }
-        Some(s) => tracing::info!(certificate = %s.file.display(), "https with the operator's certificate"),
-        None if !listen.ip().is_loopback() => {
-            tracing::warn!(endpoint = %door.endpoint, "the endpoint is cleartext and not loopback: credentials will travel unencrypted; make BEST_PEER_ENDPOINT https:// before anyone but you uses it")
-        }
-        None => {}
-    }
-    tracing::info!(%listen, endpoint = %door.endpoint, data = %dir.display(), "best-peer is serving its door");
-    let app = best_peer_door::router(door).merge(endpoint::router(peer, auth));
-    let handle = axum_server::Handle::new();
-    // An open event stream never ends by itself, so a graceful stop would wait for it forever: a few seconds, then out.
-    let stop = handle.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("stopping: open connections have three seconds");
-        stop.graceful_shutdown(Some(Duration::from_secs(3)));
-    });
-    serve_on(listener, app, serving.map(|s| s.config), handle)
-        .await
-        .unwrap_or_else(|e| fail(&format!("serving failed: {e}")));
+    best_peer_door::router(door).merge(endpoint::router(peer, auth))
 }
 
 /// Serves `app` on `listener`, over TLS when a configuration is given, until `handle` says to stop.
@@ -697,6 +763,408 @@ mod tests {
 
     fn types(events: &[Envelope]) -> Vec<String> {
         events.iter().map(|e| e.r#type.clone()).collect()
+    }
+
+    // ----- the cloud door --------------------------------------------------------------------------------------------
+
+    const CLOUD_EP: &str = "http://cloud.test";
+
+    /// A member's door reached in-process, that can be made to stop answering.
+    struct Flaky {
+        inner: transport::InProcess,
+        down: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl transport::Transport for Flaky {
+        fn call(
+            &self,
+            req: Request<Body>,
+        ) -> futures::future::BoxFuture<'static, Result<axum::response::Response, String>> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async { Err("connection refused".to_string()) });
+            }
+            self.inner.call(req)
+        }
+    }
+
+    struct CloudBed {
+        cloud: Arc<cloud::Cloud>,
+        app: axum::Router,
+        key: String,
+        members: Vec<Bed>,
+        down: Vec<Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    /// A cloud over member peers in this process, each having admitted the cloud (its key is the one the member
+    /// bed signed in with), and an agent signed in to the cloud.
+    async fn cloud_bed(members: Vec<(&str, Bed)>) -> CloudBed {
+        let mut down = Vec::new();
+        let mut list = Vec::new();
+        let mut beds = Vec::new();
+        for (name, bed) in members {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let transport: Arc<dyn transport::Transport> = Arc::new(Flaky {
+                inner: transport::InProcess {
+                    router: bed.app.clone(),
+                },
+                down: flag.clone(),
+            });
+            list.push(Arc::new(member::Member::new(
+                name,
+                EP,
+                Some(bed.key.clone()),
+                transport,
+            )));
+            down.push(flag);
+            beds.push(bed);
+        }
+        let cloud = Arc::new(cloud::Cloud::new(
+            CLOUD_EP,
+            SERVICE,
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(domain::cloud_event_dataschemas(CLOUD_EP)),
+            Arc::new(domain::completions()),
+            list,
+            None,
+        ));
+        let auth = Arc::new(
+            Auth::ephemeral(CLOUD_EP, Box::new(FakeApprover { proof: "ok".into() })).with_scopes(domain::SCOPES),
+        );
+        let door = Arc::new(cloud_door(CLOUD_EP, cloud.clone(), auth.clone()));
+        let app = best_peer_door::router(door).merge(endpoint::router(cloud.clone(), auth));
+        cloud.follow();
+        let key = key(&app).await;
+        CloudBed {
+            cloud,
+            app,
+            key,
+            members: beds,
+            down,
+        }
+    }
+
+    impl CloudBed {
+        async fn send(&self, id: &str, r#type: &str, schema: &str, data: Value) -> (StatusCode, Value) {
+            let req = Request::post("/commands")
+                .header("X-Api-Key", &self.key)
+                .header(header::CONTENT_TYPE, "application/cloudevents+json")
+                .body(Body::from(
+                    json!({
+                        "specversion": "1.0", "id": id, "source": "https://agent.test", "type": r#type,
+                        "datacontenttype": "application/json", "dataschema": format!("{CLOUD_EP}/commands/{schema}/1.0"),
+                        "time": "2026-10-13T10:30:00Z", "data": data
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let res = self.app.clone().oneshot(req).await.unwrap();
+            let status = res.status();
+            (status, body(res).await)
+        }
+
+        async fn query(&self, schema: &str) -> Value {
+            let res = self
+                .app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/queries/{schema}"))
+                        .header("X-Api-Key", &self.key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            body(res).await
+        }
+
+        fn log_of(&self, correlation: &str) -> Vec<Envelope> {
+            self.cloud
+                .log
+                .list(&Filter {
+                    correlation_id: Some(correlation.into()),
+                    ..Default::default()
+                })
+                .0
+        }
+
+        async fn events_of(&self, correlation: &str, until: &str) -> Vec<Envelope> {
+            for _ in 0..600 {
+                let events = self.log_of(correlation);
+                if events.iter().any(|e| e.r#type == until) {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!(
+                "no {until} for {correlation} on the cloud; got {:?}",
+                types(&self.log_of(correlation))
+            );
+        }
+
+        async fn deploy(&self, id: &str, gb: u64) -> (StatusCode, Value) {
+            self.send(
+                id,
+                "DeployModel",
+                "deploy-model",
+                json!({ "model": "llama3.2:3b", "engine": "ollama", "memory_bytes": gb * GB }),
+            )
+            .await
+        }
+    }
+
+    /// Two members: one with a 24 GiB card whose engine is an echo on loopback, one with an 8 GiB card.
+    async fn two_members() -> CloudBed {
+        let port = echo_engine().await;
+        let a = bed_at(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]).publishes(11434, port)),
+            "127.0.0.1",
+        )
+        .await;
+        let small = Arc::new(
+            best_peer_gpu::Fake::new()
+                .with_driver("fake 1.0")
+                .with_device(best_peer_gpu::Fake::cuda_card("gpu-0", "Card B", 8, "12.4")),
+        );
+        let b = bed(
+            small,
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        cloud_bed(vec![("a", a), ("b", b)]).await
+    }
+
+    #[tokio::test]
+    async fn a_cloud_lists_every_members_devices_places_where_the_room_is_and_relays_the_facts_with_the_member_named() {
+        let c = two_members().await;
+        let hs = c.query("get-hardware-state").await;
+        let ids: Vec<&str> = hs["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["a/gpu-0", "b/gpu-0"]);
+        assert_eq!(hs["devices"][0]["peer"], "a");
+        assert_eq!(hs["peers"][0]["state"], "up");
+        assert_eq!(hs["peers"][1]["peer"], "b");
+
+        // 16 GiB fits the 24 GiB card alone.
+        let (s, b) = c.deploy("d1", 16).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = c.events_of("d1", "DeploymentReady").await;
+        assert_eq!(
+            types(&events),
+            vec![
+                "ImagePulling",
+                "ImagePulling",
+                "ImagePulled",
+                "DeploymentStarted",
+                "WeightsLoading",
+                "WeightsLoading",
+                "DeploymentReady"
+            ],
+            "{events:#?}"
+        );
+        assert!(
+            events.iter().all(|e| e.data["peer"] == "a"),
+            "every fact names the member"
+        );
+        assert!(events
+            .iter()
+            .all(|e| e.source == SERVICE && e.dataschema.as_deref().unwrap().starts_with(CLOUD_EP)));
+        let started = &events[3].data;
+        assert_eq!(
+            started["device"], "a/gpu-0",
+            "the device is named as the cloud names it"
+        );
+        let dep = started["deployment"].as_str().unwrap().to_string();
+        assert_eq!(
+            events[6].data["endpoint"],
+            format!("{CLOUD_EP}/deployments/{dep}/v1"),
+            "the endpoint is on the cloud's door"
+        );
+        let w = c.query("get-workloads").await;
+        assert_eq!(w["deployments"][0]["peer"], "a");
+        assert_eq!(w["deployments"][0]["phase"], "ready");
+        assert_eq!(w["deployments"][0]["endpoint"], events[6].data["endpoint"]);
+        // The member holds it too, under its own name for the device.
+        let on_a = c.members[0].query("get-workloads").await;
+        assert_eq!(on_a["deployments"][0]["deployment"], dep);
+        assert_eq!(on_a["deployments"][0]["device"], "gpu-0");
+
+        // A prompt to the cloud's endpoint reaches the model through the member, with the member's credential, not
+        // the caller's, and the engine sees neither.
+        let res = c
+            .app
+            .clone()
+            .oneshot(
+                Request::post(format!("/deployments/{dep}/v1/chat/completions"))
+                    .header(header::AUTHORIZATION, format!("Bearer {}", c.key))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"llama3.2:3b","messages":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let seen = body(res).await;
+        assert_eq!(seen["path"], "/v1/chat/completions");
+        assert_eq!(seen["saw_credential"], false);
+        let res = c
+            .app
+            .clone()
+            .oneshot(
+                Request::get(format!("/deployments/{dep}/v1/models"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Another 16 GiB fits nowhere: the refusal names every member's room.
+        let (s, b) = c.deploy("d2", 16).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "INSUFFICIENT_MEMORY");
+        let named: Vec<&str> = b["error"]["details"]["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(named, ["a/gpu-0", "b/gpu-0"]);
+        assert_eq!(b["error"]["details"]["devices"][0]["room_bytes"], 8 * GB);
+        // 8 GiB fits both at 8 GiB of room: the first member listed takes it, every time.
+        let (s, b) = c.deploy("d3", 8).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = c.events_of("d3", "DeploymentReady").await;
+        assert_eq!(events[3].data["device"], "a/gpu-0");
+        // Pinned to the other member's card.
+        let (s, b) = c
+            .send(
+                "d4",
+                "DeployModel",
+                "deploy-model",
+                json!({ "model": "llama3.2:3b", "engine": "ollama", "memory_bytes": 4 * GB, "device": "b/gpu-0" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = c.events_of("d4", "DeploymentReady").await;
+        assert_eq!(events[3].data["peer"], "b");
+
+        // An undeploy through the cloud ends it on the member, and the cloud's stream says so.
+        let (s, b) = c
+            .send("u1", "UndeployModel", "undeploy-model", json!({ "deployment": dep }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = c.events_of("u1", "Undeployed").await;
+        assert_eq!(events.last().unwrap().data["peer"], "a");
+        let w = c.query("get-workloads").await;
+        assert_eq!(w["deployments"].as_array().unwrap().len(), 2);
+        assert!(c.members[0].query("get-workloads").await["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["deployment"] != dep));
+    }
+
+    #[tokio::test]
+    async fn a_member_that_stops_answering_is_told_as_lost_with_its_workloads_ended_and_as_back_when_it_answers() {
+        let c = two_members().await;
+        let (s, b) = c.deploy("d1", 16).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = c.events_of("d1", "DeploymentReady").await;
+        let dep = events[3].data["deployment"].as_str().unwrap().to_string();
+        assert_eq!(
+            types(&c.log_of("peer-a")),
+            vec!["PeerJoined"],
+            "the first answer is a fact too"
+        );
+
+        c.down[0].store(true, std::sync::atomic::Ordering::SeqCst);
+        c.cloud.reconcile().await;
+        let lost = c.log_of("peer-a");
+        assert_eq!(types(&lost), vec!["PeerJoined", "PeerLost"], "{lost:#?}");
+        assert!(lost[1].data["reason"].as_str().unwrap().contains("connection refused"));
+        let events = c.events_of("d1", "DeploymentEnded").await;
+        let ended = &events.last().unwrap().data;
+        assert_eq!(ended["deployment"], dep);
+        assert!(
+            ended["reason"].as_str().unwrap().contains("peer a is unreachable"),
+            "{ended}"
+        );
+        assert!(c.query("get-workloads").await["deployments"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        // Nothing is placed on a lost member: its devices are gone from the state, and the refusal says so.
+        let hs = c.query("get-hardware-state").await;
+        assert_eq!(hs["peers"][0]["state"], "unreachable");
+        let (s, b) = c.deploy("d2", 16).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "INSUFFICIENT_MEMORY");
+        assert_eq!(b["error"]["details"]["devices"][0]["id"], "b/gpu-0");
+
+        // The member still runs what the cloud told as ended: the cloud sees no room there until it ends it.
+        c.down[0].store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            c.members[0].query("get-workloads").await["deployments"][0]["deployment"],
+            dep
+        );
+        let hs = c.query("get-hardware-state").await;
+        assert_eq!(
+            hs["devices"][0]["memory"]["free_bytes"],
+            8 * GB,
+            "the member's promise is counted"
+        );
+        c.cloud.reconcile().await;
+        let events = c.events_of("peer-a", "Undeployed").await;
+        assert_eq!(
+            types(&events),
+            vec!["PeerJoined", "PeerLost", "PeerJoined", "Undeployed"],
+            "{events:#?}"
+        );
+        assert_eq!(events[3].data["deployment"], dep);
+        assert!(c.members[0].query("get-workloads").await["deployments"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let (s, b) = c.deploy("d3", 16).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(c.events_of("d3", "DeploymentReady").await[3].data["peer"], "a");
+    }
+
+    #[tokio::test]
+    async fn a_pull_through_the_cloud_reaches_every_member_and_is_told_once_when_all_have_it() {
+        let c = two_members().await;
+        let (s, b) = c
+            .send("p1", "PullImage", "pull-image", json!({ "image": "ollama/ollama:0.6" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = c.events_of("p1", "ImagePulled").await;
+        let pulled: Vec<&Envelope> = events.iter().filter(|e| e.r#type == "ImagePulled").collect();
+        assert_eq!(pulled.len(), 1, "{events:#?}");
+        assert!(
+            pulled[0].data["peer"].is_null(),
+            "the outcome is the cloud's, not one member's"
+        );
+        let progressed: std::collections::BTreeSet<&str> = events
+            .iter()
+            .filter(|e| e.r#type == "ImagePulling")
+            .filter_map(|e| e.data["peer"].as_str())
+            .collect();
+        assert_eq!(progressed.into_iter().collect::<Vec<_>>(), ["a", "b"]);
+        let (s, b) = c
+            .send("p2", "PullImage", "pull-image", json!({ "image": "nobody/nothing:1" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = c.events_of("p2", "ImagePullFailed").await;
+        let reason = events.last().unwrap().data["reason"].as_str().unwrap().to_string();
+        assert!(reason.contains("a:") && reason.contains("b:"), "{reason}");
     }
 
     #[test]

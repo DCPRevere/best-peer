@@ -1,27 +1,46 @@
 //! What this peer offers through its door: the hardware and the workloads as queries, the model lifecycle as
 //! commands, each outcome as events. The schemas and descriptions here are everything an agent gets; the behaviour
-//! is in [`crate::lifecycle`].
+//! is in [`crate::lifecycle`] for a peer over its own hardware, and in [`crate::cloud`] for a peer that fronts
+//! peers, which offers the same surface.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use best_peer_door::{BestError, Catalogue, CommandDef, EventDef, QueryDef};
-use best_peer_gpu::Gpu;
+use async_trait::async_trait;
+use best_peer_door::auth::Credential;
+use best_peer_door::{BestError, Catalogue, CommandDef, Emitter, Envelope, EventDef, QueryDef};
+use best_peer_gpu::Host;
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::lifecycle::Peer;
+/// What stands behind the surface: the handlers of its two queries and five commands, with the checks that admit
+/// each command before it is recorded.
+#[async_trait]
+pub trait Service: Send + Sync + 'static {
+    async fn hardware_state(&self) -> Result<Value, BestError>;
+    fn workloads(&self, who: &Credential) -> Result<Value, BestError>;
+    fn admit_pull(&self, who: &Credential) -> Result<(), BestError>;
+    async fn pull_image(self: Arc<Self>, cmd: Envelope, em: Emitter);
+    async fn admit_deploy(&self, cmd: Envelope, who: Credential, key: String) -> Result<(), BestError>;
+    async fn deploy(self: Arc<Self>, cmd: Envelope, em: Emitter);
+    fn admit_undeploy(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
+    async fn undeploy(self: Arc<Self>, cmd: Envelope, em: Emitter);
+    async fn admit_run_job(&self, cmd: Envelope, who: Credential, key: String) -> Result<(), BestError>;
+    async fn run_job(self: Arc<Self>, cmd: Envelope, em: Emitter);
+    fn admit_stop_job(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
+    async fn stop_job(self: Arc<Self>, cmd: Envelope, em: Emitter);
+}
 
-pub fn catalogue(peer: Arc<Peer>) -> Catalogue {
+pub fn catalogue(svc: Arc<dyn Service>) -> Catalogue {
     let mut c = Catalogue::new()
-        .query(hardware_query(peer.gpu.clone()))
-        .query(workloads_query(peer.clone()))
-        .command(pull_image(peer.clone()))
-        .command(deploy_model(peer.clone()))
-        .command(undeploy_model(peer.clone()))
-        .command(run_job(peer.clone()))
-        .command(stop_job(peer));
+        .query(hardware_query(svc.clone()))
+        .query(workloads_query(svc.clone()))
+        .command(pull_image(svc.clone()))
+        .command(deploy_model(svc.clone()))
+        .command(undeploy_model(svc.clone()))
+        .command(run_job(svc.clone()))
+        .command(stop_job(svc));
     for e in event_defs() {
         c = c.event(e);
     }
@@ -64,16 +83,55 @@ pub fn event_dataschemas(endpoint: &str) -> HashMap<String, String> {
     c.event_dataschemas(endpoint)
 }
 
+/// The cloud door's catalogue: the peer's, with the facts only a cloud tells.
+pub fn cloud_catalogue(svc: Arc<dyn Service>) -> Catalogue {
+    let mut c = catalogue(svc);
+    for e in cloud_event_defs() {
+        c = c.event(e);
+    }
+    c
+}
+
+/// Event type to dataschema URI for a cloud's emitters.
+pub fn cloud_event_dataschemas(endpoint: &str) -> HashMap<String, String> {
+    let mut c = Catalogue::new();
+    for e in event_defs().into_iter().chain(cloud_event_defs()) {
+        c = c.event(e);
+    }
+    c.event_dataschemas(endpoint)
+}
+
+/// What a cloud tells about its members: each one answering, and each one lost.
+pub fn cloud_event_defs() -> Vec<EventDef> {
+    let s = |d: &str| json!({ "type": "string", "description": d });
+    vec![
+        event(
+            "peer-joined",
+            "PeerJoined",
+            "A member peer admitted this cloud and answers: its devices are in get-hardware-state and workloads can be placed on it.",
+            &["peer", "endpoint"],
+            json!({ "peer": s("The member's name, the value device ids and events carry as peer"), "endpoint": s("The member's own door") }),
+        ),
+        event(
+            "peer-lost",
+            "PeerLost",
+            "A member peer stopped answering; every workload it held is told as ended under its own correlation id, and nothing is placed there until it answers again, which PeerJoined tells.",
+            &["peer", "endpoint", "reason"],
+            json!({ "peer": s("The member's name"), "endpoint": s("The member's own door"), "reason": s("What the cloud saw") }),
+        ),
+    ]
+}
+
 /// What a credential may be approved for: `deploy` models (pull, deploy, undeploy), run `jobs` (run, stop); `all` is
 /// every scope and every holder's workloads, what a credential approved with nothing said is. Reading the hardware
 /// and its own workloads and events is every credential's.
 pub const SCOPES: &[&str] = &["deploy", "jobs"];
 
-fn hardware_query(gpu: Arc<dyn Gpu>) -> QueryDef {
+fn hardware_query(svc: Arc<dyn Service>) -> QueryDef {
     QueryDef {
         schema: "get-hardware-state".into(),
         version: "1.0".into(),
-        description: "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power and utilisation, and the driver. Read it before deploying: a model needs an API the device offers and memory it has free; get-workloads says what already holds memory.".into(),
+        description: "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power and utilisation, and the driver. Read it before deploying: a model needs an API the device offers and memory it has free; get-workloads says what already holds memory. On a cloud door the devices are every member peer's, each with the peer it is on, and peers lists the members and whether each is reachable.".into(),
         parameters: None,
         response: json!({
             "type": "object",
@@ -87,7 +145,8 @@ fn hardware_query(gpu: Arc<dyn Gpu>) -> QueryDef {
                         "type": "object",
                         "required": ["id", "vendor", "name", "memory", "compute"],
                         "properties": {
-                            "id": { "type": "string", "description": "Stable device id, the value a command names a device by" },
+                            "id": { "type": "string", "description": "Stable device id, the value a command names a device by; on a cloud door, <peer>/<device>" },
+                            "peer": { "type": "string", "description": "On a cloud door, the member peer the device is on" },
                             "vendor": { "description": "Who made it; informative, never what a workload asks for" },
                             "name": { "type": "string" },
                             "memory": { "type": "object", "properties": { "total_bytes": { "type": "integer" }, "free_bytes": { "type": "integer" } } },
@@ -101,18 +160,13 @@ fn hardware_query(gpu: Arc<dyn Gpu>) -> QueryDef {
             }
         }),
         handler: Arc::new(move |_who, _params| {
-            let gpu = gpu.clone();
-            Box::pin(async move {
-                // A real adapter talks to a driver synchronously; that never blocks the door's workers.
-                tokio::task::spawn_blocking(move || hardware_state(gpu.as_ref()))
-                    .await
-                    .map_err(|e| BestError::internal(format!("the hardware query did not complete: {e}")))?
-            })
+            let svc = svc.clone();
+            Box::pin(async move { svc.hardware_state().await })
         }),
     }
 }
 
-fn workloads_query(peer: Arc<Peer>) -> QueryDef {
+fn workloads_query(peer: Arc<dyn Service>) -> QueryDef {
     QueryDef {
         schema: "get-workloads".into(),
         version: "1.0".into(),
@@ -143,7 +197,7 @@ fn workloads_query(peer: Arc<Peer>) -> QueryDef {
     }
 }
 
-fn pull_image(peer: Arc<Peer>) -> CommandDef {
+fn pull_image(peer: Arc<dyn Service>) -> CommandDef {
     let admit = peer.clone();
     CommandDef {
         schema: "pull-image".into(),
@@ -172,7 +226,7 @@ fn pull_image(peer: Arc<Peer>) -> CommandDef {
     }
 }
 
-fn deploy_model(peer: Arc<Peer>) -> CommandDef {
+fn deploy_model(peer: Arc<dyn Service>) -> CommandDef {
     let admit = peer.clone();
     CommandDef {
         schema: "deploy-model".into(),
@@ -213,7 +267,7 @@ fn deploy_model(peer: Arc<Peer>) -> CommandDef {
     }
 }
 
-fn undeploy_model(peer: Arc<Peer>) -> CommandDef {
+fn undeploy_model(peer: Arc<dyn Service>) -> CommandDef {
     let admit = peer.clone();
     CommandDef {
         schema: "undeploy-model".into(),
@@ -242,7 +296,7 @@ fn undeploy_model(peer: Arc<Peer>) -> CommandDef {
     }
 }
 
-fn run_job(peer: Arc<Peer>) -> CommandDef {
+fn run_job(peer: Arc<dyn Service>) -> CommandDef {
     let admit = peer.clone();
     CommandDef {
         schema: "run-job".into(),
@@ -280,7 +334,7 @@ fn run_job(peer: Arc<Peer>) -> CommandDef {
     }
 }
 
-fn stop_job(peer: Arc<Peer>) -> CommandDef {
+fn stop_job(peer: Arc<dyn Service>) -> CommandDef {
     let admit = peer.clone();
     CommandDef {
         schema: "stop-job".into(),
@@ -432,10 +486,8 @@ pub fn event_defs() -> Vec<EventDef> {
     ]
 }
 
-fn hardware_state(gpu: &dyn Gpu) -> Result<Value, BestError> {
-    let host = gpu
-        .snapshot()
-        .map_err(|e| BestError::internal(format!("the accelerator library failed: {e}")))?;
+/// `get-hardware-state`'s body for a host as the accelerator abstraction reports it.
+pub fn host_state(host: &Host) -> Value {
     let observed = OffsetDateTime::from(host.observed_at)
         .format(&Rfc3339)
         .unwrap_or_default();
@@ -455,5 +507,5 @@ fn hardware_state(gpu: &dyn Gpu) -> Result<Value, BestError> {
             })
         })
         .collect();
-    Ok(json!({ "driver": host.driver, "observed_at": observed, "devices": devices }))
+    json!({ "driver": host.driver, "observed_at": observed, "devices": devices })
 }

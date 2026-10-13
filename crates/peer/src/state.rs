@@ -35,6 +35,8 @@ pub struct Deployment {
     /// The correlation id of the command that deployed it: what every later fact about it carries.
     pub correlation: String,
     pub phase: Phase,
+    /// On a cloud, the member peer it was placed on, as `peer` in DeploymentStarted.
+    pub peer: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +57,8 @@ pub struct Job {
     pub phase: JobPhase,
     /// The credential that ran it, as `holder` in JobStarted.
     pub holder: String,
+    /// On a cloud, the member peer it was placed on, as `peer` in JobStarted.
+    pub peer: Option<String>,
 }
 
 /// What an admitted command was given before its handler told the first fact: its id, and the device and memory
@@ -190,6 +194,7 @@ impl State {
                         holder: text("holder"),
                         correlation,
                         phase: Phase::Starting,
+                        peer: data["peer"].as_str().map(str::to_string),
                     },
                 );
             }
@@ -218,6 +223,7 @@ impl State {
                         correlation,
                         phase: JobPhase::Running,
                         holder: text("holder"),
+                        peer: data["peer"].as_str().map(str::to_string),
                     },
                 );
             }

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use best_peer_door::auth::{holder_of_hash, Credential};
 use best_peer_door::{BestError, Emitter, Envelope, EventLog};
 use best_peer_engine::{Engine, EngineError, Kind};
@@ -19,7 +20,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
+use crate::domain::Service;
+use crate::endpoint::{Route, Upstream};
 use crate::state::{JobPhase, Owner, Phase, Reservation, State};
+use crate::transport::Transport;
 
 /// The operator's overrides for the engines' images (a pinned tag, a mirror); none means the engine's default.
 #[derive(Clone, Debug, Default)]
@@ -81,6 +85,8 @@ pub struct Peer {
     unowned: Mutex<HashMap<ContainerId, RuntimeEvent>>,
     /// The tasks that follow the engine, so a peer that stops stops hearing.
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// How prompts reach the engines: plain HTTP on this host.
+    transport: Arc<dyn Transport>,
 }
 
 #[derive(Deserialize)]
@@ -111,7 +117,7 @@ enum Stage {
 }
 
 /// The compute APIs any job may run on: a job names an image, not an engine, so any device will do.
-fn any_compute() -> Vec<Compute> {
+pub(crate) fn any_compute() -> Vec<Compute> {
     vec![
         Compute::Cuda("0".into()),
         Compute::Rocm("0".into()),
@@ -150,6 +156,7 @@ impl Peer {
             state: Mutex::new(State::default()),
             unowned: Mutex::new(HashMap::new()),
             tasks: Mutex::new(Vec::new()),
+            transport: Arc::new(crate::transport::Http::plain()),
         }
     }
 
@@ -325,30 +332,10 @@ impl Peer {
     /// Where the door passes a prompt for a deployment: its engine's base on this host, while the deployment is
     /// ready. Before that, after an undeploy was accepted, or for a deployment nobody made, the refusal says what to
     /// do.
-    pub fn upstream_of(&self, deployment: &str, who: &Credential) -> Result<String, BestError> {
+    pub fn engine_upstream(&self, deployment: &str, who: &Credential) -> Result<String, BestError> {
         let state = self.state.lock().unwrap();
-        let Some(d) = state.deployments.get(deployment) else {
-            return Err(BestError::not_found(
-                "NO_SUCH_DEPLOYMENT",
-                format!(
-                    "no deployment {deployment}: get-workloads lists what this peer runs for you, and deploy-model starts one"
-                ),
-            ));
-        };
-        if !who.grant.is_all() && d.holder != who.holder() {
-            return Err(not_yours("deployment", deployment));
-        }
-        match d.phase {
-            Phase::Ready => Ok(self.engine_base(d.port)),
-            Phase::Starting => Err(BestError::not_found(
-                "DEPLOYMENT_NOT_READY",
-                format!("deployment {deployment} is not ready yet: follow its events to DeploymentReady, then prompt it"),
-            )),
-            Phase::Ending => Err(BestError::not_found(
-                "DEPLOYMENT_ENDING",
-                format!("deployment {deployment} is ending: an undeploy was accepted; deploy the model again if it is still wanted"),
-            )),
-        }
+        let d = ready_deployment(&state, deployment, who)?;
+        Ok(self.engine_base(d.port))
     }
 
     // ----- pull-image -----------------------------------------------------------------------------------------------
@@ -994,42 +981,136 @@ impl Peer {
 
     /// `get-workloads`: what is deployed and what runs, now.
     pub fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
-        let mine = |holder: &str| who.grant.is_all() || holder == who.holder();
         let s = self.state.lock().unwrap();
-        let deployments: Vec<Value> = s
-            .deployments
-            .values()
-            .filter(|d| mine(&d.holder))
-            .map(|d| {
-                json!({
-                    "deployment": d.id, "model": d.model, "engine": d.engine, "device": d.device.0,
-                    "memory_bytes": d.memory_bytes, "holder": d.holder,
-                    // Computed, not read back from the log: a deployment made by an earlier peer is on the door too.
-                    "endpoint": d.endpoint.as_ref().map(|_| self.door_endpoint(&d.id, d.engine)),
-                    "phase": match d.phase { Phase::Starting => "starting", Phase::Ready => "ready", Phase::Ending => "ending" }
-                })
-            })
-            .collect();
-        let jobs: Vec<Value> = s
-            .jobs
-            .values()
-            .filter(|j| mine(&j.holder))
-            .map(|j| {
-                json!({
-                    "job": j.id, "image": j.image.0, "device": j.device.as_ref().map(|d| d.0.clone()),
-                    "memory_bytes": j.memory_bytes, "holder": j.holder,
-                    "phase": match j.phase { JobPhase::Running => "running", JobPhase::Stopping => "stopping" }
-                })
-            })
-            .collect();
-        Ok(
-            json!({ "deployments": deployments, "jobs": jobs, "held_bytes": s.held_by(&who.holder()), "share_bytes": who.grant.memory_bytes }),
-        )
+        Ok(workloads_view(&s, who, &self.endpoint))
     }
 }
 
+#[async_trait]
+impl Service for Peer {
+    async fn hardware_state(&self) -> Result<Value, BestError> {
+        Ok(crate::domain::host_state(&self.hardware().await?))
+    }
+
+    fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
+        Peer::workloads(self, who)
+    }
+
+    fn admit_pull(&self, who: &Credential) -> Result<(), BestError> {
+        Peer::admit_pull(self, who)
+    }
+
+    async fn pull_image(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        Peer::pull_image(self, cmd, em).await
+    }
+
+    async fn admit_deploy(&self, cmd: Envelope, who: Credential, key: String) -> Result<(), BestError> {
+        Peer::admit_deploy(self, cmd, who, key).await
+    }
+
+    async fn deploy(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        Peer::deploy(self, cmd, em).await
+    }
+
+    fn admit_undeploy(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        Peer::admit_undeploy(self, cmd, who)
+    }
+
+    async fn undeploy(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        Peer::undeploy(&self, cmd, em).await
+    }
+
+    async fn admit_run_job(&self, cmd: Envelope, who: Credential, key: String) -> Result<(), BestError> {
+        Peer::admit_run_job(self, cmd, who, key).await
+    }
+
+    async fn run_job(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        Peer::run_job(self, cmd, em).await
+    }
+
+    fn admit_stop_job(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        Peer::admit_stop_job(self, cmd, who)
+    }
+
+    async fn stop_job(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        Peer::stop_job(&self, cmd, em).await
+    }
+}
+
+impl Upstream for Peer {
+    fn upstream_of(&self, deployment: &str, who: &Credential) -> Result<Route, BestError> {
+        Ok(Route {
+            base: self.engine_upstream(deployment, who)?,
+            key: None,
+            transport: self.transport.clone(),
+        })
+    }
+}
+
+/// The deployment `id` while it is ready and the caller's to prompt; otherwise the refusal that says what to do.
+pub(crate) fn ready_deployment<'a>(
+    state: &'a State,
+    id: &str,
+    who: &Credential,
+) -> Result<&'a crate::state::Deployment, BestError> {
+    let Some(d) = state.deployments.get(id) else {
+        return Err(BestError::not_found(
+            "NO_SUCH_DEPLOYMENT",
+            format!("no deployment {id}: get-workloads lists what this peer runs for you, and deploy-model starts one"),
+        ));
+    };
+    if !who.grant.is_all() && d.holder != who.holder() {
+        return Err(not_yours("deployment", id));
+    }
+    match d.phase {
+        Phase::Ready => Ok(d),
+        Phase::Starting => Err(BestError::not_found(
+            "DEPLOYMENT_NOT_READY",
+            format!("deployment {id} is not ready yet: follow its events to DeploymentReady, then prompt it"),
+        )),
+        Phase::Ending => Err(BestError::not_found(
+            "DEPLOYMENT_ENDING",
+            format!(
+                "deployment {id} is ending: an undeploy was accepted; deploy the model again if it is still wanted"
+            ),
+        )),
+    }
+}
+
+/// `get-workloads`' body: what `state` holds for `who`, each ready deployment's endpoint on the door at `endpoint`.
+pub(crate) fn workloads_view(s: &State, who: &Credential, endpoint: &str) -> Value {
+    let mine = |holder: &str| who.grant.is_all() || holder == who.holder();
+    let deployments: Vec<Value> = s
+        .deployments
+        .values()
+        .filter(|d| mine(&d.holder))
+        .map(|d| {
+            json!({
+                "deployment": d.id, "model": d.model, "engine": d.engine, "device": d.device.0,
+                "memory_bytes": d.memory_bytes, "holder": d.holder, "peer": d.peer,
+                // Computed, not read back from the log: a deployment made by an earlier peer is on the door too.
+                "endpoint": d.endpoint.as_ref().map(|_| format!("{endpoint}/deployments/{}{}", d.id, d.engine.openai_path())),
+                "phase": match d.phase { Phase::Starting => "starting", Phase::Ready => "ready", Phase::Ending => "ending" }
+            })
+        })
+        .collect();
+    let jobs: Vec<Value> = s
+        .jobs
+        .values()
+        .filter(|j| mine(&j.holder))
+        .map(|j| {
+            json!({
+                "job": j.id, "image": j.image.0, "device": j.device.as_ref().map(|d| d.0.clone()),
+                "memory_bytes": j.memory_bytes, "holder": j.holder, "peer": j.peer,
+                "phase": match j.phase { JobPhase::Running => "running", JobPhase::Stopping => "stopping" }
+            })
+        })
+        .collect();
+    json!({ "deployments": deployments, "jobs": jobs, "held_bytes": s.held_by(&who.holder()), "share_bytes": who.grant.memory_bytes })
+}
+
 /// A credential that may not use `scope` is refused with what it was approved for and what to do.
-fn require(who: &Credential, scope: &str) -> Result<(), BestError> {
+pub(crate) fn require(who: &Credential, scope: &str) -> Result<(), BestError> {
     if who.grant.allows(scope) {
         return Ok(());
     }
@@ -1044,7 +1125,7 @@ fn require(who: &Credential, scope: &str) -> Result<(), BestError> {
 }
 
 /// A deploy or a job past the credential's share is refused with what it holds and what to do.
-fn within_share(state: &State, who: &Credential, needed: u64) -> Result<(), BestError> {
+pub(crate) fn within_share(state: &State, who: &Credential, needed: u64) -> Result<(), BestError> {
     let Some(share) = who.grant.memory_bytes else {
         return Ok(());
     };
@@ -1062,7 +1143,7 @@ fn within_share(state: &State, who: &Credential, needed: u64) -> Result<(), Best
 }
 
 /// A workload another credential holds is not this one's to end.
-fn not_yours(kind: &str, id: &str) -> BestError {
+pub(crate) fn not_yours(kind: &str, id: &str) -> BestError {
     BestError::bad_request(
         "FORBIDDEN",
         format!("{kind} {id} was started by another credential: get-workloads lists yours, and only a credential approved for all may reach another's"),
@@ -1071,14 +1152,14 @@ fn not_yours(kind: &str, id: &str) -> BestError {
 }
 
 /// The holder a credential may be told about: every one for a credential approved for all, else its own.
-fn mine(who: &Credential) -> Option<String> {
+pub(crate) fn mine(who: &Credential) -> Option<String> {
     (!who.grant.is_all()).then(|| who.holder())
 }
 
 /// Where a workload needing `memory_bytes` on a device offering one of `apis` goes: the fitting device with the most
 /// memory free after what is already promised there, or `pinned` when the caller named one. A refusal names what is
 /// in the way and what to do about it.
-fn place(
+pub(crate) fn place(
     host: &Host,
     state: &State,
     apis: &[Compute],
@@ -1258,12 +1339,12 @@ fn fix_for_engine(e: &EngineError) -> &'static str {
     }
 }
 
-fn parse<T: serde::de::DeserializeOwned>(data: &Value) -> Result<T, BestError> {
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(data: &Value) -> Result<T, BestError> {
     serde_json::from_value(data.clone())
         .map_err(|e| BestError::internal(format!("the command passed its schema but could not be read: {e}")))
 }
 
-fn list<'a, S: AsRef<str> + 'a>(items: impl Iterator<Item = &'a S>) -> String {
+pub(crate) fn list<'a, S: AsRef<str> + 'a>(items: impl Iterator<Item = &'a S>) -> String {
     let v: Vec<&str> = items.map(AsRef::as_ref).collect();
     if v.is_empty() {
         "none".into()
@@ -1278,7 +1359,7 @@ fn holder_of_key(key: &str) -> String {
     holder_of_hash(key.split(':').next().unwrap_or(""))
 }
 
-fn new_id(prefix: &str) -> String {
+pub(crate) fn new_id(prefix: &str) -> String {
     format!("{prefix}-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
 }
 

@@ -9,40 +9,48 @@
 
 use std::sync::Arc;
 
-use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderName, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
-use best_peer_door::auth::AUTH_HEADER;
+use best_peer_door::auth::{Credential, AUTH_HEADER};
 use best_peer_door::error::BestError;
 use best_peer_door::Auth;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 
-use crate::lifecycle::Peer;
+use crate::transport::Transport;
 
 /// Where the endpoints live on the door: `/deployments/<deployment>` and everything under it.
 const PREFIX: &str = "/deployments/";
 
+/// Where a deployment's prompts go: the base URL the rest of the path is appended to, the credential that opens it
+/// when it is another door's (a member of this cloud), and the transport to reach it.
+pub struct Route {
+    pub base: String,
+    pub key: Option<String>,
+    pub transport: Arc<dyn Transport>,
+}
+
+/// What stands behind the endpoints: a peer's engines on this host, or a cloud's members.
+pub trait Upstream: Send + Sync + 'static {
+    /// The route for `deployment` while it is ready, or the refusal that says what to do.
+    fn upstream_of(&self, deployment: &str, who: &Credential) -> Result<Route, BestError>;
+}
+
 #[derive(Clone)]
 struct Gateway {
-    peer: Arc<Peer>,
+    upstream: Arc<dyn Upstream>,
     auth: Arc<Auth>,
-    client: Client<HttpConnector, Body>,
 }
 
 /// The routes `DeploymentReady` names: the deployment's base and everything under it go to that deployment's
 /// engine, with the path and query as the client sent them.
-pub fn router(peer: Arc<Peer>, auth: Arc<Auth>) -> Router {
-    let client = Client::builder(TokioExecutor::new()).build_http();
+pub fn router(upstream: Arc<dyn Upstream>, auth: Arc<Auth>) -> Router {
     Router::new()
         .route("/deployments/:deployment", any(pass_through))
         .route("/deployments/:deployment/", any(pass_through))
         .route("/deployments/:deployment/*rest", any(pass_through))
-        .with_state(Gateway { peer, auth, client })
+        .with_state(Gateway { upstream, auth })
 }
 
 async fn pass_through(State(gw): State<Gateway>, req: Request) -> Response {
@@ -70,13 +78,13 @@ async fn forward(gw: &Gateway, req: Request) -> Result<Response, BestError> {
             "the endpoint names a deployment: /deployments/<deployment>/v1, as DeploymentReady said",
         ));
     }
-    let upstream = gw.peer.upstream_of(deployment, &who)?;
+    let route = gw.upstream.upstream_of(deployment, &who)?;
     let rest = match rest {
         "" => "/".to_string(),
         r if r.starts_with('?') => format!("/{r}"),
         r => r.to_string(),
     };
-    let uri: Uri = format!("{upstream}{rest}")
+    let uri: Uri = format!("{}{rest}", route.base)
         .parse()
         .map_err(|e| BestError::bad_request("BAD_REQUEST", format!("the path cannot be forwarded: {e}")))?;
     let (mut parts, body) = req.into_parts();
@@ -89,9 +97,15 @@ async fn forward(gw: &Gateway, req: Request) -> Result<Response, BestError> {
     parts.headers.remove(AUTH_HEADER);
     parts.headers.remove(header::AUTHORIZATION);
     strip_hop_by_hop(&mut parts.headers);
-    let res = gw
-        .client
-        .request(Request::from_parts(parts, body))
+    // A member's endpoint opens to this door's own credential for it, never to the caller's.
+    if let Some(key) = &route.key {
+        if let Ok(v) = key.parse() {
+            parts.headers.insert(AUTH_HEADER, v);
+        }
+    }
+    let res = route
+        .transport
+        .call(Request::from_parts(parts, body))
         .await
         .map_err(|e| {
             BestError::new(
@@ -104,7 +118,7 @@ async fn forward(gw: &Gateway, req: Request) -> Result<Response, BestError> {
         })?;
     let (mut parts, body) = res.into_parts();
     strip_hop_by_hop(&mut parts.headers);
-    Ok(Response::from_parts(parts, Body::new(body)))
+    Ok(Response::from_parts(parts, body))
 }
 
 /// The credential, from the door's own header or the `Authorization: Bearer` the OpenAI-compatible clients send.

@@ -87,7 +87,23 @@ decides who is in, as with SSH keys, and what they may do: approved with nothing
 `--may deploy --memory 40G` makes one that may deploy models but run no job, and hold 40 GiB of device memory at
 most across its workloads, which it alone sees, prompts and ends.
 
-**4. What the agent does from there.** Reads the hardware state (a card shows its memory, temperature, power,
+**4. More than one machine.** Run a peer on each, then one more `best-peer` anywhere with the list of them, and
+that one is a cloud door: the same manifest, commands, queries and events, where the devices are every member's
+(`a/gpu-0`), a deploy goes to the member with the room, and the facts come back with the member named:
+
+```bash
+BEST_PEER_LISTEN=0.0.0.0:7777 BEST_PEER_ENDPOINT=https://<the cloud's address>:7777 \
+BEST_PEER_MEMBERS=a=https://<machine a>:7777,b=https://<machine b>:7777 \
+BEST_PEER_TRUST=<a's cert.pem>,<b's cert.pem> ./best-peer
+```
+
+It signs in to each member as any agent would and logs the code: `to admit this cloud on a, run on that machine:
+best-peer approve <code>`. Once admitted, the member is `up` in the cloud's `get-hardware-state`; a member that
+stops answering is `PeerLost` on the cloud's stream, with every workload it held told as ended, and `PeerJoined`
+when it answers again. Prompts to the cloud's endpoints pass through to the member's. See [Run](#run) for the
+variables.
+
+**5. What the agent does from there.** Reads the hardware state (a card shows its memory, temperature, power,
 utilisation and the CUDA version; the host CPU is listed after it), deploys a model on it, follows the events to
 `DeploymentReady`, prompts the endpoint that event names, runs a job, undeploys. The whole run, as recorded the first
 time it passed, is [acceptance/lifecycle-from-the-manifest.md](acceptance/lifecycle-from-the-manifest.md). Send back
@@ -134,6 +150,18 @@ host changes or fewer than thirty days of it remain, which the start-up line say
 `~/.best-peer`) holds the event log, the credentials as hashes, the admin token, that certificate, and the record of
 where the door is that `best-peer approve` reads, so it reaches the peer over the same TLS, pinned to that
 certificate and no other.
+
+`BEST_PEER_MEMBERS` makes this peer a cloud door over the peers listed (`name=https://host:7777`, comma-separated;
+a name not given is the host). It holds no model and runs no job: `get-hardware-state` lists every member's devices
+as `<name>/<id>` with the members and their state, `deploy-model` and `run-job` are placed by the peer's own rule
+across members (or on the device named) and sent there as the cloud's command, `pull-image` goes to every member,
+and what a member tells comes back on the cloud's stream under the caller's correlation id with `peer` named; the
+endpoint `DeploymentReady` names is on the cloud's door and passes through to the member's with the cloud's own
+credential for it. The cloud signs in to each member by the device flow and logs the code to approve there; the
+credentials and its place on each member's stream live in `members.json` under the data folder. `BEST_PEER_TRUST`
+lists PEM files to trust beyond the public roots, for members serving their own certificates. Every thirty seconds
+the cloud squares its state with its members: one that does not answer is told as `PeerLost` and its workloads as
+ended, and `PeerJoined` when it answers again. `BEST_PEER_GPU` and `BEST_PEER_RUNTIME` are not read on a cloud.
 
 `BEST_PEER_GPU` (default `nvml`) is how the peer sees the hardware: through the NVIDIA driver's own library, every
 card with its memory, temperature, power, utilisation and the CUDA version the driver offers, read live at every

@@ -57,3 +57,34 @@ jobs:
           key=$(echo "$token" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
           echo "$token" | python3 -c 'import json,sys; t=json.load(sys.stdin); assert t["name"]=="ci-peer" and t["auth_header"]=="X-Api-Key" and t["note"].startswith("The credential is a secret."), "the token answer lacks a BEST member"'
           NODE_EXTRA_CA_CERTS="$cert" npx -y @behavioralstate/best-validate@0.4.2 "$base" --api-key "$key" --auth-type apikey --auth-header X-Api-Key --probe-registration
+
+      # Then the cloud door: the same binary over two member peers on the fakes, admitted by each through the real
+      # `best-peer approve` with the code the cloud logs, and validated anonymous and signed in like a peer.
+      - name: best-validate, the cloud door over two members
+        run: |
+          set -euo pipefail
+          data_a="$(mktemp -d)"; data_b="$(mktemp -d)"
+          BEST_PEER_DATA="$data_a" BEST_PEER_LISTEN=127.0.0.1:7781 BEST_PEER_ENDPOINT=http://127.0.0.1:7781 ./target/release/best-peer &
+          BEST_PEER_DATA="$data_b" BEST_PEER_LISTEN=127.0.0.1:7782 BEST_PEER_ENDPOINT=http://127.0.0.1:7782 ./target/release/best-peer &
+          cloud="$(mktemp -d)"
+          BEST_PEER_DATA="$cloud" BEST_PEER_LISTEN=127.0.0.1:7783 BEST_PEER_ENDPOINT=http://127.0.0.1:7783 BEST_PEER_MEMBERS="a=http://127.0.0.1:7781,b=http://127.0.0.1:7782" ./target/release/best-peer > "$cloud/log" 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:7783/.well-known/best >/dev/null && break; sleep 1; done
+          for m in a b; do
+            for i in $(seq 1 40); do grep -q "on $m, run on that machine" "$cloud/log" && break; sleep 0.5; done
+            code=$(grep -o "on $m, run on that machine: best-peer approve [A-Z0-9-]*" "$cloud/log" | head -1 | awk '{print $NF}')
+            d="data_$m"; BEST_PEER_DATA="${!d}" ./target/release/best-peer approve "$code"
+          done
+          base=http://127.0.0.1:7783
+          device=$(curl -sf -X POST "$base/auth/device" -d client_id=ci -d connection=ci-cloud -d agent_label=ci)
+          user_code=$(echo "$device" | python3 -c 'import json,sys; print(json.load(sys.stdin)["user_code"])')
+          device_code=$(echo "$device" | python3 -c 'import json,sys; print(json.load(sys.stdin)["device_code"])')
+          BEST_PEER_DATA="$cloud" ./target/release/best-peer approve "$user_code"
+          token=$(curl -sf -X POST "$base/auth/token" -d grant_type=urn:ietf:params:oauth:grant-type:device_code -d "device_code=$device_code" -d client_id=ci)
+          key=$(echo "$token" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+          for i in $(seq 1 60); do
+            up=$(curl -sf -H "X-Api-Key: $key" "$base/queries/get-hardware-state" | python3 -c 'import json,sys; print(sum(1 for p in json.load(sys.stdin)["peers"] if p["state"]=="up"))')
+            [ "$up" = 2 ] && break; sleep 0.5
+          done
+          [ "$up" = 2 ] || { echo "::error::the cloud sees $up of 2 members up"; cat "$cloud/log"; exit 1; }
+          npx -y @behavioralstate/best-validate@0.4.2 "$base"
+          npx -y @behavioralstate/best-validate@0.4.2 "$base" --api-key "$key" --auth-type apikey --auth-header X-Api-Key --probe-registration

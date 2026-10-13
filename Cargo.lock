@@ -201,6 +201,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 name = "best-peer"
 version = "0.0.8"
 dependencies = [
+ "async-trait",
  "axum",
  "axum-server",
  "best-peer-docker",
@@ -212,8 +213,10 @@ dependencies = [
  "best-peer-native",
  "best-peer-nvml",
  "best-peer-runtime",
+ "futures",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "rcgen",
  "rustls",
@@ -229,6 +232,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -999,6 +1003,22 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tower-service",
+]
+
+[[package]]
+name = "hyper-rustls"
+version = "0.27.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfa8e654703247911e29c23fbeaa261834bd9bb74efba2f9acddc37bfb127f53"
+dependencies = [
+ "http",
+ "hyper",
+ "hyper-util",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]

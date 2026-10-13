@@ -232,7 +232,7 @@ fn own(dir: &Path, names: &[String]) -> Result<(PathBuf, PathBuf, bool), String>
 
 /// Writes a file its owner alone can read, whatever was there before: an existing file is removed first, since
 /// a mode on creation does not touch one that exists, and the mode is set again after.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
