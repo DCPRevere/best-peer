@@ -101,7 +101,11 @@ jobs:
             archive: tar.gz
     runs-on: ${{ matrix.os }}
     env:
+      # Each archive is published twice, byte for byte the same: under NAME, which carries the version, for pinning,
+      # and under ALIAS, which does not, so `releases/latest/download/<ALIAS>` is always the newest release and the
+      # README's commands never name a version. The folder inside is ALIAS, so `cd` needs no version either.
       NAME: best-peer-${{ needs.check.outputs.version }}-${{ matrix.target }}
+      ALIAS: best-peer-${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -123,20 +127,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "dist/$NAME"
-          cp README.md LICENSE "dist/$NAME/"
+          mkdir -p "dist/$ALIAS"
+          cp README.md LICENSE "dist/$ALIAS/"
           if [[ "${{ matrix.archive }}" == zip ]]; then
-            cp target/${{ matrix.target }}/release/best-peer.exe "dist/$NAME/"
-            (cd dist && 7z a -tzip "$NAME.zip" "$NAME" > /dev/null)
+            cp target/${{ matrix.target }}/release/best-peer.exe "dist/$ALIAS/"
+            (cd dist && 7z a -tzip "$NAME.zip" "$ALIAS" > /dev/null)
           else
-            cp target/${{ matrix.target }}/release/best-peer "dist/$NAME/"
-            tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+            cp target/${{ matrix.target }}/release/best-peer "dist/$ALIAS/"
+            tar -C dist -czf "dist/$NAME.tar.gz" "$ALIAS"
           fi
+          cp "dist/$NAME.${{ matrix.archive }}" "dist/$ALIAS.${{ matrix.archive }}"
+          rm -r "dist/$ALIAS"
           ls -l dist
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.NAME }}
-          path: dist/${{ env.NAME }}.${{ matrix.archive }}
+          path: |
+            dist/${{ env.NAME }}.${{ matrix.archive }}
+            dist/${{ env.ALIAS }}.${{ matrix.archive }}
           if-no-files-found: error
 
   release:
@@ -191,13 +199,13 @@ jobs:
             echo
             echo "## Run it"
             echo
-            echo "One binary. Download the archive for the machine, check it against \`SHA256SUMS\`, unpack it and run \`best-peer\` with the environment the README's Run section names; \`best-peer --version\` says \`best-peer $version\`."
+            echo "One binary. Download the archive for the machine, check it against \`SHA256SUMS\`, unpack it and run \`best-peer\` with the environment the README's Run section names; \`best-peer --version\` says \`best-peer $version\`. Each archive is here twice, byte for byte the same: under the name with the version, for pinning, and under the name without it, which \`releases/latest/download/<name>\` resolves to the newest release, as the README's commands use."
             echo
-            echo "| Machine | Archive |"
-            echo "|---|---|"
-            echo "| Linux x86_64 (glibc 2.35 or newer) | \`best-peer-$version-x86_64-unknown-linux-gnu.tar.gz\` |"
-            echo "| Windows x86_64 | \`best-peer-$version-x86_64-pc-windows-msvc.zip\` |"
-            echo "| macOS Apple silicon | \`best-peer-$version-aarch64-apple-darwin.tar.gz\` |"
+            echo "| Machine | Archive | Same file, unversioned |"
+            echo "|---|---|---|"
+            echo "| Linux x86_64 (glibc 2.35 or newer) | \`best-peer-$version-x86_64-unknown-linux-gnu.tar.gz\` | \`best-peer-x86_64-unknown-linux-gnu.tar.gz\` |"
+            echo "| Windows x86_64 | \`best-peer-$version-x86_64-pc-windows-msvc.zip\` | \`best-peer-x86_64-pc-windows-msvc.zip\` |"
+            echo "| macOS Apple silicon | \`best-peer-$version-aarch64-apple-darwin.tar.gz\` | \`best-peer-aarch64-apple-darwin.tar.gz\` |"
             echo
             echo "Every archive carries a build provenance attestation: \`gh attestation verify <archive> --repo ${GITHUB_REPOSITORY}\`."
           } > notes.md

@@ -37,15 +37,19 @@ the CPU is the one device. Then one of two ways to run models, each with what it
 `BEST_PEER_RUNTIME=fake` is a third way for a machine with neither: the surface answers, nothing runs. Every other
 variable has a default that fits these two ways; [Run](#run) lists them for a setup that differs.
 
-**1. Download and run.** Take the archive for your machine from the
-[releases](https://github.com/behavioralstate/best-peer/releases), unpack it, and start the peer:
+**1. Download and run.** Take the newest release's archive for your machine, unpack it, and start the peer:
 
 ```bash
-tar xzf best-peer-<version>-x86_64-unknown-linux-gnu.tar.gz
-cd best-peer-<version>-x86_64-unknown-linux-gnu
+curl -LO https://github.com/behavioralstate/best-peer/releases/latest/download/best-peer-x86_64-unknown-linux-gnu.tar.gz
+tar xzf best-peer-x86_64-unknown-linux-gnu.tar.gz
+cd best-peer-x86_64-unknown-linux-gnu
 ./best-peer --version
 ./best-peer
 ```
+
+On Windows x86_64 the archive is `best-peer-x86_64-pc-windows-msvc.zip`, on macOS Apple silicon
+`best-peer-aarch64-apple-darwin.tar.gz`. The [releases](https://github.com/behavioralstate/best-peer/releases) page
+holds the same archives under names that carry the version, for pinning one, with `SHA256SUMS` to check them against.
 
 It prints one line, `best-peer is serving its door`, with where it listens and its data folder, and then waits:
 nothing else appears until a client talks to it. If it exits instead, the message names what is missing (the

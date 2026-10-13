@@ -52,7 +52,9 @@
   `main`, not on a `Release <version>` commit or not equal to `Cargo.toml`, waits for `ci` to pass on that commit,
   runs the checks on the locked tree, builds the binary for Linux x86_64 (glibc 2.35 or newer: the driver's library is loaded at run time, which a
   static binary cannot do), Windows x86_64 and macOS Apple
-  silicon, checks each says the version, and publishes the archives with checksums, a build provenance attestation
+  silicon, checks each says the version, and publishes each archive twice, byte for byte the same: under its versioned
+  name, for pinning, and under a name without the version that `releases/latest/download` resolves, so the README's
+  commands name no version; with checksums, a build provenance attestation
   and notes made from the release commit's message and the commits since the previous release. A release is cut when someone
   other than the owner will run the binary, or when a slice's issue says a host needs it; before 1.0 the minor goes
   up with a capability and the patch with a fix. A change to the workflow is tried with its `workflow_dispatch`,
