@@ -324,15 +324,33 @@ fn approve(args: &[String]) {
     if let Some(b) = memory {
         form.push(("memory_bytes", b.to_string()));
     }
-    match ureq::post(&url).send_form(form.iter().map(|(k, v)| (*k, v.as_str()))) {
+    // The door's answer is read whatever its status: a refusal says why, in its body, and that is what the person
+    // at the machine needs to see (a scope the door does not have, a code that expired).
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    match agent.post(&url).send_form(form.iter().map(|(k, v)| (*k, v.as_str()))) {
         Ok(mut res) => {
-            let admitted: serde_json::Value = res
+            let status = res.status().as_u16();
+            let answer: serde_json::Value = res
                 .body_mut()
                 .read_to_string()
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default();
-            let a = &admitted["admitted"];
+            match status {
+                200 => {}
+                403 => fail(&format!(
+                    "the peer refused the admin token in {}: it is not the token of the peer listening on {listen}",
+                    dir.display()
+                )),
+                _ => fail(&format!(
+                    "the peer refused ({status}): {}",
+                    answer["error_description"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("is {code} a live code shown by an agent in the last ten minutes?"))
+                )),
+            }
+            let a = &answer["admitted"];
             let who = match a["agent_label"].as_str() {
                 Some(l) => format!("{l} ({})", a["client_id"].as_str().unwrap_or("?")),
                 None => a["client_id"].as_str().unwrap_or("?").to_string(),
@@ -351,13 +369,6 @@ fn approve(args: &[String]) {
                 a["lifetime"].as_str().unwrap_or("durable")
             );
         }
-        Err(ureq::Error::StatusCode(403)) => fail(&format!(
-            "the peer refused the admin token in {}: it is not the token of the peer listening on {listen}",
-            dir.display()
-        )),
-        Err(ureq::Error::StatusCode(status)) => fail(&format!(
-            "the peer refused ({status}): is {code} a live code shown by an agent in the last ten minutes?"
-        )),
         Err(e) => fail(&format!("cannot reach the peer at {url}: {e}")),
     }
 }
