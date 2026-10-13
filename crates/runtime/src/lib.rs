@@ -109,6 +109,8 @@ pub struct Fake {
     open_registry: bool,
     /// Whether this engine runs jobs; an engine that only serves deployments says no.
     jobs: bool,
+    /// Host ports chosen for container ports, over the fake's own numbering: where a test listens itself.
+    published: BTreeMap<u16, u16>,
     containers: Mutex<BTreeMap<ContainerId, Spec>>,
     devices: Vec<DeviceId>,
     next: Mutex<u32>,
@@ -124,6 +126,7 @@ impl Fake {
             registry: Mutex::new(Vec::new()),
             open_registry: false,
             jobs: true,
+            published: BTreeMap::new(),
             containers: Mutex::new(BTreeMap::new()),
             devices,
             next: Mutex::new(0),
@@ -145,6 +148,13 @@ impl Fake {
     /// An engine that runs no job, as an engine installed on the host outside any container: deploys only.
     pub fn without_jobs(mut self) -> Self {
         self.jobs = false;
+        self
+    }
+
+    /// Publishes container port `container` at host port `host` instead of the fake's own numbering, for a test
+    /// that listens there itself and sees what reaches the engine.
+    pub fn publishes(mut self, container: u16, host: u16) -> Self {
+        self.published.insert(container, host);
         self
     }
 
@@ -208,10 +218,12 @@ impl Runtime for Fake {
         let ports = spec
             .ports
             .iter()
-            .map(|&p| {
-                p.checked_add(30000)
+            .map(|&p| match self.published.get(&p) {
+                Some(&host) => Ok(Published { container: p, host }),
+                None => p
+                    .checked_add(30000)
                     .map(|host| Published { container: p, host })
-                    .ok_or_else(|| RuntimeError::Engine(format!("no host port for container port {p}")))
+                    .ok_or_else(|| RuntimeError::Engine(format!("no host port for container port {p}"))),
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.containers.lock().unwrap().insert(id.clone(), spec);

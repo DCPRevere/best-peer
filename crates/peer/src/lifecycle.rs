@@ -69,8 +69,8 @@ pub struct Peer {
     service: String,
     dataschemas: Arc<HashMap<String, String>>,
     completions: Arc<HashMap<String, std::collections::HashSet<String>>>,
-    /// The host consumers reach the engines' published ports at: the door endpoint's host.
-    host: String,
+    /// The door's own base URL: what `DeploymentReady` names an endpoint under.
+    endpoint: String,
     /// The host the peer itself reaches the engines at: where the containers' ports are bound, on this machine.
     engine_host: String,
     images: Images,
@@ -142,7 +142,7 @@ impl Peer {
             service: service.into(),
             dataschemas: Arc::new(crate::domain::event_dataschemas(endpoint)),
             completions: Arc::new(crate::domain::completions()),
-            host: host_of(endpoint),
+            endpoint: endpoint.trim_end_matches('/').to_string(),
             engine_host: engine_host.into(),
             images,
             patience,
@@ -316,6 +316,32 @@ impl Peer {
         format!("http://{}:{port}", self.engine_host)
     }
 
+    /// Where the door passes a prompt for a deployment: its engine's base on this host, while the deployment is
+    /// ready. Before that, after an undeploy was accepted, or for a deployment nobody made, the refusal says what to
+    /// do.
+    pub fn upstream_of(&self, deployment: &str) -> Result<String, BestError> {
+        let state = self.state.lock().unwrap();
+        let Some(d) = state.deployments.get(deployment) else {
+            return Err(BestError::not_found(
+                "NO_SUCH_DEPLOYMENT",
+                format!(
+                    "no deployment {deployment}: get-workloads lists what this peer runs, and deploy-model starts one"
+                ),
+            ));
+        };
+        match d.phase {
+            Phase::Ready => Ok(self.engine_base(d.port)),
+            Phase::Starting => Err(BestError::not_found(
+                "DEPLOYMENT_NOT_READY",
+                format!("deployment {deployment} is not ready yet: follow its events to DeploymentReady, then prompt it"),
+            )),
+            Phase::Ending => Err(BestError::not_found(
+                "DEPLOYMENT_ENDING",
+                format!("deployment {deployment} is ending: an undeploy was accepted; deploy the model again if it is still wanted"),
+            )),
+        }
+    }
+
     // ----- pull-image -----------------------------------------------------------------------------------------------
 
     pub async fn pull_image(self: Arc<Self>, cmd: Envelope, em: Emitter) {
@@ -477,7 +503,7 @@ impl Peer {
                 self.tell(
                     &em,
                     "DeploymentReady",
-                    json!({ "deployment": id, "model": data.model, "engine": data.engine, "endpoint": format!("http://{}:{port}{}", self.host, recipe.openai_path) }),
+                    json!({ "deployment": id, "model": data.model, "engine": data.engine, "endpoint": format!("{}/deployments/{id}{}", self.endpoint, recipe.openai_path) }),
                 );
             }
             Ok(()) => {}
@@ -1080,20 +1106,6 @@ fn new_id(prefix: &str) -> String {
     format!("{prefix}-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
 }
 
-/// The host part of a base URL: what the engines' published ports are reached at.
-pub fn host_of(endpoint: &str) -> String {
-    let rest = endpoint.split("://").nth(1).unwrap_or(endpoint);
-    let authority = rest.split('/').next().unwrap_or(rest);
-    if let Some(end) = authority.strip_prefix('[').and_then(|a| a.find(']')) {
-        return authority[..end + 2].to_string();
-    }
-    authority
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(authority)
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1117,13 +1129,5 @@ mod tests {
         // A job with no stated API goes to the card too.
         let (id, _) = place(&host, &state, &any_compute(), 1 << 30, None, "a job").unwrap();
         assert_eq!(id.0, "GPU-a");
-    }
-
-    #[test]
-    fn the_engines_host_is_the_endpoints_host() {
-        assert_eq!(host_of("http://127.0.0.1:7777"), "127.0.0.1");
-        assert_eq!(host_of("https://peer.example.com"), "peer.example.com");
-        assert_eq!(host_of("https://peer.example.com:8443/base"), "peer.example.com");
-        assert_eq!(host_of("http://[::1]:7777"), "[::1]");
     }
 }

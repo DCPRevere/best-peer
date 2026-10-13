@@ -8,8 +8,9 @@ each other through BEST doors too, so the same word carries to the end game: a n
 
 best-peer is an implementation of BEST written in Rust from the spec text alone, sharing no code with any other, so
 the spec is proven portable and its gaps surface. It wraps an existing runtime (containers with the NVIDIA container
-toolkit running Ollama or vLLM) and builds no engine of its own. Inference tokens stay on the runtime's
-OpenAI-compatible endpoint; BEST carries the control path only.
+toolkit running Ollama or vLLM) and builds no engine of its own. Prompts go to the runtime's OpenAI-compatible
+endpoint through the door, with the door's credential, and the door passes them through untouched; BEST carries the
+control path only.
 
 The plan is the epic [behavioralstate/spec#27](https://github.com/behavioralstate/spec/issues/27) and its slices, on the
 [Behavioralstate board](https://github.com/orgs/Amarcode-Studios/projects/4). The board is the plan: no plan file lives
@@ -32,7 +33,7 @@ the CPU is the one device. Then one of two ways to run models, each with what it
 | Way | What the machine needs | Settings |
 |---|---|---|
 | **Docker** (the default) | Docker Engine running and reachable by your user (`docker ps` without `sudo`, or run the peer with it), and the NVIDIA container toolkit registered with it, so that `docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi` lists the card. Room under Docker's storage for the engine image and the model weights, a few GB. | None: the peer pulls the engine image, starts the container, publishes its port. |
-| **Native** | Ollama installed and running as a service on its own port. The peer pulls the model through it and claims its port; nothing is started or stopped. No jobs: `run-job` is refused at ingest, with the fix. | `BEST_PEER_RUNTIME=native`. For prompts from another machine, Ollama itself must listen beyond loopback (`OLLAMA_HOST=0.0.0.0` in its service), since the endpoint a deploy names is Ollama's own port. |
+| **Native** | Ollama installed and running as a service on its own port. The peer pulls the model through it and claims its port; nothing is started or stopped. No jobs: `run-job` is refused at ingest, with the fix. | `BEST_PEER_RUNTIME=native`. Ollama keeps its own bind, loopback as installed: prompts reach it through the door. |
 
 `BEST_PEER_RUNTIME=fake` is a third way for a machine with neither: the surface answers, nothing runs. Every other
 variable has a default that fits these two ways; [Run](#run) lists them for a setup that differs.
@@ -64,11 +65,9 @@ BEST_PEER_LISTEN=0.0.0.0:7777 BEST_PEER_ENDPOINT=http://<address they reach>:777
 ```
 
 There is no TLS and no relay in the peer, so across the internet that address is a VPN or tunnel (a Tailscale IP, a
-port forward). Prompts go to the engine directly, so the firewall lets in 7777 and the engine's port: in native mode
-that is Ollama's own (11434 as installed); with Docker it is one the container engine picks per deploy, named by the
-endpoint in `DeploymentReady`, so it is opened then. Once the door listens on an interface that is not loopback, the
-engine's port is published on every interface, with whatever access the engine enforces, none in Ollama as
-installed, so expose the peer on a network you trust.
+port forward), and the firewall lets in 7777 and nothing else: prompts go through the door too, on that port,
+with the door's credential. The engines' own ports stay on loopback whatever the door listens on. The door is plain
+HTTP, so the credential travels in the clear: across the internet, put TLS in front or use the VPN.
 
 **3. Admit the agent.** The person connecting says to their client "sign me in `<name>`, start from
 `http://<address>:7777/.well-known/best`"; their client shows them a code like `8BB9-CB44`, and they send it to you.
@@ -135,8 +134,8 @@ outside any container (an installed Ollama; no jobs), `fake` serves the whole su
 `BEST_PEER_OLLAMA_IMAGE` and `BEST_PEER_VLLM_IMAGE` pin or mirror the engines' images; `BEST_PEER_READY_SECONDS`
 (default 900) is how long an engine may take to answer after its container started, `BEST_PEER_LOAD_SECONDS`
 (default 3600) how long a model may take to load. `BEST_PEER_ENGINE_HOST` (default `127.0.0.1`) is where the peer
-itself reaches the engines' published ports; the endpoint a `DeploymentReady` event names uses the door's host, and
-the ports are bound to every interface only when the door listens on one that is not loopback.
+itself reaches the engines' ports, which are bound to loopback whatever the door listens on; the endpoint a
+`DeploymentReady` event names is on the door, under the deployment.
 
 ## Deploy
 
@@ -156,20 +155,23 @@ the engine still runs; a workload that ended while the peer was down is told so 
 ## The data path
 
 BEST carries the control path: the commands, the facts they produce and the state those facts fold to. The
-conversation with the model is not on it. `DeploymentReady` names the endpoint, an OpenAI-compatible base URL on the
-door's host, and the model name to put in the request; from then on a client prompts the engine there directly,
-with the engine's own API, and the door neither sees, proxies nor records a token. Two reasons. Streaming tokens
-through a protocol made for facts would add a hop and a format to every answer for nothing: a token is not a fact
-about the machine, and every client already speaks the API the engines expose. And the boundary keeps the door
-honest about what it promises: its events say what the machine runs, never what the model answered.
+conversation with the model is not on it. `DeploymentReady` names the endpoint, an OpenAI-compatible base URL on
+the door under the deployment (`<door>/deployments/<deployment>/v1`), and the model name to put in the request. A
+client prompts there with the engine's own API and the door's credential, sent as the door's `X-Api-Key` header or
+as the `Authorization: Bearer` the OpenAI-compatible clients send; the door checks it, passes the request to the
+engine as it is and the answer back as it comes, streaming included, and records nothing. Tokens are not turned into
+events: a token is not a fact about the machine, and the door's events say what the machine runs, never what the
+model answered. The pass-through is there so that the one credential means what a person expects: who may deploy on
+the machine is who may prompt it.
 
-Where the boundary lies: the door's credential ends at the door. The endpoint answers whoever reaches its port, with
-whatever access the engine itself enforces (none, in Ollama as installed), on the interfaces the peer binds the
-container's port to, or, in `native` mode, the ones the installed engine listens on. The door promises that the
-endpoint serves the model from `DeploymentReady` until the deployment ends: an `undeploy-model` accepted (its
-phase is `ending` in `get-workloads` from then, and `Undeployed` follows), or `DeploymentEnded` or `OutOfMemory`
-telling what the engine did on its own, within 30 s of it where the engine told nothing itself (an installed engine
-that stopped). What is said at the endpoint, how fast and to whom, is the engine's.
+Where the boundary lies: the engines' own ports are bound to loopback whatever the door listens on (in `native` mode
+the installed engine keeps its own bind), so the door is the one way in. Without the credential the endpoint
+answers the door's `401`; a deployment that is not ready, or whose `undeploy-model` was accepted (its phase is
+`ending` in `get-workloads` from then, and `Undeployed` follows), or that nobody made, answers `404` with what to
+do; an engine that does not answer is `502` with what to do. The door promises that the endpoint serves the model
+from `DeploymentReady` until the deployment ends: the undeploy, or `DeploymentEnded` or `OutOfMemory` telling what
+the engine did on its own, within 30 s of it where the engine told nothing itself. What is said at the endpoint
+and how fast is the engine's.
 
 ## Commands over time
 

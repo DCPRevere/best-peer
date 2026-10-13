@@ -9,6 +9,7 @@
 //! machine.
 
 mod domain;
+mod endpoint;
 mod lifecycle;
 mod state;
 
@@ -202,12 +203,9 @@ async fn serve() {
         EventLog::open(&dir).unwrap_or_else(|e| fail(&format!("cannot keep the event log in {}: {e}", dir.display()))),
     );
     let gpu = accelerator(std::env::var("BEST_PEER_GPU").ok().as_deref()).unwrap_or_else(|why| fail(&why));
-    // The engines' ports are bound where the door is reached: this machine only, unless the door is open to others.
-    let bind_ip = if listen.ip().is_loopback() {
-        "127.0.0.1"
-    } else {
-        "0.0.0.0"
-    };
+    // The engines' ports are bound to this machine only, whatever the door listens on: a prompt reaches an engine
+    // through the door, with the door's credential.
+    let bind_ip = "127.0.0.1";
     let engine_host = std::env::var("BEST_PEER_ENGINE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let (runtime, engine) = engines(bind_ip, &engine_host).await;
     let images = Images {
@@ -223,7 +221,7 @@ async fn serve() {
         ..Patience::default()
     };
     let peer = peer(&endpoint, &engine_host, gpu, runtime, engine, log, images, patience).await;
-    let door = Arc::new(door(&endpoint, peer, auth));
+    let door = Arc::new(door(&endpoint, peer.clone(), auth.clone()));
     // What the last run accepted and never completed is run now, before anyone can send more.
     best_peer_door::resume(&door).await;
     let listener = tokio::net::TcpListener::bind(listen)
@@ -233,7 +231,8 @@ async fn serve() {
         tracing::warn!(endpoint = %door.endpoint, "the endpoint is cleartext and not loopback: credentials will travel unencrypted; put TLS in front before anyone but you uses it");
     }
     tracing::info!(%listen, endpoint = %door.endpoint, data = %dir.display(), "best-peer is serving its door");
-    let server = axum::serve(listener, best_peer_door::router(door)).with_graceful_shutdown(async {
+    let app = best_peer_door::router(door).merge(endpoint::router(peer, auth));
+    let server = axum::serve(listener, app).with_graceful_shutdown(async {
         tokio::signal::ctrl_c().await.ok();
     });
     // An open event stream never ends by itself, so a graceful stop would wait for it forever: a few seconds, then out.
@@ -347,13 +346,23 @@ mod tests {
     /// A peer over the fakes: the hardware given, a registry that serves the engines' images, and a signed-in
     /// agent. `log` carries a previous run's log across a restart.
     async fn bed(gpu: Arc<best_peer_gpu::Fake>, log: Arc<EventLog>, runtime: Arc<best_peer_runtime::Fake>) -> Bed {
+        bed_at(gpu, log, runtime, "engines.local").await
+    }
+
+    /// The same, with the engines reached at `engine_host`: `127.0.0.1` for a test that stands in for one.
+    async fn bed_at(
+        gpu: Arc<best_peer_gpu::Fake>,
+        log: Arc<EventLog>,
+        runtime: Arc<best_peer_runtime::Fake>,
+        engine_host: &str,
+    ) -> Bed {
         for image in ["ollama/ollama", "vllm/vllm-openai", "busybox", "ollama/ollama:0.6"] {
             runtime.registry_has(best_peer_runtime::ImageRef(image.into()));
         }
         let engine = Arc::new(best_peer_engine::Fake::new());
         let peer = peer(
             EP,
-            "engines.local",
+            engine_host,
             gpu.clone(),
             runtime.clone(),
             engine.clone(),
@@ -367,9 +376,9 @@ mod tests {
         )
         .await;
         let auth = Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() })));
-        let door = Arc::new(super::door(EP, peer.clone(), auth));
+        let door = Arc::new(super::door(EP, peer.clone(), auth.clone()));
         best_peer_door::resume(&door).await;
-        let app = best_peer_door::router(door.clone());
+        let app = best_peer_door::router(door.clone()).merge(endpoint::router(peer.clone(), auth));
         let key = key(&app).await;
         Bed {
             door,
@@ -591,8 +600,9 @@ mod tests {
         assert_eq!(events[3].data["progress_pct"], 25);
         let ready = &events[5].data;
         assert_eq!(
-            ready["endpoint"], "http://peer.test:41434/v1",
-            "the host of the door, the port the engine published"
+            ready["endpoint"],
+            format!("{EP}/deployments/{}/v1", started["deployment"].as_str().unwrap()),
+            "on the door, under the deployment"
         );
         assert_eq!(ready["deployment"], started["deployment"]);
         assert!(events.iter().all(|e| e.dataschema.as_deref().unwrap().starts_with(EP)));
@@ -609,7 +619,7 @@ mod tests {
         );
         let w = bed.query("get-workloads").await;
         assert_eq!(w["deployments"][0]["phase"], "ready");
-        assert_eq!(w["deployments"][0]["endpoint"], "http://peer.test:41434/v1");
+        assert_eq!(w["deployments"][0]["endpoint"], ready["endpoint"]);
 
         let dep = started["deployment"].as_str().unwrap();
         let (s, b) = bed
@@ -671,6 +681,151 @@ mod tests {
         assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
         assert_eq!(b["error"]["details"]["devices"][0]["room_bytes"], 2 * GB);
         assert_eq!(bed.deploy("d4", "tiny:1b", "ollama", 2).await.0, StatusCode::CREATED);
+    }
+
+    /// An engine stand-in on a loopback port of its own: answers every request with what reached it.
+    async fn echo_engine() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().fallback(|req: axum::extract::Request| async move {
+            let (parts, body) = req.into_parts();
+            let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+            axum::Json(json!({
+                "method": parts.method.as_str(),
+                "path": parts.uri.path(),
+                "query": parts.uri.query(),
+                "saw_credential": parts.headers.contains_key("X-Api-Key") || parts.headers.contains_key(header::AUTHORIZATION),
+                "body": String::from_utf8_lossy(&bytes),
+            }))
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
+    }
+
+    /// A loopback port nothing listens on.
+    fn closed_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[tokio::test]
+    async fn the_endpoint_is_on_the_door_behind_its_credential_and_passes_prompts_through_to_the_engine() {
+        let port = echo_engine().await;
+        let bed = bed_at(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]).publishes(11434, port)),
+            "127.0.0.1",
+        )
+        .await;
+        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
+        assert_eq!(
+            bed.query("get-workloads").await["deployments"][0]["endpoint"],
+            format!("{EP}/deployments/{dep}/v1")
+        );
+        let path = format!("/deployments/{dep}/v1/chat/completions?stream=true");
+        let prompt = |headers: Vec<(&'static str, String)>| {
+            let mut req = Request::post(&path).header(header::CONTENT_TYPE, "application/json");
+            for (name, value) in headers {
+                req = req.header(name, value);
+            }
+            req.body(Body::from(r#"{"model":"llama3.2:3b","messages":[]}"#))
+                .unwrap()
+        };
+        // No credential: the door's refusal, and nothing reaches the engine.
+        let res = bed.app.clone().oneshot(prompt(vec![])).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body(res).await["error"]["code"], "UNAUTHORIZED");
+        // The door's own header: the request reaches the engine as the client made it, less the credential.
+        let res = bed
+            .app
+            .clone()
+            .oneshot(prompt(vec![("X-Api-Key", bed.key.clone())]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let seen = body(res).await;
+        assert_eq!(seen["method"], "POST");
+        assert_eq!(seen["path"], "/v1/chat/completions");
+        assert_eq!(seen["query"], "stream=true");
+        assert_eq!(seen["body"], r#"{"model":"llama3.2:3b","messages":[]}"#);
+        assert_eq!(seen["saw_credential"], false, "the credential ends at the door");
+        // The header the OpenAI-compatible clients send.
+        let res = bed
+            .app
+            .clone()
+            .oneshot(prompt(vec![("authorization", format!("Bearer {}", bed.key))]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        // A wrong credential is refused like a missing one.
+        let res = bed
+            .app
+            .clone()
+            .oneshot(prompt(vec![("authorization", "Bearer bp_nope".into())]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        // A deployment nobody made.
+        let res = bed
+            .app
+            .clone()
+            .oneshot(
+                Request::get("/deployments/dep-nope/v1/models")
+                    .header("X-Api-Key", &bed.key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body(res).await["error"]["code"], "NO_SUCH_DEPLOYMENT");
+        // Once an undeploy is accepted the promise ends, before the engine is gone.
+        let (s, _) = bed
+            .send("u1", "UndeployModel", "undeploy-model", json!({ "deployment": dep }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED);
+        bed.events_of("u1", "Undeployed").await;
+        let res = bed
+            .app
+            .clone()
+            .oneshot(prompt(vec![("X-Api-Key", bed.key.clone())]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_engine_that_does_not_answer_is_a_bad_gateway_with_the_fix() {
+        let bed = bed_at(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]).publishes(11434, closed_port())),
+            "127.0.0.1",
+        )
+        .await;
+        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
+        let res = bed
+            .app
+            .clone()
+            .oneshot(
+                Request::get(format!("/deployments/{dep}/v1/models"))
+                    .header("X-Api-Key", &bed.key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let b = body(res).await;
+        assert_eq!(b["error"]["code"], "ENGINE_UNREACHABLE");
+        assert!(
+            b["error"]["message"].as_str().unwrap().contains("DeploymentEnded"),
+            "{b}"
+        );
     }
 
     #[tokio::test]

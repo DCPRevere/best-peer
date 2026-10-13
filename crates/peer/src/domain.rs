@@ -120,7 +120,7 @@ fn workloads_query(peer: Arc<Peer>) -> QueryDef {
                 "deployments": { "type": "array", "items": { "type": "object", "required": ["deployment", "model", "engine", "device", "memory_bytes", "phase"], "properties": {
                     "deployment": { "type": "string" }, "model": { "type": "string" }, "engine": { "type": "string", "enum": ["ollama", "vllm"] },
                     "device": { "type": "string" }, "memory_bytes": { "type": "integer" },
-                    "endpoint": { "type": ["string", "null"], "description": "The OpenAI-compatible base URL, once the deployment is ready" },
+                    "endpoint": { "type": ["string", "null"], "description": "The OpenAI-compatible base URL on this door, once the deployment is ready; this door's credential opens it, as X-Api-Key or Authorization: Bearer" },
                     "phase": { "type": "string", "enum": ["starting", "ready", "ending"] }
                 } } },
                 "jobs": { "type": "array", "items": { "type": "object", "required": ["job", "image", "phase"], "properties": {
@@ -351,9 +351,9 @@ pub fn event_defs() -> Vec<EventDef> {
         event(
             "deployment-ready",
             "DeploymentReady",
-            "The model answers at the endpoint: an OpenAI-compatible base URL to send prompts to, outside this door, with the engine's own API and access. The model name goes in the request.",
+            "The model answers at the endpoint: an OpenAI-compatible base URL on this door, under the deployment, to send prompts to with the engine's own API and this door's credential, as X-Api-Key or Authorization: Bearer. The door passes the request and the answer through as they are, streaming included, and records nothing. The model name goes in the request.",
             &["deployment", "model", "engine", "endpoint"],
-            json!({ "deployment": s("The deployment"), "model": s("The model name to put in the request"), "engine": s("ollama or vllm"), "endpoint": s("The OpenAI-compatible base URL, such as http://host:41434/v1; this door's credential is not presented there") }),
+            json!({ "deployment": s("The deployment"), "model": s("The model name to put in the request"), "engine": s("ollama or vllm"), "endpoint": s("The OpenAI-compatible base URL on this door, such as http://host:7777/deployments/dep-1/v1; this door\'s credential opens it") }),
         ),
         event(
             "deployment-failed",

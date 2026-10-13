@@ -142,6 +142,8 @@ dependencies = [
  "best-peer-nvml",
  "best-peer-runtime",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde",
  "serde_json",
  "serde_urlencoded",

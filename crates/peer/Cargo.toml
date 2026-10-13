@@ -21,6 +21,8 @@ best-peer-host = { path = "../host" }
 best-peer-native = { path = "../native" }
 best-peer-nvml = { path = "../nvml" }
 best-peer-runtime = { path = "../runtime" }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 time = { version = "0.3", features = ["formatting"] }
