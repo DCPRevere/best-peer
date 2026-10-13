@@ -21,7 +21,7 @@ transcript.
 - **The person's part**: the agent showed the link and the code; at the machine, `best-peer approve 8BB9-CB44`
   admitted it (the approval's own log says 18:37:44, eleven seconds after the client started; the transcript
   carries no clock for it), and the agent's next poll had the credential, which it never saw.
-- **The validator**: the tree the binary was built from passed `best-validate` (BEST 0.9.18, conformant, 0 failures)
+- **The validator**: the tree the binary was built from passed `best-validate` 0.4.2 (BEST 0.9.17, conformant, 0 failures)
   anonymous and signed in, in the gate before the push and in CI on the commit.
 
 ## What the run showed
