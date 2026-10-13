@@ -351,7 +351,7 @@ impl Peer {
 
     pub async fn pull_image(self: Arc<Self>, cmd: Envelope, em: Emitter) {
         let image = best_peer_runtime::ImageRef(cmd.data["image"].as_str().unwrap_or_default().to_string());
-        match self.runtime.pull(&image, self.pulling(&em, &image)).await {
+        match self.pull(&em, &image).await {
             Ok(()) => {
                 self.tell(&em, "ImagePulled", json!({ "image": image.0 }));
             }
@@ -414,7 +414,7 @@ impl Peer {
             .engine
             .recipe(&data.model, &compute, self.images.for_engine(data.engine));
         let image = recipe.image.clone();
-        if let Err(e) = self.runtime.pull(&image, self.pulling(&em, &image)).await {
+        if let Err(e) = self.pull(&em, &image).await {
             self.fail_deployment(
                 &em,
                 &id,
@@ -498,9 +498,9 @@ impl Peer {
         };
         let outcome = async {
             self.engine.ready(data.engine, &base, self.patience.ready).await?;
-            tokio::time::timeout(
+            let loaded = tokio::time::timeout(
                 self.patience.load,
-                self.engine.load(data.engine, &base, &data.model, loading),
+                self.engine.load(data.engine, &base, &data.model, loading.clone()),
             )
             .await
             .unwrap_or_else(|_| {
@@ -508,7 +508,12 @@ impl Peer {
                     "the model was not loaded within {:?}",
                     self.patience.load
                 )))
-            })
+            });
+            // A model that loaded is at 100, whether or not the engine said so on the way.
+            if loaded.is_ok() {
+                loading(Some(100));
+            }
+            loaded
         }
         .await;
         match outcome {
@@ -532,6 +537,14 @@ impl Peer {
                 .await
             }
         }
+    }
+
+    /// Pulls an image, telling its progress; a pull that completed is 100, whether or not the engine said so.
+    async fn pull(self: &Arc<Self>, em: &Emitter, image: &best_peer_runtime::ImageRef) -> Result<(), RuntimeError> {
+        let progress = self.pulling(em, image);
+        self.runtime.pull(image, progress.clone()).await?;
+        progress(Some(100));
+        Ok(())
     }
 
     /// The progress sink of a pull: ImagePulling facts under the command's correlation, at the pace a consumer reads.
@@ -727,7 +740,7 @@ impl Peer {
                 json!({ "job": id, "image": data.image, "reason": reason, "fix": fix }),
             );
         };
-        if let Err(e) = self.runtime.pull(&image, self.pulling(&em, &image)).await {
+        if let Err(e) = self.pull(&em, &image).await {
             fail(e.to_string(), fix_for_runtime(&e));
             return;
         }

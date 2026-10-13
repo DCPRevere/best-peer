@@ -605,6 +605,7 @@ mod tests {
             types(&events),
             vec![
                 "ImagePulling",
+                "ImagePulling",
                 "ImagePulled",
                 "DeploymentStarted",
                 "WeightsLoading",
@@ -613,13 +614,14 @@ mod tests {
             ],
             "{events:#?}"
         );
-        let started = &events[2].data;
+        let started = &events[3].data;
         assert_eq!(started["device"], "gpu-0");
         assert_eq!(started["engine"], "ollama");
         assert_eq!(started["memory_bytes"], 8 * GB);
         assert!(started["deployment"].as_str().unwrap().starts_with("dep-"));
-        assert_eq!(events[3].data["progress_pct"], 25);
-        let ready = &events[5].data;
+        assert_eq!(events[1].data["progress_pct"], 100, "a pull that completed is 100");
+        assert_eq!(events[4].data["progress_pct"], 25);
+        let ready = &events[6].data;
         assert_eq!(
             ready["endpoint"],
             format!("{EP}/deployments/{}/v1", started["deployment"].as_str().unwrap()),
@@ -977,8 +979,8 @@ mod tests {
         let (s, b) = bed.deploy("o1", "llama3.2:3b", "ollama", 1).await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         let events = bed.events_of("o1", "DeploymentReady").await;
-        assert_eq!(events[2].data["device"], "cpu-0");
-        let container = ContainerId(events[2].data["container"].as_str().unwrap().into());
+        assert_eq!(events[3].data["device"], "cpu-0");
+        let container = ContainerId(events[3].data["container"].as_str().unwrap().into());
         assert!(bed.runtime.spec_of(&container).unwrap().devices.is_empty());
         let (s, b) = bed
             .send(
@@ -1002,9 +1004,15 @@ mod tests {
         let events = bed.events_of("f1", "DeploymentFailed").await;
         assert_eq!(
             types(&events),
-            vec!["ImagePulling", "ImagePulled", "DeploymentStarted", "DeploymentFailed"]
+            vec![
+                "ImagePulling",
+                "ImagePulling",
+                "ImagePulled",
+                "DeploymentStarted",
+                "DeploymentFailed"
+            ]
         );
-        let failed = &events[3].data;
+        let failed = &events[4].data;
         assert!(failed["reason"].as_str().unwrap().contains("nobody/none:1b"));
         assert!(failed["fix"].as_str().unwrap().contains("check the name"));
         assert!(
@@ -1074,8 +1082,11 @@ mod tests {
             .await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         let events = bed.events_of("j1", "JobStarted").await;
-        assert_eq!(types(&events), vec!["ImagePulling", "ImagePulled", "JobStarted"]);
-        let started = &events[2].data;
+        assert_eq!(
+            types(&events),
+            vec!["ImagePulling", "ImagePulling", "ImagePulled", "JobStarted"]
+        );
+        let started = &events[3].data;
         assert_eq!(started["device"], "gpu-0");
         let job = started["job"].as_str().unwrap().to_string();
         assert!(job.starts_with("job-"));
@@ -1114,7 +1125,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(
             types(&bed.log_of("j2")),
-            vec!["ImagePulling", "ImagePulled", "JobStarted"],
+            vec!["ImagePulling", "ImagePulling", "ImagePulled", "JobStarted"],
             "no JobFinished for a stop"
         );
         // A device without the memory to place it by is refused, not ignored.
