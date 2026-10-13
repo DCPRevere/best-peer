@@ -40,7 +40,7 @@ variable has a default that fits these two ways; [Run](#run) lists them for a se
 **1. Download and run.** Take the newest release's archive for your machine, unpack it, and start the peer:
 
 ```bash
-curl -LO https://github.com/behavioralstate/best-peer/releases/latest/download/best-peer-x86_64-unknown-linux-gnu.tar.gz
+curl -fLO https://github.com/behavioralstate/best-peer/releases/latest/download/best-peer-x86_64-unknown-linux-gnu.tar.gz
 tar xzf best-peer-x86_64-unknown-linux-gnu.tar.gz
 cd best-peer-x86_64-unknown-linux-gnu
 ./best-peer --version
