@@ -58,19 +58,24 @@ driver, Docker) and the variable that serves without it. `http://127.0.0.1:7777/
 the manifest, the one document an agent needs.
 
 **2. Let someone reach it.** By default the peer listens on loopback, so only clients on the same machine see it.
-For a person elsewhere, listen on every interface and say the address they will reach:
+For a person elsewhere, listen on every interface and say the address they will reach, as `https://`:
 
 ```bash
-BEST_PEER_LISTEN=0.0.0.0:7777 BEST_PEER_ENDPOINT=http://<address they reach>:7777 ./best-peer
+BEST_PEER_LISTEN=0.0.0.0:7777 BEST_PEER_ENDPOINT=https://<address they reach>:7777 ./best-peer
 ```
 
-There is no TLS and no relay in the peer, so across the internet that address is a VPN or tunnel (a Tailscale IP, a
-port forward), and the firewall lets in 7777 and nothing else: prompts go through the door too, on that port,
-with the door's credential. The engines' own ports stay on loopback whatever the door listens on. The door is plain
-HTTP, so the credential travels in the clear: across the internet, put TLS in front or use the VPN.
+The peer makes itself a certificate at first start, keeps it in its data folder and names the file in the line
+`https with a certificate this peer made`: send that file to the person connecting, and their client trusts it
+(`NODE_EXTRA_CA_CERTS=<file>` for a Node client, `SSL_CERT_FILE=<file>` for a Python one, `--cacert <file>` for
+curl). A certificate of your own, from your CA or a public one for a name you hold, is
+`BEST_PEER_TLS_CERT=<chain.pem> BEST_PEER_TLS_KEY=<key.pem>`; the peer checks nothing about it beyond that it
+loads. An `http://` endpoint still works, with a warning at start: the credential then travels in the clear, so keep
+that to a VPN. There is no relay in the peer, so across the internet the address is one you make reachable (a static
+IP with a port forward, a Tailscale IP), and the firewall lets in 7777 and nothing else: prompts go through the door
+too, on that port, with the door's credential. The engines' own ports stay on loopback whatever the door listens on.
 
 **3. Admit the agent.** The person connecting says to their client "sign me in `<name>`, start from
-`http://<address>:7777/.well-known/best`"; their client shows them a code like `8BB9-CB44`, and they send it to you.
+`https://<address>:7777/.well-known/best`"; their client shows them a code like `8BB9-CB44`, and they send it to you.
 At your machine:
 
 ```bash
@@ -121,8 +126,13 @@ and a build provenance attestation (`gh attestation verify <archive> --repo beha
 `best-peer --version` says which it is.
 
 `BEST_PEER_LISTEN` (default `127.0.0.1:7777`) is where it listens; `BEST_PEER_ENDPOINT` is the consumer-facing base URL
-the manifest advertises, required when the peer listens on every interface. `BEST_PEER_DATA` (default `~/.best-peer`)
-holds the event log, the credentials as hashes, and the admin token.
+the manifest advertises, required when the peer listens on every interface. An `https://` endpoint is served by the
+peer itself, with rustls: `BEST_PEER_TLS_CERT` and `BEST_PEER_TLS_KEY` name the operator's certificate chain and
+private key (PEM files, checked for nothing beyond loading); without them the peer makes a certificate at first
+start, `tls/cert.pem` under its data folder, named at start for clients to pin. `BEST_PEER_DATA` (default
+`~/.best-peer`) holds the event log, the credentials as hashes, the admin token, that certificate, and the record of
+where the door is that `best-peer approve` reads, so it reaches the peer over the same TLS, pinned to that
+certificate and no other.
 
 `BEST_PEER_GPU` (default `nvml`) is how the peer sees the hardware: through the NVIDIA driver's own library, every
 card with its memory, temperature, power, utilisation and the CUDA version the driver offers, read live at every

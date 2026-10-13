@@ -36,18 +36,24 @@ jobs:
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:7777/.well-known/best >/dev/null && break; sleep 1; done
           npx -y @behavioralstate/best-validate@0.4.2 http://127.0.0.1:7777
 
-      # Then as an admitted agent: the device flow, approval with this machine's admin token through the real
-      # `best-peer approve`, the credential redeemed, and the validator probing every active capability with it.
-      # Nothing here prints the credential.
-      - name: best-validate, signed in, with the registration probe
+      # Then as an admitted agent, over https: a second peer with an https endpoint and no certificate given makes
+      # its own, and every call here is pinned to that file (curl --cacert, the validator through NODE_EXTRA_CA_CERTS):
+      # the device flow, approval with this machine's admin token through the real `best-peer approve`, the credential
+      # redeemed, and the validator probing every active capability with it. Nothing here prints the credential.
+      - name: best-validate, signed in over https, with the registration probe
         run: |
           set -euo pipefail
-          base=http://127.0.0.1:7777
-          device=$(curl -sf -X POST "$base/auth/device" -d client_id=ci -d connection=ci-peer -d agent_label=ci)
+          data="$(mktemp -d)"
+          base=https://127.0.0.1:7778
+          cert="$data/tls/cert.pem"
+          BEST_PEER_DATA="$data" BEST_PEER_LISTEN=127.0.0.1:7778 BEST_PEER_ENDPOINT="$base" ./target/release/best-peer &
+          for i in $(seq 1 30); do curl -sf --cacert "$cert" "$base/.well-known/best" >/dev/null 2>&1 && break; sleep 1; done
+          device=$(curl -sf --cacert "$cert" -X POST "$base/auth/device" -d client_id=ci -d connection=ci-peer -d agent_label=ci)
           user_code=$(echo "$device" | python3 -c 'import json,sys; print(json.load(sys.stdin)["user_code"])')
           device_code=$(echo "$device" | python3 -c 'import json,sys; print(json.load(sys.stdin)["device_code"])')
-          ./target/release/best-peer approve "$user_code"
-          token=$(curl -sf -X POST "$base/auth/token" -d grant_type=urn:ietf:params:oauth:grant-type:device_code -d "device_code=$device_code" -d client_id=ci)
+          echo "$device" | python3 -c 'import json,sys; assert json.load(sys.stdin)["verification_uri"].startswith("https://"), "the verification URI is not https"'
+          BEST_PEER_DATA="$data" ./target/release/best-peer approve "$user_code"
+          token=$(curl -sf --cacert "$cert" -X POST "$base/auth/token" -d grant_type=urn:ietf:params:oauth:grant-type:device_code -d "device_code=$device_code" -d client_id=ci)
           key=$(echo "$token" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
           echo "$token" | python3 -c 'import json,sys; t=json.load(sys.stdin); assert t["name"]=="ci-peer" and t["auth_header"]=="X-Api-Key" and t["note"].startswith("The credential is a secret."), "the token answer lacks a BEST member"'
-          npx -y @behavioralstate/best-validate@0.4.2 "$base" --api-key "$key" --auth-type apikey --auth-header X-Api-Key --probe-registration
+          NODE_EXTRA_CA_CERTS="$cert" npx -y @behavioralstate/best-validate@0.4.2 "$base" --api-key "$key" --auth-type apikey --auth-header X-Api-Key --probe-registration

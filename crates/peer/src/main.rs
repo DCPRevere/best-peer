@@ -12,6 +12,7 @@ mod domain;
 mod endpoint;
 mod lifecycle;
 mod state;
+mod tls;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,26 +24,40 @@ use best_peer_engine::Engine;
 use best_peer_gpu::Gpu;
 use best_peer_runtime::Runtime;
 use lifecycle::{Images, Patience, Peer};
+use tls::Tls;
 
-/// Where to listen and what to advertise, from `BEST_PEER_LISTEN` (ip:port, default loopback) and
-/// `BEST_PEER_ENDPOINT` (the consumer-facing base URL). The endpoint defaults to the listen address only when that
-/// address is one a consumer can use: a peer listening on every interface has no address of its own to advertise,
-/// so it refuses to start until told what it is called.
-pub fn config(listen: Option<&str>, endpoint: Option<&str>) -> Result<(SocketAddr, String), String> {
+/// Where to listen, what to advertise and whether TLS serves it, from `BEST_PEER_LISTEN` (ip:port, default
+/// loopback), `BEST_PEER_ENDPOINT` (the consumer-facing base URL) and `BEST_PEER_TLS_CERT` with `BEST_PEER_TLS_KEY`
+/// (the operator's certificate; an `https://` endpoint without them is served with one the peer makes). The endpoint
+/// defaults to the listen address only when that address is one a consumer can use: a peer listening on every
+/// interface has no address of its own to advertise, so it refuses to start until told what it is called.
+pub fn config(
+    listen: Option<&str>,
+    endpoint: Option<&str>,
+    cert: Option<&str>,
+    key: Option<&str>,
+) -> Result<(SocketAddr, String, Tls), String> {
     let listen_text = listen.unwrap_or("127.0.0.1:7777");
     let listen: SocketAddr = listen_text
         .parse()
         .map_err(|_| format!("BEST_PEER_LISTEN must be ip:port, not {listen_text:?}"))?;
     let endpoint = match endpoint {
-        Some(e) => e.trim_end_matches('/').to_string(),
+        Some(e) if e.starts_with("http://") || e.starts_with("https://") => e.trim_end_matches('/').to_string(),
+        Some(e) => {
+            return Err(format!(
+                "BEST_PEER_ENDPOINT must be a base URL, http:// or https://, not {e:?}"
+            ))
+        }
         None if listen.ip().is_unspecified() => {
             return Err(format!(
                 "BEST_PEER_LISTEN is {listen}, an address no consumer can reach: set BEST_PEER_ENDPOINT to the URL this peer is reached at"
             ))
         }
+        None if cert.is_some() => format!("https://{listen}"),
         None => format!("http://{listen}"),
     };
-    Ok((listen, endpoint))
+    let tls = Tls::decide(&endpoint, cert, key)?;
+    Ok((listen, endpoint, tls))
 }
 
 /// The peer's data directory: `BEST_PEER_DATA`, else `.best-peer` in the home directory. Never a relative path:
@@ -187,9 +202,11 @@ async fn serve() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-    let (listen, endpoint) = match config(
+    let (listen, endpoint, tls) = match config(
         std::env::var("BEST_PEER_LISTEN").ok().as_deref(),
         std::env::var("BEST_PEER_ENDPOINT").ok().as_deref(),
+        std::env::var("BEST_PEER_TLS_CERT").ok().as_deref(),
+        std::env::var("BEST_PEER_TLS_KEY").ok().as_deref(),
     ) {
         Ok(c) => c,
         Err(why) => {
@@ -236,25 +253,60 @@ async fn serve() {
     let door = Arc::new(door(&endpoint, peer.clone(), auth.clone()));
     // What the last run accepted and never completed is run now, before anyone can send more.
     best_peer_door::resume(&door).await;
-    let listener = tokio::net::TcpListener::bind(listen)
-        .await
+    let serving = tls::serving(&tls, &dir, &tls::names_for(&endpoint, &listen)).unwrap_or_else(|why| fail(&why));
+    let listener = std::net::TcpListener::bind(listen)
+        .and_then(|l| l.set_nonblocking(true).map(|()| l))
         .unwrap_or_else(|e| fail(&format!("cannot listen on {listen}: {e}")));
-    if door.endpoint.starts_with("http://") && !listen.ip().is_loopback() {
-        tracing::warn!(endpoint = %door.endpoint, "the endpoint is cleartext and not loopback: credentials will travel unencrypted; put TLS in front before anyone but you uses it");
+    // Where the door is and what it serves, for `best-peer approve` on this machine.
+    tls::Record {
+        listen,
+        endpoint: door.endpoint.clone(),
+        certificate: serving.as_ref().map(|(_, cert)| cert.clone()),
+    }
+    .write(&dir)
+    .unwrap_or_else(|e| fail(&format!("cannot record the door in {}: {e}", dir.display())));
+    match &serving {
+        Some((_, cert)) if tls == Tls::Own => {
+            tracing::info!(certificate = %cert.display(), "https with a certificate this peer made: a client that pins it reads this file")
+        }
+        Some((_, cert)) => tracing::info!(certificate = %cert.display(), "https with the operator's certificate"),
+        None if !listen.ip().is_loopback() => {
+            tracing::warn!(endpoint = %door.endpoint, "the endpoint is cleartext and not loopback: credentials will travel unencrypted; make BEST_PEER_ENDPOINT https:// before anyone but you uses it")
+        }
+        None => {}
     }
     tracing::info!(%listen, endpoint = %door.endpoint, data = %dir.display(), "best-peer is serving its door");
     let app = best_peer_door::router(door).merge(endpoint::router(peer, auth));
-    let server = axum::serve(listener, app).with_graceful_shutdown(async {
-        tokio::signal::ctrl_c().await.ok();
-    });
+    let handle = axum_server::Handle::new();
     // An open event stream never ends by itself, so a graceful stop would wait for it forever: a few seconds, then out.
-    let deadline = async {
+    let stop = handle.clone();
+    tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
-        tokio::time::sleep(Duration::from_secs(3)).await;
-    };
-    tokio::select! {
-        r = server => r.unwrap_or_else(|e| fail(&format!("serving failed: {e}"))),
-        _ = deadline => tracing::info!("stopping with event streams still open"),
+        tracing::info!("stopping: open connections have three seconds");
+        stop.graceful_shutdown(Some(Duration::from_secs(3)));
+    });
+    serve_on(listener, app, serving.map(|(config, _)| config), handle)
+        .await
+        .unwrap_or_else(|e| fail(&format!("serving failed: {e}")));
+}
+
+/// Serves `app` on `listener`, over TLS when a configuration is given, until `handle` says to stop.
+async fn serve_on(
+    listener: std::net::TcpListener,
+    app: axum::Router,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    handle: axum_server::Handle<SocketAddr>,
+) -> std::io::Result<()> {
+    let service = app.into_make_service();
+    match tls {
+        Some(config) => {
+            let config = axum_server::tls_rustls::RustlsConfig::from_config(config);
+            axum_server::from_tcp_rustls(listener, config)?
+                .handle(handle)
+                .serve(service)
+                .await
+        }
+        None => axum_server::from_tcp(listener)?.handle(handle).serve(service).await,
     }
 }
 
@@ -282,7 +334,8 @@ fn parse_memory(text: &str) -> Result<u64, String> {
 }
 
 /// `best-peer approve <code>`: presents this machine's admin token to the peer running on it, for the code the
-/// person was shown. The token goes to the listen address only, never to the public endpoint.
+/// person was shown. The token goes to the listen address only, never to the public endpoint, and over TLS to the
+/// certificate the peer serves and no other, when it serves one.
 fn approve(args: &[String]) {
     const USAGE: &str = "usage: best-peer approve <code> [--may read,deploy,jobs | all] [--memory 40G]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said)";
     let Some(code) = args.first() else { fail(USAGE) };
@@ -315,8 +368,14 @@ fn approve(args: &[String]) {
                 dir.display()
             ))
         });
-    let listen = std::env::var("BEST_PEER_LISTEN").unwrap_or_else(|_| "127.0.0.1:7777".into());
-    let url = format!("http://{listen}/auth/approve");
+    // Where the running peer is and what it serves, as it recorded at start.
+    let record = tls::Record::read(&dir).unwrap_or_else(|e| {
+        fail(&format!(
+            "no record of a running peer in {}: is the peer running on this machine with the same BEST_PEER_DATA? ({e})",
+            dir.display()
+        ))
+    });
+    let addr = record.dial();
     let mut form: Vec<(&str, String)> = vec![("user_code", code.clone()), ("proof", token)];
     if let Some(m) = &may {
         form.push(("may", m.clone()));
@@ -324,53 +383,51 @@ fn approve(args: &[String]) {
     if let Some(b) = memory {
         form.push(("memory_bytes", b.to_string()));
     }
+    let body = serde_urlencoded::to_string(&form).unwrap_or_else(|e| fail(&format!("cannot encode the request: {e}")));
+    let req = axum::http::Request::post("/auth/approve")
+        .header(axum::http::header::HOST, addr.to_string())
+        .header(axum::http::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|e| fail(&format!("cannot make the request: {e}")));
     // The door's answer is read whatever its status: a refusal says why, in its body, and that is what the person
     // at the machine needs to see (a scope the door does not have, a code that expired).
-    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
-    match agent.post(&url).send_form(form.iter().map(|(k, v)| (*k, v.as_str()))) {
-        Ok(mut res) => {
-            let status = res.status().as_u16();
-            let answer: serde_json::Value = res
-                .body_mut()
-                .read_to_string()
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-            match status {
-                200 => {}
-                403 => fail(&format!(
-                    "the peer refused the admin token in {}: it is not the token of the peer listening on {listen}",
-                    dir.display()
-                )),
-                _ => fail(&format!(
-                    "the peer refused ({status}): {}",
-                    answer["error_description"]
-                        .as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("is {code} a live code shown by an agent in the last ten minutes?"))
-                )),
-            }
-            let a = &answer["admitted"];
-            let who = match a["agent_label"].as_str() {
-                Some(l) => format!("{l} ({})", a["client_id"].as_str().unwrap_or("?")),
-                None => a["client_id"].as_str().unwrap_or("?").to_string(),
-            };
-            let may = match a["grant"]["scopes"].as_array() {
-                Some(s) => s.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","),
-                None => "all".into(),
-            };
-            let share = match a["grant"]["memory_bytes"].as_u64() {
-                Some(b) => format!("{b} bytes of device memory at most"),
-                None => "no share set".into(),
-            };
-            println!(
-                "admitted {who} as connection {} with a {} credential that may {may}, {share}: the agent's next poll gets it",
-                a["connection"].as_str().unwrap_or("(the host's name)"),
-                a["lifetime"].as_str().unwrap_or("durable")
-            );
-        }
-        Err(e) => fail(&format!("cannot reach the peer at {url}: {e}")),
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| fail(&format!("cannot start: {e}")));
+    let (status, answer) = runtime
+        .block_on(tls::call(addr, record.certificate.as_deref(), req))
+        .unwrap_or_else(|why| fail(&why));
+    match status.as_u16() {
+        200 => {}
+        403 => fail(&format!(
+            "the peer refused the admin token in {}: it is not the token of the peer listening on {}",
+            dir.display(),
+            record.listen
+        )),
+        status => fail(&format!(
+            "the peer refused ({status}): {}",
+            answer["error_description"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("is {code} a live code shown by an agent in the last ten minutes?"))
+        )),
     }
+    let a = &answer["admitted"];
+    let who = match a["agent_label"].as_str() {
+        Some(l) => format!("{l} ({})", a["client_id"].as_str().unwrap_or("?")),
+        None => a["client_id"].as_str().unwrap_or("?").to_string(),
+    };
+    let may = match a["grant"]["scopes"].as_array() {
+        Some(s) => s.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","),
+        None => "all".into(),
+    };
+    let share = match a["grant"]["memory_bytes"].as_u64() {
+        Some(b) => format!("{b} bytes of device memory at most"),
+        None => "no share set".into(),
+    };
+    println!(
+        "admitted {who} as connection {} with a {} credential that may {may}, {share}: the agent's next poll gets it",
+        a["connection"].as_str().unwrap_or("(the host's name)"),
+        a["lifetime"].as_str().unwrap_or("durable")
+    );
 }
 
 fn fail(why: &str) -> ! {
@@ -641,18 +698,120 @@ mod tests {
 
     #[test]
     fn the_endpoint_defaults_to_the_listen_address_only_when_a_consumer_can_reach_it() {
-        let (listen, endpoint) = config(None, None).unwrap();
+        let (listen, endpoint, tls) = config(None, None, None, None).unwrap();
         assert_eq!(listen.to_string(), "127.0.0.1:7777");
         assert_eq!(endpoint, "http://127.0.0.1:7777");
-        let (_, endpoint) = config(Some("0.0.0.0:7777"), Some("https://peer.example.com/")).unwrap();
+        assert_eq!(tls, Tls::Off);
+        let (_, endpoint, tls) = config(Some("0.0.0.0:7777"), Some("https://peer.example.com/"), None, None).unwrap();
         assert_eq!(endpoint, "https://peer.example.com");
-        assert!(config(Some("0.0.0.0:7777"), None)
+        assert_eq!(tls, Tls::Own);
+        assert!(config(Some("0.0.0.0:7777"), None, None, None)
             .unwrap_err()
             .contains("BEST_PEER_ENDPOINT"));
-        assert!(config(Some("[::]:7777"), None)
+        assert!(config(Some("[::]:7777"), None, None, None)
             .unwrap_err()
             .contains("BEST_PEER_ENDPOINT"));
-        assert!(config(Some("localhost:7777"), None).unwrap_err().contains("ip:port"));
+        assert!(config(Some("localhost:7777"), None, None, None)
+            .unwrap_err()
+            .contains("ip:port"));
+        assert!(config(None, Some("peer.example.com"), None, None)
+            .unwrap_err()
+            .contains("https://"));
+    }
+
+    #[test]
+    fn a_certificate_makes_the_default_endpoint_https() {
+        let (_, endpoint, tls) = config(None, None, Some("c.pem"), Some("k.pem")).unwrap();
+        assert_eq!(endpoint, "https://127.0.0.1:7777");
+        assert!(matches!(tls, Tls::Given { .. }));
+        let why = config(None, Some("http://127.0.0.1:7777"), Some("c.pem"), Some("k.pem")).unwrap_err();
+        assert!(why.contains("https://"), "{why}");
+    }
+
+    /// The door served over https from a loopback port, with the certificate the peer makes for itself: the manifest
+    /// names https everywhere, `approve` reaches it pinned to that certificate, and any other certificate is refused.
+    #[tokio::test]
+    async fn the_door_serves_https_with_its_own_certificate_and_approve_pins_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listen = listener.local_addr().unwrap();
+        let endpoint = format!("https://{listen}");
+        let (config, cert) = tls::serving(&Tls::Own, dir.path(), &tls::names_for(&endpoint, &listen))
+            .unwrap()
+            .unwrap();
+        let peer = peer(
+            &endpoint,
+            "engines.local",
+            card(),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+            Arc::new(best_peer_engine::Fake::new()),
+            Arc::new(EventLog::ephemeral()),
+            Images::default(),
+            Patience::default(),
+        )
+        .await;
+        let auth = Arc::new(Auth::ephemeral(
+            &endpoint,
+            Box::new(FakeApprover { proof: "ok".into() }),
+        ));
+        let door = Arc::new(super::door(&endpoint, peer.clone(), auth.clone()));
+        let app = best_peer_door::router(door).merge(endpoint::router(peer, auth));
+        let handle = axum_server::Handle::new();
+        tokio::spawn(serve_on(listener, app, Some(config), handle.clone()));
+        handle.listening().await;
+
+        let get = |path: &str| {
+            Request::get(path)
+                .header(header::HOST, listen.to_string())
+                .body(Body::empty())
+                .unwrap()
+        };
+        let (status, manifest) = tls::call(listen, Some(&cert), get("/.well-known/best")).await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let auth_block = &manifest["best"]["authentication"];
+        assert_eq!(auth_block["deviceAuthorizationUrl"], format!("{endpoint}/auth/device"));
+        assert_eq!(auth_block["tokenUrl"], format!("{endpoint}/auth/token"));
+        assert_eq!(manifest["best"]["services"][SERVICE]["http"]["endpoint"], endpoint);
+
+        // The operator's side, as `best-peer approve` does it: the device flow's code approved over the pinned link.
+        let form = |path: &str, pairs: &[(&str, &str)]| {
+            Request::post(path)
+                .header(header::HOST, listen.to_string())
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(serde_urlencoded::to_string(pairs).unwrap()))
+                .unwrap()
+        };
+        let (status, asked) = tls::call(
+            listen,
+            Some(&cert),
+            form("/auth/device", &[("client_id", "agent"), ("connection", "box")]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK, "{asked}");
+        assert!(asked["verification_uri"].as_str().unwrap().starts_with("https://"));
+        let code = asked["user_code"].as_str().unwrap();
+        let (status, admitted) = tls::call(
+            listen,
+            Some(&cert),
+            form("/auth/approve", &[("user_code", code), ("proof", "ok")]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK, "{admitted}");
+        assert_eq!(admitted["admitted"]["client_id"], "agent");
+
+        // Another certificate, even one made the same way, is not the peer's.
+        let other = tempfile::tempdir().unwrap();
+        let (_, other_cert) = tls::serving(&Tls::Own, other.path(), &tls::names_for(&endpoint, &listen))
+            .unwrap()
+            .unwrap();
+        let why = tls::call(listen, Some(&other_cert), get("/.well-known/best"))
+            .await
+            .unwrap_err();
+        assert!(why.contains("does not serve the certificate"), "{why}");
+        handle.shutdown();
     }
 
     #[tokio::test]
