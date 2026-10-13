@@ -66,6 +66,7 @@ jobs:
           data_a="$(mktemp -d)"; data_b="$(mktemp -d)"
           BEST_PEER_DATA="$data_a" BEST_PEER_LISTEN=127.0.0.1:7781 BEST_PEER_ENDPOINT=http://127.0.0.1:7781 ./target/release/best-peer &
           BEST_PEER_DATA="$data_b" BEST_PEER_LISTEN=127.0.0.1:7782 BEST_PEER_ENDPOINT=http://127.0.0.1:7782 ./target/release/best-peer &
+          for p in 7781 7782; do for i in $(seq 1 30); do curl -sf http://127.0.0.1:$p/.well-known/best >/dev/null && break; sleep 1; done; done
           cloud="$(mktemp -d)"
           BEST_PEER_DATA="$cloud" BEST_PEER_LISTEN=127.0.0.1:7783 BEST_PEER_ENDPOINT=http://127.0.0.1:7783 BEST_PEER_MEMBERS="a=http://127.0.0.1:7781,b=http://127.0.0.1:7782" ./target/release/best-peer > "$cloud/log" 2>&1 &
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:7783/.well-known/best >/dev/null && break; sleep 1; done

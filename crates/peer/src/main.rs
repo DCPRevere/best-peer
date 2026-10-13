@@ -1056,6 +1056,72 @@ mod tests {
         let events = c.events_of("d4", "DeploymentReady").await;
         assert_eq!(events[3].data["peer"], "b");
 
+        // A credential approved for deploy alone, with a share: the cloud names it as the holder of what it
+        // deploys, so it sees, prompts and ends its own, and its share is counted.
+        let team = key_with(&c.app, Some("deploy"), Some(4 * GB)).await;
+        let as_team = |id: &str, gb: u64| {
+            Request::post("/commands")
+                .header("X-Api-Key", &team)
+                .header(header::CONTENT_TYPE, "application/cloudevents+json")
+                .body(Body::from(
+                    json!({
+                        "specversion": "1.0", "id": id, "source": "https://agent.test", "type": "DeployModel",
+                        "datacontenttype": "application/json", "dataschema": format!("{CLOUD_EP}/commands/deploy-model/1.0"),
+                        "time": "2026-10-13T10:30:00Z", "data": { "model": "llama3.2:3b", "engine": "ollama", "memory_bytes": gb * GB, "device": "b/gpu-0" }
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let res = c.app.clone().oneshot(as_team("t1", 2)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let events = c.events_of("t1", "DeploymentReady").await;
+        let team_dep = events[3].data["deployment"].as_str().unwrap().to_string();
+        let seen = c
+            .app
+            .clone()
+            .oneshot(
+                Request::get("/queries/get-workloads")
+                    .header("X-Api-Key", &team)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let w = body(seen).await;
+        let own: Vec<&str> = w["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["deployment"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            own,
+            [team_dep.as_str()],
+            "the team sees its own deployment and no other"
+        );
+        assert_eq!(w["held_bytes"], 2 * GB);
+        let res = c.app.clone().oneshot(as_team("t2", 3)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body(res).await["error"]["code"], "SHARE_EXCEEDED");
+        let res = c
+            .app
+            .clone()
+            .oneshot(
+                Request::post(format!("/deployments/{team_dep}/v1/chat/completions"))
+                    .header("X-Api-Key", &team)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            res.status(),
+            StatusCode::BAD_REQUEST,
+            "the team's own endpoint opens to it"
+        );
+
         // An undeploy through the cloud ends it on the member, and the cloud's stream says so.
         let (s, b) = c
             .send("u1", "UndeployModel", "undeploy-model", json!({ "deployment": dep }))
@@ -1064,7 +1130,7 @@ mod tests {
         let events = c.events_of("u1", "Undeployed").await;
         assert_eq!(events.last().unwrap().data["peer"], "a");
         let w = c.query("get-workloads").await;
-        assert_eq!(w["deployments"].as_array().unwrap().len(), 2);
+        assert_eq!(w["deployments"].as_array().unwrap().len(), 3);
         assert!(c.members[0].query("get-workloads").await["deployments"]
             .as_array()
             .unwrap()
@@ -1079,17 +1145,16 @@ mod tests {
         assert_eq!(s, StatusCode::CREATED, "{b}");
         let events = c.events_of("d1", "DeploymentReady").await;
         let dep = events[3].data["deployment"].as_str().unwrap().to_string();
-        assert_eq!(
-            types(&c.log_of("peer-a")),
-            vec!["PeerJoined"],
-            "the first answer is a fact too"
+        assert!(
+            c.log_of("peer-a").is_empty(),
+            "membership is the reconcile tick's to tell, not a read's"
         );
 
         c.down[0].store(true, std::sync::atomic::Ordering::SeqCst);
         c.cloud.reconcile().await;
         let lost = c.log_of("peer-a");
-        assert_eq!(types(&lost), vec!["PeerJoined", "PeerLost"], "{lost:#?}");
-        assert!(lost[1].data["reason"].as_str().unwrap().contains("connection refused"));
+        assert_eq!(types(&lost), vec!["PeerLost"], "{lost:#?}");
+        assert!(lost[0].data["reason"].as_str().unwrap().contains("connection refused"));
         let events = c.events_of("d1", "DeploymentEnded").await;
         let ended = &events.last().unwrap().data;
         assert_eq!(ended["deployment"], dep);
@@ -1125,10 +1190,10 @@ mod tests {
         let events = c.events_of("peer-a", "Undeployed").await;
         assert_eq!(
             types(&events),
-            vec!["PeerJoined", "PeerLost", "PeerJoined", "Undeployed"],
+            vec!["PeerLost", "PeerJoined", "Undeployed"],
             "{events:#?}"
         );
-        assert_eq!(events[3].data["deployment"], dep);
+        assert_eq!(events[2].data["deployment"], dep);
         assert!(c.members[0].query("get-workloads").await["deployments"]
             .as_array()
             .unwrap()

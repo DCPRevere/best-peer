@@ -284,6 +284,15 @@ impl EventLog {
         write_line(&self.accepted_file, &line, "bound command");
     }
 
+    /// The workload `sender`'s command `id` made, when it bound one: what a restart finds already running.
+    pub fn workload_of(&self, sender: &str, id: &str) -> Option<String> {
+        self.accepted
+            .lock()
+            .unwrap()
+            .get(&(sender.to_string(), id.to_string()))
+            .and_then(|a| a.workload.clone())
+    }
+
     /// The stored hash of `sender`'s command `id`, for a restart to check the stored envelope against.
     pub fn hash_of(&self, sender: &str, id: &str) -> Option<String> {
         self.accepted

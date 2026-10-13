@@ -1,17 +1,22 @@
 //! A member of the cloud this peer fronts: another peer's door, reached through the transport with the credential
 //! that door issued to this peer by its own sign-in. Everything here is the BEST surface as a consumer uses it (the
-//! manifest, queries, commands, the event stream, the inference endpoint): the cloud is an agent to its members.
+//! manifest, queries, commands, the event stream): the cloud is an agent to its members. Every call has a deadline,
+//! so a member that neither answers nor refuses is unreachable, never a stall.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{header, Method, Request, Response, StatusCode};
+use axum::http::{header, Method, Request, StatusCode};
 use best_peer_door::auth::AUTH_HEADER;
 use best_peer_door::{BestError, Envelope};
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 
 use crate::transport::Transport;
+
+/// How long a member has to answer a query or a command before it counts as unreachable.
+pub const ANSWER_WITHIN: Duration = Duration::from_secs(15);
 
 /// Why a member did not do what was asked: it could not be reached, or it refused, with its answer.
 #[derive(Debug)]
@@ -41,12 +46,30 @@ impl Refusal {
             }
         }
     }
+
+    /// The member no longer honours the credential this peer holds for it.
+    pub fn is_unauthorized(&self) -> bool {
+        matches!(self, Refusal::Refused { status, .. } if *status == StatusCode::UNAUTHORIZED)
+    }
+
+    pub fn text(&self) -> String {
+        match self {
+            Refusal::Unreachable(why) => why.clone(),
+            Refusal::Refused { status, body } => {
+                format!("{status}: {}", body["error"]["message"].as_str().unwrap_or("refused"))
+            }
+        }
+    }
 }
 
 pub struct Member {
     pub name: String,
+    /// Where this peer reaches the member: what the operator listed.
     pub endpoint: String,
     key: Mutex<Option<String>>,
+    /// What the member calls itself, from its manifest: what its schema URIs are built on, which may differ from
+    /// where it is reached.
+    own_endpoint: Mutex<Option<String>>,
     pub transport: Arc<dyn Transport>,
 }
 
@@ -56,6 +79,7 @@ impl Member {
             name: name.into(),
             endpoint: endpoint.trim_end_matches('/').into(),
             key: Mutex::new(key),
+            own_endpoint: Mutex::new(None),
             transport,
         }
     }
@@ -66,6 +90,11 @@ impl Member {
 
     pub fn set_key(&self, key: String) {
         *self.key.lock().unwrap() = Some(key);
+    }
+
+    /// Forgets a credential the member no longer honours, so the sign-in runs again.
+    pub fn clear_key(&self) {
+        *self.key.lock().unwrap() = None;
     }
 
     /// Admitted by this member: it issued the credential this peer holds for it.
@@ -89,17 +118,22 @@ impl Member {
     }
 
     async fn exchange(&self, req: Request<Body>) -> Result<Value, Refusal> {
-        let res = self.transport.call(req).await.map_err(Refusal::Unreachable)?;
-        let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), 8 << 20)
+        let answer = async {
+            let res = self.transport.call(req).await.map_err(Refusal::Unreachable)?;
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), 8 << 20)
+                .await
+                .map_err(|e| Refusal::Unreachable(format!("the answer could not be read: {e}")))?;
+            let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            if status.is_success() {
+                Ok(body)
+            } else {
+                Err(Refusal::Refused { status, body })
+            }
+        };
+        tokio::time::timeout(ANSWER_WITHIN, answer)
             .await
-            .map_err(|e| Refusal::Unreachable(format!("the answer could not be read: {e}")))?;
-        let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
-        if status.is_success() {
-            Ok(body)
-        } else {
-            Err(Refusal::Refused { status, body })
-        }
+            .unwrap_or_else(|_| Err(Refusal::Unreachable(format!("no answer within {ANSWER_WITHIN:?}"))))
     }
 
     pub async fn get(&self, path: &str) -> Result<Value, Refusal> {
@@ -109,6 +143,29 @@ impl Member {
     /// A query of the member, with this peer's credential.
     pub async fn query(&self, schema: &str) -> Result<Value, Refusal> {
         self.get(&format!("/queries/{schema}")).await
+    }
+
+    /// The base the member builds its schema URIs on: its own endpoint, read once from its manifest, and where it is
+    /// reached until the manifest has been read.
+    pub async fn schema_base(&self) -> String {
+        if let Some(e) = self.own_endpoint.lock().unwrap().clone() {
+            return e;
+        }
+        let Ok(manifest) = self.get("/.well-known/best").await else {
+            return self.endpoint.clone();
+        };
+        let own = manifest["best"]["services"]
+            .as_object()
+            .and_then(|s| s.values().next())
+            .and_then(|s| s["http"]["endpoint"].as_str())
+            .map(|e| e.trim_end_matches('/').to_string());
+        match own {
+            Some(e) => {
+                *self.own_endpoint.lock().unwrap() = Some(e.clone());
+                e
+            }
+            None => self.endpoint.clone(),
+        }
     }
 
     /// A command sent to the member, as the envelope is; its `created` answer, or the refusal.
@@ -142,7 +199,10 @@ impl Member {
                 req.headers_mut().insert("last-event-id", v);
             }
         }
-        let res = self.transport.call(req).await.map_err(Refusal::Unreachable)?;
+        let res = tokio::time::timeout(ANSWER_WITHIN, self.transport.call(req))
+            .await
+            .unwrap_or_else(|_| Err(format!("no answer within {ANSWER_WITHIN:?}")))
+            .map_err(Refusal::Unreachable)?;
         if !res.status().is_success() {
             let status = res.status();
             let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap_or_default();
@@ -153,31 +213,20 @@ impl Member {
         }
         Ok(sse_events(res.into_body()))
     }
-
-    /// A request passed to the member's inference endpoint for `deployment`, with this peer's credential in place
-    /// of the caller's; the answer as it comes.
-    pub async fn forward(&self, mut req: Request<Body>) -> Result<Response<Body>, String> {
-        if let Some(key) = self.key() {
-            req.headers_mut().insert(
-                AUTH_HEADER,
-                key.parse().map_err(|_| "the credential is not a header value")?,
-            );
-        }
-        self.transport.call(req).await
-    }
 }
 
 /// Server-sent events parsed from a body as it streams: the `id` and the `data` of each event, the data as an
-/// envelope. Comments (keep-alives) and events without an envelope are skipped.
+/// envelope. Bytes are kept until an event is complete, so a character split across chunks is read whole. Comments
+/// (keep-alives) and events without an envelope are skipped.
 fn sse_events(body: Body) -> impl Stream<Item = (String, Envelope)> {
-    let mut buffer = String::new();
+    let mut buffer: Vec<u8> = Vec::new();
     body.into_data_stream()
         .take_while(|chunk| futures::future::ready(chunk.is_ok()))
         .flat_map(move |chunk| {
-            buffer.push_str(&String::from_utf8_lossy(&chunk.unwrap_or_default()));
+            buffer.extend_from_slice(&chunk.unwrap_or_default());
             let mut out = Vec::new();
-            while let Some(end) = buffer.find("\n\n") {
-                let block = buffer[..end].to_string();
+            while let Some(end) = buffer.windows(2).position(|w| w == b"\n\n") {
+                let block = String::from_utf8_lossy(&buffer[..end]).into_owned();
                 buffer.drain(..end + 2);
                 let (mut id, mut data) = (None, String::new());
                 for line in block.lines() {
@@ -200,23 +249,32 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn the_stream_is_parsed_event_by_event_across_chunks() {
-        let e1 = serde_json::to_string(&Envelope::event("s", "A", json!({}), None, None)).unwrap();
+    async fn the_stream_is_parsed_event_by_event_across_chunks_and_characters_are_read_whole() {
+        let e1 = serde_json::to_string(&Envelope::event(
+            "s",
+            "A",
+            json!({ "reason": "crème brûlée" }),
+            None,
+            None,
+        ))
+        .unwrap();
         let e2 = serde_json::to_string(&Envelope::event("s", "B", json!({}), None, None)).unwrap();
         let text = format!(": keepalive\n\nid: one\ndata: {e1}\n\nid: two\ndata: {e2}\n\n");
-        let (head, tail) = text.split_at(text.len() / 2);
+        // Cut inside the "û": the two bytes of the character land in different chunks.
+        let cut = text.find('û').unwrap() + 1;
+        let bytes = text.as_bytes();
         let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = vec![
-            Ok(axum::body::Bytes::from(head.to_string())),
-            Ok(axum::body::Bytes::from(tail.to_string())),
+            Ok(axum::body::Bytes::copy_from_slice(&bytes[..cut])),
+            Ok(axum::body::Bytes::copy_from_slice(&bytes[cut..])),
         ];
         let body = Body::from_stream(futures::stream::iter(chunks));
-        let got: Vec<(String, String)> = sse_events(body).map(|(id, e)| (id, e.r#type)).collect().await;
-        assert_eq!(
-            got,
-            [
-                ("one".to_string(), "A".to_string()),
-                ("two".to_string(), "B".to_string())
-            ]
-        );
+        let got: Vec<(String, String, Value)> = sse_events(body)
+            .map(|(id, e)| (id, e.r#type, e.data["reason"].clone()))
+            .collect()
+            .await;
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].0.as_str(), got[0].1.as_str()), ("one", "A"));
+        assert_eq!(got[0].2, "crème brûlée");
+        assert_eq!((got[1].0.as_str(), got[1].1.as_str()), ("two", "B"));
     }
 }

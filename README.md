@@ -160,8 +160,10 @@ endpoint `DeploymentReady` names is on the cloud's door and passes through to th
 credential for it. The cloud signs in to each member by the device flow and logs the code to approve there; the
 credentials and its place on each member's stream live in `members.json` under the data folder. `BEST_PEER_TRUST`
 lists PEM files to trust beyond the public roots, for members serving their own certificates. Every thirty seconds
-the cloud squares its state with its members: one that does not answer is told as `PeerLost` and its workloads as
-ended, and `PeerJoined` when it answers again. `BEST_PEER_GPU` and `BEST_PEER_RUNTIME` are not read on a cloud.
+the cloud squares its state with its members: one that does not answer within fifteen seconds is told as `PeerLost`,
+with its workloads told as ended and its commands in flight failed; `PeerJoined` when it answers again, and what it
+still runs of the cloud's by then is ended there, so the two agree; a workload a member no longer lists at two ticks
+running is told as ended. `BEST_PEER_GPU` and `BEST_PEER_RUNTIME` are not read on a cloud.
 
 `BEST_PEER_GPU` (default `nvml`) is how the peer sees the hardware: through the NVIDIA driver's own library, every
 card with its memory, temperature, power, utilisation and the CUDA version the driver offers, read live at every
