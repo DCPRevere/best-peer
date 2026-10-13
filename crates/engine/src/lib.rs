@@ -34,6 +34,11 @@ impl Kind {
         }
     }
 
+    /// Where the engine serves the OpenAI-compatible API, under its base.
+    pub fn openai_path(self) -> &'static str {
+        "/v1"
+    }
+
     /// What to run to serve `model` on a device offering `compute`. The image may be overridden by the operator
     /// (`image`), for a pinned tag or a mirror; the engine's port and arguments are not negotiable.
     pub fn recipe(self, model: &str, compute: &Compute, image: Option<&str>) -> Recipe {

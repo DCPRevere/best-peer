@@ -316,6 +316,11 @@ impl Peer {
         format!("http://{}:{port}", self.engine_host)
     }
 
+    /// The endpoint a deployment has on this door: under the deployment, at the engine's OpenAI-compatible path.
+    fn door_endpoint(&self, deployment: &str, engine: Kind) -> String {
+        format!("{}/deployments/{deployment}{}", self.endpoint, engine.openai_path())
+    }
+
     /// Where the door passes a prompt for a deployment: its engine's base on this host, while the deployment is
     /// ready. Before that, after an undeploy was accepted, or for a deployment nobody made, the refusal says what to
     /// do.
@@ -503,7 +508,7 @@ impl Peer {
                 self.tell(
                     &em,
                     "DeploymentReady",
-                    json!({ "deployment": id, "model": data.model, "engine": data.engine, "endpoint": format!("{}/deployments/{id}{}", self.endpoint, recipe.openai_path) }),
+                    json!({ "deployment": id, "model": data.model, "engine": data.engine, "endpoint": self.door_endpoint(&id, data.engine) }),
                 );
             }
             Ok(()) => {}
@@ -941,7 +946,9 @@ impl Peer {
             .map(|d| {
                 json!({
                     "deployment": d.id, "model": d.model, "engine": d.engine, "device": d.device.0,
-                    "memory_bytes": d.memory_bytes, "endpoint": d.endpoint,
+                    "memory_bytes": d.memory_bytes,
+                    // Computed, not read back from the log: a deployment made by an earlier peer is on the door too.
+                    "endpoint": d.endpoint.as_ref().map(|_| self.door_endpoint(&d.id, d.engine)),
                     "phase": match d.phase { Phase::Starting => "starting", Phase::Ready => "ready", Phase::Ending => "ending" }
                 })
             })

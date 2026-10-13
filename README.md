@@ -134,8 +134,11 @@ outside any container (an installed Ollama; no jobs), `fake` serves the whole su
 `BEST_PEER_OLLAMA_IMAGE` and `BEST_PEER_VLLM_IMAGE` pin or mirror the engines' images; `BEST_PEER_READY_SECONDS`
 (default 900) is how long an engine may take to answer after its container started, `BEST_PEER_LOAD_SECONDS`
 (default 3600) how long a model may take to load. `BEST_PEER_ENGINE_HOST` (default `127.0.0.1`) is where the peer
-itself reaches the engines' ports, which are bound to loopback whatever the door listens on; the endpoint a
-`DeploymentReady` event names is on the door, under the deployment.
+itself reaches the engines' ports, which are bound there and nowhere else whatever the door listens on: on loopback
+when the container engine is on this host, on that host's interfaces when it is elsewhere, so a container engine
+on another host sits on a network you trust. The endpoint a `DeploymentReady` event names is on the door, under
+the deployment. A deployment made by a peer older than 0.0.4 is served through the door too, but its engine's port
+stays published as that peer bound it until it is undeployed and deployed again.
 
 ## Deploy
 

@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path, Request, State};
-use axum::http::{header, HeaderMap, StatusCode, Uri};
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderMap, HeaderName, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
@@ -23,6 +23,9 @@ use hyper_util::rt::TokioExecutor;
 
 use crate::lifecycle::Peer;
 
+/// Where the endpoints live on the door: `/deployments/<deployment>` and everything under it.
+const PREFIX: &str = "/deployments/";
+
 #[derive(Clone)]
 struct Gateway {
     peer: Arc<Peer>,
@@ -30,41 +33,59 @@ struct Gateway {
     client: Client<HttpConnector, Body>,
 }
 
-/// The route `DeploymentReady` names: everything under `/deployments/{deployment}/` goes to that deployment's engine.
+/// The routes `DeploymentReady` names: the deployment's base and everything under it go to that deployment's
+/// engine, with the path and query as the client sent them.
 pub fn router(peer: Arc<Peer>, auth: Arc<Auth>) -> Router {
     let client = Client::builder(TokioExecutor::new()).build_http();
     Router::new()
+        .route("/deployments/:deployment", any(pass_through))
+        .route("/deployments/:deployment/", any(pass_through))
         .route("/deployments/:deployment/*rest", any(pass_through))
         .with_state(Gateway { peer, auth, client })
 }
 
-async fn pass_through(
-    State(gw): State<Gateway>,
-    Path((deployment, rest)): Path<(String, String)>,
-    req: Request,
-) -> Response {
-    forward(&gw, &deployment, &rest, req)
-        .await
-        .unwrap_or_else(IntoResponse::into_response)
+async fn pass_through(State(gw): State<Gateway>, req: Request) -> Response {
+    forward(&gw, req).await.unwrap_or_else(IntoResponse::into_response)
 }
 
-async fn forward(gw: &Gateway, deployment: &str, rest: &str, req: Request) -> Result<Response, BestError> {
+async fn forward(gw: &Gateway, req: Request) -> Result<Response, BestError> {
     let key = credential(req.headers());
     if key.is_empty() || gw.auth.authenticate(key).is_none() {
         return Err(BestError::unauthorized());
     }
+    // The deployment and the rest are read from the request line as sent, never decoded: what the client encoded
+    // reaches the engine encoded, and `..` or a `?` inside a segment stays inside it.
+    let sent = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".into());
+    let after = sent.strip_prefix(PREFIX).unwrap_or("");
+    let end = after.find(['/', '?']).unwrap_or(after.len());
+    let (deployment, rest) = after.split_at(end);
+    if deployment.is_empty() {
+        return Err(BestError::not_found(
+            "NO_SUCH_DEPLOYMENT",
+            "the endpoint names a deployment: /deployments/<deployment>/v1, as DeploymentReady said",
+        ));
+    }
     let upstream = gw.peer.upstream_of(deployment)?;
-    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
-    let uri: Uri = format!("{upstream}/{rest}{query}")
+    let rest = match rest {
+        "" => "/".to_string(),
+        r if r.starts_with('?') => format!("/{r}"),
+        r => r.to_string(),
+    };
+    let uri: Uri = format!("{upstream}{rest}")
         .parse()
         .map_err(|e| BestError::bad_request("BAD_REQUEST", format!("the path cannot be forwarded: {e}")))?;
     let (mut parts, body) = req.into_parts();
     parts.uri = uri;
-    // The engine gets the request as the client made it, less what is the door's: the host it was sent to and the
-    // credential, which ends here.
+    // The engine gets the request as the client made it, less what is this hop's: the host it was sent to, the
+    // credential, which ends here, and the headers that govern one connection, not the request.
     parts.headers.remove(header::HOST);
     parts.headers.remove(AUTH_HEADER);
     parts.headers.remove(header::AUTHORIZATION);
+    strip_hop_by_hop(&mut parts.headers);
     let res = gw
         .client
         .request(Request::from_parts(parts, body))
@@ -78,7 +99,9 @@ async fn forward(gw: &Gateway, deployment: &str, rest: &str, req: Request) -> Re
                 ),
             )
         })?;
-    Ok(res.map(Body::new))
+    let (mut parts, body) = res.into_parts();
+    strip_hop_by_hop(&mut parts.headers);
+    Ok(Response::from_parts(parts, Body::new(body)))
 }
 
 /// The credential, from the door's own header or the `Authorization: Bearer` the OpenAI-compatible clients send.
@@ -94,7 +117,40 @@ fn credential(headers: &HeaderMap) -> &str {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().strip_prefix("Bearer "))
         .map(str::trim)
+        .filter(|v| v.len() > 7 && v[..7].eq_ignore_ascii_case("bearer "))
+        .map(|v| v[7..].trim())
         .unwrap_or("")
+}
+
+/// Removes what belongs to one connection and not to the request or the answer (RFC 9110 §7.6.1): the headers
+/// `Connection` names, and the hop-by-hop ones by name. Each hop frames its own body and keeps its own
+/// connections; a client's `Connection: close` must not close the door's connection to the engine, nor the
+/// engine's the door's to the client.
+fn strip_hop_by_hop(headers: &mut HeaderMap) {
+    let named: Vec<String> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for name in named {
+        if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
+            headers.remove(name);
+        }
+    }
+    for name in [
+        header::CONNECTION,
+        header::PROXY_AUTHENTICATE,
+        header::PROXY_AUTHORIZATION,
+        header::TE,
+        header::TRAILER,
+        header::TRANSFER_ENCODING,
+        header::UPGRADE,
+    ] {
+        headers.remove(name);
+    }
+    headers.remove("keep-alive");
 }

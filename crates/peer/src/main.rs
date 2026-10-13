@@ -118,6 +118,11 @@ fn main() {
     }
 }
 
+/// Whether a host name or address is this machine's loopback.
+fn is_loopback(host: &str) -> bool {
+    host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 /// The hardware the peer places workloads on, by `BEST_PEER_GPU`: `nvml` (the default) reads the NVIDIA cards
 /// through the driver's own library and refuses to start without it, since a GPU host that cannot see its cards is
 /// misconfigured; `none` says this host has no accelerator, and the CPU with the system memory is the one device.
@@ -203,10 +208,16 @@ async fn serve() {
         EventLog::open(&dir).unwrap_or_else(|e| fail(&format!("cannot keep the event log in {}: {e}", dir.display()))),
     );
     let gpu = accelerator(std::env::var("BEST_PEER_GPU").ok().as_deref()).unwrap_or_else(|why| fail(&why));
-    // The engines' ports are bound to this machine only, whatever the door listens on: a prompt reaches an engine
-    // through the door, with the door's credential.
-    let bind_ip = "127.0.0.1";
+    // The engines' ports are bound where the peer reaches them, whatever the door listens on: a prompt reaches an
+    // engine through the door, with the door's credential. On this machine that is loopback; a container engine on
+    // another host (BEST_PEER_ENGINE_HOST not loopback) publishes them on that host's interfaces, as loopback there
+    // is not here.
     let engine_host = std::env::var("BEST_PEER_ENGINE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let bind_ip = if is_loopback(&engine_host) {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0"
+    };
     let (runtime, engine) = engines(bind_ip, &engine_host).await;
     let images = Images {
         ollama: std::env::var("BEST_PEER_OLLAMA_IMAGE").ok(),
@@ -695,6 +706,7 @@ mod tests {
                 "path": parts.uri.path(),
                 "query": parts.uri.query(),
                 "saw_credential": parts.headers.contains_key("X-Api-Key") || parts.headers.contains_key(header::AUTHORIZATION),
+                "headers": parts.headers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
                 "body": String::from_utf8_lossy(&bytes),
             }))
         });
@@ -753,14 +765,74 @@ mod tests {
         assert_eq!(seen["query"], "stream=true");
         assert_eq!(seen["body"], r#"{"model":"llama3.2:3b","messages":[]}"#);
         assert_eq!(seen["saw_credential"], false, "the credential ends at the door");
-        // The header the OpenAI-compatible clients send.
+        // The header the OpenAI-compatible clients send, in whichever case.
+        for scheme in ["Bearer", "bearer"] {
+            let res = bed
+                .app
+                .clone()
+                .oneshot(prompt(vec![("authorization", format!("{scheme} {}", bed.key))]))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{scheme}");
+        }
+        // What the client encoded reaches the engine encoded, and what governs one connection stops at the hop.
         let res = bed
             .app
             .clone()
-            .oneshot(prompt(vec![("authorization", format!("Bearer {}", bed.key))]))
+            .oneshot(
+                Request::get(format!("/deployments/{dep}/v1/a%20b/models%3Ffoo=bar"))
+                    .header("X-Api-Key", &bed.key)
+                    .header("connection", "close, x-secret")
+                    .header("x-secret", "s")
+                    .header("te", "trailers")
+                    .header("x-request-id", "r1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+        let seen = body(res).await;
+        assert_eq!(seen["path"], "/v1/a%20b/models%3Ffoo=bar");
+        assert_eq!(seen["query"], Value::Null);
+        let names: Vec<&str> = seen["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"x-request-id"), "{names:?}");
+        // Host is the engine's, set by the door's own client, not the door's as the client sent it.
+        for gone in ["connection", "x-secret", "te", "x-api-key"] {
+            assert!(!names.contains(&gone), "{gone} crossed: {names:?}");
+        }
+        // The deployment's base itself, with or without the slash, is the engine's root.
+        for base in [format!("/deployments/{dep}"), format!("/deployments/{dep}/")] {
+            let res = bed
+                .app
+                .clone()
+                .oneshot(
+                    Request::get(&base)
+                        .header("X-Api-Key", &bed.key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{base}");
+            assert_eq!(body(res).await["path"], "/", "{base}");
+        }
+        let res = bed
+            .app
+            .clone()
+            .oneshot(Request::get("/deployments/dep-nope").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "the credential comes before the lookup"
+        );
         // A wrong credential is refused like a missing one.
         let res = bed
             .app

@@ -20,8 +20,8 @@ const LABEL: &str = "best-peer";
 
 pub struct DockerRuntime {
     docker: Docker,
-    /// The host address published ports are bound to: loopback when only this machine reaches the door, every
-    /// interface when the door is reached from outside.
+    /// The host address published ports are bound to: loopback when the peer runs on this host and reaches the
+    /// engines there, every interface when the container engine is on another host (`BEST_PEER_ENGINE_HOST`).
     bind_ip: String,
     tx: broadcast::Sender<Event>,
 }
