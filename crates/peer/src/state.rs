@@ -128,17 +128,20 @@ impl State {
     }
 
     /// What holds memory on `device`, for a refusal that says what to undeploy.
-    pub fn holders_on(&self, device: &DeviceId) -> Vec<Value> {
+    /// What holds memory on `device`, by name: every workload, or with `mine` only that holder's, which is what a
+    /// credential that does not act for every holder may be told.
+    pub fn holders_on(&self, device: &DeviceId, mine: Option<&str>) -> Vec<Value> {
+        let shown = |holder: &str| mine.is_none_or(|m| m == holder);
         let mut holders: Vec<Value> = self
             .deployments
             .values()
-            .filter(|d| &d.device == device)
+            .filter(|d| &d.device == device && shown(&d.holder))
             .map(|d| serde_json::json!({ "deployment": d.id, "model": d.model, "memory_bytes": d.memory_bytes }))
             .collect();
         holders.extend(
             self.jobs
                 .values()
-                .filter(|j| j.device.as_ref() == Some(device))
+                .filter(|j| j.device.as_ref() == Some(device) && shown(&j.holder))
                 .map(|j| serde_json::json!({ "job": j.id, "image": j.image.0, "memory_bytes": j.memory_bytes })),
         );
         holders
@@ -278,7 +281,12 @@ mod tests {
             json!({ "job": "job-1", "image": "busybox", "device": "gpu-0", "memory_bytes": 2, "container": "k-2" }),
         ));
         assert_eq!(s.reserved_on(&"gpu-0".into()), 10);
-        assert_eq!(s.holders_on(&"gpu-0".into()).len(), 2);
+        assert_eq!(s.holders_on(&"gpu-0".into(), None).len(), 2);
+        assert_eq!(
+            s.holders_on(&"gpu-0".into(), Some("nobody")).len(),
+            0,
+            "another holder is told nothing"
+        );
         s.apply(&ev("JobFinished", "c2", json!({ "job": "job-1", "exit_code": 0 })));
         s.apply(&ev("Undeployed", "c1", json!({ "deployment": "dep-1" })));
         assert_eq!(s.reserved_on(&"gpu-0".into()), 0);

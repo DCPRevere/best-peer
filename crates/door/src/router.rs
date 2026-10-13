@@ -392,7 +392,7 @@ pub async fn resume(door: &Shared) {
         if let Some(admit) = &def.admit {
             // The sender is the credential that sent it; one that expired or is gone since cannot be honoured.
             let Some(who) = door.auth.credential_by_hash(&owed.sender) else {
-                fail("the command was accepted before a restart and its sender's credential is gone".into());
+                fail("the command was accepted before a restart and its sender's credential is gone: sign in again and send it again".into());
                 continue;
             };
             if let Err(refusal) = admit(envelope.clone(), who, command_key(&owed.sender, &envelope.id)).await {
@@ -467,12 +467,18 @@ fn filter_from(q: &HashMap<String, String>) -> Result<Filter, BestError> {
     })
 }
 
+/// The sender whose events alone a credential reads: none for one that acts for every holder.
+fn only(sender: &Credential) -> Option<String> {
+    (!sender.grant.is_all()).then(|| sender.hash.clone())
+}
+
 async fn list_events(
     State(door): State<Shared>,
+    Extension(sender): Extension<Credential>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, BestError> {
     let filter = filter_from(&q)?;
-    let (events, next) = door.log.list(&filter);
+    let (events, next) = door.log.list_for(&filter, only(&sender).as_deref());
     let mut body = json!({ "events": events });
     if let Some(n) = next {
         body["nextCursor"] = json!(n);
@@ -484,10 +490,12 @@ async fn list_events(
 /// the buffer is cut off, so it reconnects with its last id and misses nothing silently.
 async fn stream_events(
     State(door): State<Shared>,
+    Extension(sender): Extension<Credential>,
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, BestError> {
     let filter = filter_from(&q)?;
+    let only = only(&sender);
     let last = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -498,11 +506,19 @@ async fn stream_events(
         None => Vec::new(),
     };
     let f1 = filter.clone();
-    let replayed = stream::iter(replay.into_iter().filter(move |s| f1.matches(s)));
+    let (log1, only1) = (door.log.clone(), only.clone());
+    let replayed = stream::iter(
+        replay
+            .into_iter()
+            .filter(move |s| f1.matches(s) && log1.visible_to(only1.as_deref(), s)),
+    );
+    let log2 = door.log.clone();
     let live = BroadcastStream::new(rx)
         .take_while(|r| futures::future::ready(r.is_ok()))
         .filter_map(move |r| {
-            let keep = r.ok().filter(|s| s.seq > seen_up_to && filter.matches(s));
+            let keep = r
+                .ok()
+                .filter(|s| s.seq > seen_up_to && filter.matches(s) && log2.visible_to(only.as_deref(), s));
             async move { keep }
         });
     let out = replayed.chain(live).map(|s| {

@@ -1034,7 +1034,7 @@ mod tests {
         let bed = fresh().await;
         // A team key: may deploy, 8 GiB of device memory at most, no jobs; nothing in the door changed for the
         // owner's own key, which was approved with nothing said.
-        let team = key_with(&bed.app, Some("read,deploy"), Some(8 * GB)).await;
+        let team = key_with(&bed.app, Some("deploy"), Some(8 * GB)).await;
         let send = |key: String, id: &'static str, r#type: &'static str, schema: &'static str, data: Value| {
             let app = bed.app.clone();
             async move {
@@ -1099,9 +1099,12 @@ mod tests {
         assert_eq!(s, StatusCode::CREATED);
         // No jobs for this key, said at ingest with what it was approved for; the command document says so too.
         let (s, b) = send(team.clone(), "t4", "RunJob", "run-job", json!({ "image": "busybox" })).await;
-        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
         assert_eq!(b["error"]["code"], "FORBIDDEN");
-        assert!(b["error"]["message"].as_str().unwrap().contains("read,deploy"), "{b}");
+        assert!(
+            b["error"]["message"].as_str().unwrap().contains("approved for deploy"),
+            "{b}"
+        );
         let doc = body(
             bed.app
                 .clone()
@@ -1157,10 +1160,67 @@ mod tests {
             json!({ "deployment": owner_dep }),
         )
         .await;
-        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "FORBIDDEN");
         assert!(
             b["error"]["message"].as_str().unwrap().contains("another credential"),
             "{b}"
+        );
+        // Nor its endpoint, its events, or its name in a refusal: the team reads what is the team's.
+        let res = bed
+            .app
+            .clone()
+            .oneshot(
+                Request::get(format!("/deployments/{owner_dep}/v1/models"))
+                    .header("X-Api-Key", &team)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body(res).await["error"]["code"], "FORBIDDEN");
+        let events = |key: String, corr: &'static str| {
+            let app = bed.app.clone();
+            async move {
+                let req = Request::get(format!("/events?correlationId={corr}"))
+                    .header("X-Api-Key", &key)
+                    .body(Body::empty())
+                    .unwrap();
+                body(app.oneshot(req).await.unwrap()).await["events"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            }
+        };
+        assert_eq!(
+            events(team.clone(), "o1").await,
+            0,
+            "the owner's deploy is not the team's to read"
+        );
+        assert!(events(team.clone(), "t1").await > 0, "its own is");
+        assert!(
+            events(bed.key.clone(), "t1").await > 0,
+            "and the owner reads everyone's"
+        );
+        let (s, b) = send(
+            team.clone(),
+            "t5b",
+            "UndeployModel",
+            "undeploy-model",
+            json!({ "deployment": "dep-nope" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let live: Vec<&str> = b["error"]["details"]["live"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            !live.contains(&owner_dep.as_str()) && live.contains(&team_dep.as_str()),
+            "{live:?}"
         );
         let (s, _) = send(
             team.clone(),
@@ -1235,7 +1295,7 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(m["best"]["authentication"]["scopes"], json!(["read", "deploy", "jobs"]));
+        assert_eq!(m["best"]["authentication"]["scopes"], json!(["deploy", "jobs"]));
     }
 
     #[tokio::test]

@@ -64,16 +64,16 @@ pub fn event_dataschemas(endpoint: &str) -> HashMap<String, String> {
     c.event_dataschemas(endpoint)
 }
 
-/// What a credential may be approved for: `read` the hardware and the workloads, `deploy` models (pull, deploy,
-/// undeploy), run `jobs` (run, stop); `all` is every scope and every holder's workloads, what a credential approved
-/// with nothing said is.
-pub const SCOPES: &[&str] = &["read", "deploy", "jobs"];
+/// What a credential may be approved for: `deploy` models (pull, deploy, undeploy), run `jobs` (run, stop); `all` is
+/// every scope and every holder's workloads, what a credential approved with nothing said is. Reading the hardware
+/// and its own workloads and events is every credential's.
+pub const SCOPES: &[&str] = &["deploy", "jobs"];
 
 fn hardware_query(gpu: Arc<dyn Gpu>) -> QueryDef {
     QueryDef {
         schema: "get-hardware-state".into(),
         version: "1.0".into(),
-        description: "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power and utilisation, and the driver. Read it before deploying: a model needs an API the device offers and memory it has free; get-workloads says what already holds memory. Needs the read scope.".into(),
+        description: "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power and utilisation, and the driver. Read it before deploying: a model needs an API the device offers and memory it has free; get-workloads says what already holds memory.".into(),
         parameters: None,
         response: json!({
             "type": "object",
@@ -100,16 +100,9 @@ fn hardware_query(gpu: Arc<dyn Gpu>) -> QueryDef {
                 }
             }
         }),
-        handler: Arc::new(move |who, _params| {
+        handler: Arc::new(move |_who, _params| {
             let gpu = gpu.clone();
             Box::pin(async move {
-                if !who.grant.allows("read") {
-                    return Err(BestError::new(
-                        axum::http::StatusCode::FORBIDDEN,
-                        "FORBIDDEN",
-                        format!("this credential may not read: it was approved for {}", who.grant.said()),
-                    ));
-                }
                 // A real adapter talks to a driver synchronously; that never blocks the door's workers.
                 tokio::task::spawn_blocking(move || hardware_state(gpu.as_ref()))
                     .await
@@ -123,7 +116,7 @@ fn workloads_query(peer: Arc<Peer>) -> QueryDef {
     QueryDef {
         schema: "get-workloads".into(),
         version: "1.0".into(),
-        description: "What this peer runs for you now: each deployment with its model, engine, device, the memory promised to it, its inference endpoint once ready and its phase (starting, ready, ending); each job with its image, device and phase (running, stopping); and held_bytes, the device memory your workloads hold together, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name. Needs the read scope.".into(),
+        description: "What this peer runs for you now: each deployment with its model, engine, device, the memory promised to it, its inference endpoint once ready and its phase (starting, ready, ending); each job with its image, device and phase (running, stopping); and held_bytes, the device memory your workloads hold together, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.".into(),
         parameters: None,
         response: json!({
             "type": "object",
@@ -356,8 +349,8 @@ pub fn event_defs() -> Vec<EventDef> {
             "deployment-started",
             "DeploymentStarted",
             "The engine's container runs on the device named; the model is not yet served.",
-            &["deployment", "model", "engine", "device", "memory_bytes", "container", "holder"],
-            json!({ "deployment": s("The id later commands name"), "holder": s("The credential that deployed it, an opaque id: what get-workloads shows as holder"), "model": s("The model"), "engine": s("ollama or vllm"), "device": s("The device it was placed on"), "memory_bytes": n("The memory promised to it"), "container": s("The engine's container id"), "port": n("The host port the engine is reached at") }),
+            &["deployment", "model", "engine", "device", "memory_bytes", "container"],
+            json!({ "deployment": s("The id later commands name"), "holder": s("The credential that deployed it, an opaque id: what get-workloads shows as holder; absent for one deployed before holders were told"), "model": s("The model"), "engine": s("ollama or vllm"), "device": s("The device it was placed on"), "memory_bytes": n("The memory promised to it"), "container": s("The engine's container id"), "port": n("The host port the engine is reached at") }),
         ),
         event(
             "weights-loading",
@@ -405,8 +398,8 @@ pub fn event_defs() -> Vec<EventDef> {
             "job-started",
             "JobStarted",
             "The job's container runs.",
-            &["job", "image", "container", "holder"],
-            json!({ "job": s("The id stop-job names"), "holder": s("The credential that ran it, an opaque id"), "image": s("The image"), "device": { "type": ["string", "null"] }, "memory_bytes": n("The memory promised to it"), "container": s("The engine's container id") }),
+            &["job", "image", "container"],
+            json!({ "job": s("The id stop-job names"), "holder": s("The credential that ran it, an opaque id; absent for one run before holders were told"), "image": s("The image"), "device": { "type": ["string", "null"] }, "memory_bytes": n("The memory promised to it"), "container": s("The engine's container id") }),
         ),
         event(
             "job-finished",

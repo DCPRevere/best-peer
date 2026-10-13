@@ -77,7 +77,7 @@ pub enum Accept {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct AcceptedLine {
+pub struct AcceptedLine {
     sender: String,
     id: String,
     hash: String,
@@ -339,12 +339,20 @@ impl EventLog {
     /// A page of the log, oldest first, and the cursor for the next page when there is one. `limit` is what the
     /// caller asked for and already checked (1 to [`MAX_PAGE`]); the default is 50.
     pub fn list(&self, filter: &Filter) -> (Vec<Envelope>, Option<String>) {
+        self.list_for(filter, None)
+    }
+
+    /// The page `filter` selects, and when `sender` is given only the events under that sender's own commands:
+    /// what a credential that does not act for every holder may read.
+    pub fn list_for(&self, filter: &Filter, sender: Option<&str>) -> (Vec<Envelope>, Option<String>) {
         let limit = filter.limit.unwrap_or(50).clamp(1, MAX_PAGE);
+        let accepted = self.accepted.lock().unwrap();
         let events = self.events.lock().unwrap();
         let mut page: Vec<&Stored> = events
             .iter()
             .filter(|s| filter.after.is_none_or(|a| s.seq > a))
             .filter(|s| filter.matches(s))
+            .filter(|s| sender.is_none_or(|who| Self::is_senders(&accepted, who, s)))
             .take(limit + 1)
             .collect();
         let next = if page.len() > limit {
@@ -358,6 +366,24 @@ impl EventLog {
 
     /// Everything after the event with `id`, for a reconnecting stream. An id this log never told is not a position
     /// in it, so nothing is replayed: the client reads history with `GET /events` and follows from now.
+    /// Whether `s` is under a command `sender` sent: every fact about a workload is told under the correlation id
+    /// of the command that made it, so a sender's events are the events under its own commands. An event under no
+    /// command is nobody's and is read by a credential that acts for every holder only.
+    pub fn is_senders(accepted: &HashMap<(String, String), AcceptedLine>, sender: &str, s: &Stored) -> bool {
+        let Some(corr) = s.envelope.correlationid.as_deref() else {
+            return false;
+        };
+        accepted.values().any(|a| a.sender == sender && a.correlation == corr)
+    }
+
+    /// `is_senders` for a stream, which holds no lock across events.
+    pub fn visible_to(&self, sender: Option<&str>, s: &Stored) -> bool {
+        match sender {
+            None => true,
+            Some(who) => Self::is_senders(&self.accepted.lock().unwrap(), who, s),
+        }
+    }
+
     pub fn since_id(&self, id: &str) -> Vec<Stored> {
         let events = self.events.lock().unwrap();
         match events.iter().position(|s| s.envelope.id == id) {

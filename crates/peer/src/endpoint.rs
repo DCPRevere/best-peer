@@ -3,8 +3,9 @@
 //! `Authorization: Bearer` the OpenAI-compatible clients send, goes to the engine as it is and the answer comes back
 //! as it comes, streaming included. The door reads the headers it checks and nothing else: no token is recorded, and
 //! its events still say what the machine runs, never what the model answered. Without the credential the answer is
-//! the door's 401; a deployment that is not ready, is ending or is gone answers 404 with what to do; an engine that
-//! does not answer is 502 with what to do.
+//! the door's 401; a deployment that is not ready, is ending or is gone answers 404 with what to do; one another
+//! credential holds is refused by name unless the caller acts for every holder; an engine that does not answer is
+//! 502 with what to do.
 
 use std::sync::Arc;
 
@@ -50,9 +51,9 @@ async fn pass_through(State(gw): State<Gateway>, req: Request) -> Response {
 
 async fn forward(gw: &Gateway, req: Request) -> Result<Response, BestError> {
     let key = credential(req.headers());
-    if key.is_empty() || gw.auth.authenticate(key).is_none() {
+    let Some(who) = (!key.is_empty()).then(|| gw.auth.authenticate(key)).flatten() else {
         return Err(BestError::unauthorized());
-    }
+    };
     // The deployment and the rest are read from the request line as sent, never decoded: what the client encoded
     // reaches the engine encoded, and `..` or a `?` inside a segment stays inside it.
     let sent = req
@@ -69,7 +70,7 @@ async fn forward(gw: &Gateway, req: Request) -> Result<Response, BestError> {
             "the endpoint names a deployment: /deployments/<deployment>/v1, as DeploymentReady said",
         ));
     }
-    let upstream = gw.peer.upstream_of(deployment)?;
+    let upstream = gw.peer.upstream_of(deployment, &who)?;
     let rest = match rest {
         "" => "/".to_string(),
         r if r.starts_with('?') => format!("/{r}"),

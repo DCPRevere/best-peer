@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::http::StatusCode;
 use best_peer_door::auth::{holder_of_hash, Credential};
 use best_peer_door::{BestError, Emitter, Envelope, EventLog};
 use best_peer_engine::{Engine, EngineError, Kind};
@@ -326,16 +325,19 @@ impl Peer {
     /// Where the door passes a prompt for a deployment: its engine's base on this host, while the deployment is
     /// ready. Before that, after an undeploy was accepted, or for a deployment nobody made, the refusal says what to
     /// do.
-    pub fn upstream_of(&self, deployment: &str) -> Result<String, BestError> {
+    pub fn upstream_of(&self, deployment: &str, who: &Credential) -> Result<String, BestError> {
         let state = self.state.lock().unwrap();
         let Some(d) = state.deployments.get(deployment) else {
             return Err(BestError::not_found(
                 "NO_SUCH_DEPLOYMENT",
                 format!(
-                    "no deployment {deployment}: get-workloads lists what this peer runs, and deploy-model starts one"
+                    "no deployment {deployment}: get-workloads lists what this peer runs for you, and deploy-model starts one"
                 ),
             ));
         };
+        if !who.grant.is_all() && d.holder != who.holder() {
+            return Err(not_yours("deployment", deployment));
+        }
         match d.phase {
             Phase::Ready => Ok(self.engine_base(d.port)),
             Phase::Starting => Err(BestError::not_found(
@@ -387,6 +389,7 @@ impl Peer {
             data.memory_bytes,
             data.device.as_deref(),
             &format!("{} on {}", data.model, data.engine),
+            mine(&who).as_deref(),
         )?;
         state.reserved.insert(
             key,
@@ -611,7 +614,12 @@ impl Peer {
         require(who, "deploy")?;
         let id = cmd.data["deployment"].as_str().unwrap_or_default();
         let mut s = self.state.lock().unwrap();
-        let live: Vec<String> = s.deployments.keys().cloned().collect();
+        let live: Vec<String> = s
+            .deployments
+            .values()
+            .filter(|d| who.grant.is_all() || d.holder == who.holder())
+            .map(|d| d.id.clone())
+            .collect();
         match s.deployments.get_mut(id) {
             None => Err(BestError::bad_request(
                 "NO_SUCH_DEPLOYMENT",
@@ -719,6 +727,7 @@ impl Peer {
                 needed,
                 data.device.as_deref(),
                 &format!("a job from {}", data.image),
+                mine(&who).as_deref(),
             )?),
             _ => None,
         };
@@ -794,7 +803,12 @@ impl Peer {
         require(who, "jobs")?;
         let id = cmd.data["job"].as_str().unwrap_or_default();
         let mut s = self.state.lock().unwrap();
-        let running: Vec<String> = s.jobs.keys().cloned().collect();
+        let running: Vec<String> = s
+            .jobs
+            .values()
+            .filter(|j| who.grant.is_all() || j.holder == who.holder())
+            .map(|j| j.id.clone())
+            .collect();
         match s.jobs.get_mut(id) {
             None => Err(BestError::bad_request(
                 "NO_SUCH_JOB",
@@ -980,7 +994,6 @@ impl Peer {
 
     /// `get-workloads`: what is deployed and what runs, now.
     pub fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
-        require(who, "read")?;
         let mine = |holder: &str| who.grant.is_all() || holder == who.holder();
         let s = self.state.lock().unwrap();
         let deployments: Vec<Value> = s
@@ -1020,8 +1033,7 @@ fn require(who: &Credential, scope: &str) -> Result<(), BestError> {
     if who.grant.allows(scope) {
         return Ok(());
     }
-    Err(BestError::new(
-        StatusCode::FORBIDDEN,
+    Err(BestError::bad_request(
         "FORBIDDEN",
         format!(
             "this credential may not {scope}: it was approved for {}; ask whoever controls the machine to approve a credential that may (best-peer approve <code> --may {scope})",
@@ -1051,12 +1063,16 @@ fn within_share(state: &State, who: &Credential, needed: u64) -> Result<(), Best
 
 /// A workload another credential holds is not this one's to end.
 fn not_yours(kind: &str, id: &str) -> BestError {
-    BestError::new(
-        StatusCode::FORBIDDEN,
+    BestError::bad_request(
         "FORBIDDEN",
-        format!("{kind} {id} was started by another credential: get-workloads lists yours, and only a credential approved for all may end another's"),
+        format!("{kind} {id} was started by another credential: get-workloads lists yours, and only a credential approved for all may reach another's"),
     )
     .with_details(json!({ kind: id }))
+}
+
+/// The holder a credential may be told about: every one for a credential approved for all, else its own.
+fn mine(who: &Credential) -> Option<String> {
+    (!who.grant.is_all()).then(|| who.holder())
 }
 
 /// Where a workload needing `memory_bytes` on a device offering one of `apis` goes: the fitting device with the most
@@ -1069,6 +1085,7 @@ fn place(
     memory_bytes: u64,
     pinned: Option<&str>,
     what: &str,
+    mine: Option<&str>,
 ) -> Result<(DeviceId, Compute), BestError> {
     let ids: Vec<String> = host.devices.iter().map(|d| d.id.0.clone()).collect();
     let candidates: Vec<&best_peer_gpu::Device> = match pinned {
@@ -1128,7 +1145,7 @@ fn place(
         .map(|(d, _)| {
             json!({
                 "id": d.id.0, "name": d.name, "free_bytes": d.memory.free_bytes, "total_bytes": d.memory.total_bytes,
-                "promised_bytes": state.reserved_on(&d.id), "room_bytes": room(d), "holders": state.holders_on(&d.id)
+                "promised_bytes": state.reserved_on(&d.id), "room_bytes": room(d), "holders": state.holders_on(&d.id, mine)
             })
         })
         .collect();
@@ -1326,13 +1343,13 @@ mod tests {
         };
         let state = State::default();
         let ollama = best_peer_engine::Kind::Ollama.runs_on();
-        let (id, api) = place(&host, &state, &ollama, 4 << 30, None, "ollama").unwrap();
+        let (id, api) = place(&host, &state, &ollama, 4 << 30, None, "ollama", None).unwrap();
         assert_eq!((id.0.as_str(), api), ("GPU-a", Compute::Cuda("0".into())));
         // Only when no card has the room does the CPU take it.
-        let (id, api) = place(&host, &state, &ollama, 30 << 30, None, "ollama").unwrap();
+        let (id, api) = place(&host, &state, &ollama, 30 << 30, None, "ollama", None).unwrap();
         assert_eq!((id.0.as_str(), api), ("cpu-0", Compute::Cpu));
         // A job with no stated API goes to the card too.
-        let (id, _) = place(&host, &state, &any_compute(), 1 << 30, None, "a job").unwrap();
+        let (id, _) = place(&host, &state, &any_compute(), 1 << 30, None, "a job", None).unwrap();
         assert_eq!(id.0, "GPU-a");
     }
 }
