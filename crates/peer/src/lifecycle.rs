@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use best_peer_door::{BestError, Emitter, Envelope, EventLog};
 use best_peer_engine::{Engine, EngineError, Kind};
@@ -479,13 +479,21 @@ impl Peer {
         self.replay_unowned(&started.id).await;
         let base = self.engine_base(port);
         let loading: best_peer_engine::Progress = {
-            let (me, em, id, model) = (self.clone(), em.clone(), id.clone(), data.model.clone());
+            let (me, em, id, model, pace) = (
+                self.clone(),
+                em.clone(),
+                id.clone(),
+                data.model.clone(),
+                Pace::default(),
+            );
             Arc::new(move |pct| {
-                me.tell(
-                    &em,
-                    "WeightsLoading",
-                    json!({ "deployment": id, "model": model, "progress_pct": pct }),
-                );
+                if pace.due(pct) {
+                    me.tell(
+                        &em,
+                        "WeightsLoading",
+                        json!({ "deployment": id, "model": model, "progress_pct": pct }),
+                    );
+                }
             })
         };
         let outcome = async {
@@ -526,11 +534,13 @@ impl Peer {
         }
     }
 
-    /// The progress sink of a pull: each step told as an ImagePulling fact under the command's correlation.
+    /// The progress sink of a pull: ImagePulling facts under the command's correlation, at the pace a consumer reads.
     fn pulling(self: &Arc<Self>, em: &Emitter, image: &best_peer_runtime::ImageRef) -> best_peer_runtime::Progress {
-        let (me, em, image) = (self.clone(), em.clone(), image.0.clone());
+        let (me, em, image, pace) = (self.clone(), em.clone(), image.0.clone(), Pace::default());
         Arc::new(move |pct| {
-            me.tell(&em, "ImagePulling", json!({ "image": image, "progress_pct": pct }));
+            if pace.due(pct) {
+                me.tell(&em, "ImagePulling", json!({ "image": image, "progress_pct": pct }));
+            }
         })
     }
 
@@ -1075,6 +1085,45 @@ fn api_name(c: &Compute) -> String {
     }
 }
 
+/// The pace progress is told at. An engine reports every percent, sometimes every byte; a consumer that catches up
+/// on the log reads every event told, so one workload tells its progress at steps of ten points, at once when the
+/// value is final, and at least every few seconds while the engine keeps reporting, so a slow pull is seen to
+/// move. A report without a value (the engine knows it is working, not how far) is told by time alone.
+pub struct Pace {
+    last: Mutex<Option<(Option<u8>, Instant)>>,
+}
+
+impl Pace {
+    pub const STEP: u8 = 10;
+    pub const AT_LEAST_EVERY: Duration = Duration::from_secs(5);
+
+    /// Whether this report is told, and if so it is the one the next is measured from.
+    pub fn due(&self, pct: Option<u8>) -> bool {
+        let now = Instant::now();
+        let mut last = self.last.lock().unwrap();
+        let due = match *last {
+            None => true,
+            Some((told, at)) => match (told, pct) {
+                (_, Some(100)) => told != Some(100),
+                (Some(t), Some(p)) => {
+                    p >= t.saturating_add(Self::STEP) || now.duration_since(at) >= Self::AT_LEAST_EVERY
+                }
+                _ => now.duration_since(at) >= Self::AT_LEAST_EVERY,
+            },
+        };
+        if due {
+            *last = Some((pct, now));
+        }
+        due
+    }
+}
+
+impl Default for Pace {
+    fn default() -> Self {
+        Self { last: Mutex::new(None) }
+    }
+}
+
 fn fix_for_runtime(e: &RuntimeError) -> &'static str {
     match e {
         RuntimeError::ImageNotFound(_) => "the registry has no such image: check the name and the tag",
@@ -1115,6 +1164,33 @@ fn new_id(prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::Pace;
+
+    #[test]
+    fn progress_is_told_at_steps_of_ten_and_at_the_end_whatever_the_engine_reports() {
+        let pace = Pace::default();
+        let told: Vec<u8> = (0..=100).filter(|&p| pace.due(Some(p))).collect();
+        assert_eq!(told, vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
+        // Final once: a repeated 100 is not told again.
+        assert!(!pace.due(Some(100)));
+        // A jump straight to the end is told at once, whatever the step.
+        let pace = Pace::default();
+        assert!(pace.due(Some(3)));
+        assert!(!pace.due(Some(7)));
+        assert!(pace.due(Some(100)));
+        // A value that moved back (a new layer appeared) waits for the interval, not for ever.
+        let pace = Pace::default();
+        assert!(pace.due(Some(40)));
+        assert!(!pace.due(Some(35)));
+        assert!(!pace.due(Some(49)));
+        assert!(pace.due(Some(50)));
+        // Reports without a value are told by time alone: the first, then not until the interval passed.
+        let pace = Pace::default();
+        assert!(pace.due(None));
+        assert!(!pace.due(None));
+        assert!(!pace.due(Some(5)));
+    }
+
     use super::*;
 
     #[test]

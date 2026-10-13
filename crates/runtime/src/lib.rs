@@ -111,6 +111,8 @@ pub struct Fake {
     jobs: bool,
     /// Host ports chosen for container ports, over the fake's own numbering: where a test listens itself.
     published: BTreeMap<u16, u16>,
+    /// What a pull reports as it goes; a real engine reports every percent, often more.
+    steps: Vec<Option<u8>>,
     containers: Mutex<BTreeMap<ContainerId, Spec>>,
     devices: Vec<DeviceId>,
     next: Mutex<u32>,
@@ -127,6 +129,7 @@ impl Fake {
             open_registry: false,
             jobs: true,
             published: BTreeMap::new(),
+            steps: vec![Some(50)],
             containers: Mutex::new(BTreeMap::new()),
             devices,
             next: Mutex::new(0),
@@ -148,6 +151,12 @@ impl Fake {
     /// An engine that runs no job, as an engine installed on the host outside any container: deploys only.
     pub fn without_jobs(mut self) -> Self {
         self.jobs = false;
+        self
+    }
+
+    /// A fake whose pull reports every percent from 0 to 100, as a real engine does.
+    pub fn reporting_every_percent(mut self) -> Self {
+        self.steps = (0..=100).map(Some).collect();
         self
     }
 
@@ -194,7 +203,9 @@ impl Runtime for Fake {
         if !self.open_registry && !self.registry.lock().unwrap().contains(image) {
             return Err(RuntimeError::ImageNotFound(image.0.clone()));
         }
-        progress(Some(50));
+        for &step in &self.steps {
+            progress(step);
+        }
         let mut local = self.local.lock().unwrap();
         if !local.contains(image) {
             local.push(image.clone());

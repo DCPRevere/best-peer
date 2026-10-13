@@ -118,6 +118,8 @@ pub struct Fake {
     missing: Mutex<Vec<String>>,
     loaded: Mutex<BTreeMap<String, Vec<String>>>,
     unloaded: Mutex<BTreeMap<String, Vec<String>>>,
+    /// What a load reports as it goes; a real engine reports every percent, often more.
+    steps: Vec<Option<u8>>,
 }
 
 impl Default for Fake {
@@ -133,7 +135,14 @@ impl Fake {
             missing: Mutex::new(vec![]),
             loaded: Mutex::new(BTreeMap::new()),
             unloaded: Mutex::new(BTreeMap::new()),
+            steps: vec![Some(25), Some(100)],
         }
+    }
+
+    /// A fake whose load reports every percent from 0 to 100, as a real engine does.
+    pub fn reporting_every_percent(mut self) -> Self {
+        self.steps = (0..=100).map(Some).collect();
+        self
     }
 
     /// Makes the engine at `base` never answer.
@@ -173,8 +182,9 @@ impl Engine for Fake {
         if self.missing.lock().unwrap().iter().any(|m| m == model) {
             return Err(EngineError::ModelNotFound(model.into()));
         }
-        progress(Some(25));
-        progress(Some(100));
+        for &step in &self.steps {
+            progress(step);
+        }
         self.loaded
             .lock()
             .unwrap()

@@ -367,10 +367,20 @@ mod tests {
         runtime: Arc<best_peer_runtime::Fake>,
         engine_host: &str,
     ) -> Bed {
+        bed_with(gpu, log, runtime, Arc::new(best_peer_engine::Fake::new()), engine_host).await
+    }
+
+    /// The same, with the inference engine given too.
+    async fn bed_with(
+        gpu: Arc<best_peer_gpu::Fake>,
+        log: Arc<EventLog>,
+        runtime: Arc<best_peer_runtime::Fake>,
+        engine: Arc<best_peer_engine::Fake>,
+        engine_host: &str,
+    ) -> Bed {
         for image in ["ollama/ollama", "vllm/vllm-openai", "busybox", "ollama/ollama:0.6"] {
             runtime.registry_has(best_peer_runtime::ImageRef(image.into()));
         }
-        let engine = Arc::new(best_peer_engine::Fake::new());
         let peer = peer(
             EP,
             engine_host,
@@ -898,6 +908,31 @@ mod tests {
             b["error"]["message"].as_str().unwrap().contains("DeploymentEnded"),
             "{b}"
         );
+    }
+
+    #[tokio::test]
+    async fn engines_that_report_every_percent_are_told_at_steps_of_ten_and_the_last_is_a_hundred() {
+        let bed = bed_with(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]).reporting_every_percent()),
+            Arc::new(best_peer_engine::Fake::new().reporting_every_percent()),
+            "engines.local",
+        )
+        .await;
+        let (s, b) = bed.deploy("d1", "llama3.2:3b", "ollama", 8).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = bed.events_of("d1", "DeploymentReady").await;
+        for kind in ["ImagePulling", "WeightsLoading"] {
+            let pcts: Vec<u64> = events
+                .iter()
+                .filter(|e| e.r#type == kind)
+                .map(|e| e.data["progress_pct"].as_u64().unwrap())
+                .collect();
+            assert_eq!(pcts, vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100], "{kind}");
+        }
+        // Eleven of each, with ImagePulled, DeploymentStarted and DeploymentReady between: tens, not hundreds.
+        assert_eq!(events.len(), 11 + 1 + 1 + 11 + 1, "{:?}", types(&events));
     }
 
     #[tokio::test]
