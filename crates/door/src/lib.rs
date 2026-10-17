@@ -27,6 +27,12 @@ pub use catalogue::{AdmitHook, Catalogue, CommandDef, Emitter, EventDef, QueryDe
 pub use envelope::Envelope;
 pub use error::BestError;
 pub use log::{Accept, EventLog, Filter, Stored, Unfinished};
+
+/// What a credential may read of an event, beyond the door's own rule: `Some(visible)` decides, `None` leaves it to
+/// the rule (a credential that acts for every holder reads everything; another reads the events under its own
+/// commands). The host sets one where a log carries facts addressed to identities (SPEC.md, Security
+/// Requirements: tenant context derives from the credential, streams are isolated per tenant).
+pub type Partition = Arc<dyn Fn(&auth::Credential, &Stored) -> Option<bool> + Send + Sync>;
 pub use router::{payload_hash, resume, router, tenant_router};
 
 use std::collections::HashMap;
@@ -57,6 +63,8 @@ pub struct Door {
     /// tenants: the manifest's `tenants` block, and the root service then declares its own authentication, so
     /// its capabilities read as the root's, not a tenant's.
     pub tenants: Option<String>,
+    /// What a credential may read of this log's events, when the door's own rule is not the whole answer.
+    pub partition: Option<Partition>,
 }
 
 impl Door {
@@ -82,7 +90,24 @@ impl Door {
             inflight: std::sync::Mutex::new(HashMap::new()),
             completions,
             tenants: None,
+            partition: None,
         }
+    }
+
+    /// Decides what a credential reads beyond the door's own rule.
+    pub fn with_partition(mut self, partition: Partition) -> Self {
+        self.partition = Some(partition);
+        self
+    }
+
+    /// Whether `who` reads the event `s`: the partition's word when it has one, else the door's rule, under which a
+    /// credential that acts for every holder reads everything and another reads the events under its own commands.
+    pub fn visible_to(&self, who: &auth::Credential, s: &Stored) -> bool {
+        if let Some(decided) = self.partition.as_ref().and_then(|p| p(who, s)) {
+            return decided;
+        }
+        let only = (!who.grant.is_all()).then_some(who.hash.as_str());
+        self.log.visible_to(only, s)
     }
 
     /// Declares the tenant manifests this door hosts: their URI template, with `{tenantId}` where the tenant's id

@@ -162,7 +162,10 @@ log, catalogue, stream and correlation space; a credential opens the workspaces 
 others, and `get-workspaces` at the root lists them with each one's endpoint and manifest. At the root:
 `create-workspace` (whoever sends it is the owner), `invite-member` (the owner, naming the invitee's `identity`,
 the opaque id of their credential that `get-workspaces` shows them), `accept-invitation` and `leave-workspace`
-(refused while one still holds a workload there); owner and member are the only roles, and the owner stays. In a workspace: `configure-cloud` names a **cloud**, a
+(refused while one still holds a workload there); owner and member are the only roles, and the owner stays. The
+root's events tell a credential the facts addressed to it (the workspaces it made or joined, the invitations it
+received) and nothing of another workspace, whatever its grant; a workspace's own stream tells its members its
+membership, its clouds and its peers, and each holder its own workloads. In a workspace: `configure-cloud` names a **cloud**, a
 pool of peers as `peer` and `endpoint`, and makes or changes it (one machine serves one cloud per workspace, and a
 peer still holding a workload is not removed); `archive-cloud` retires an empty one, and `get-clouds` lists them
 with each peer's state. The cloud signs in to each member by the device flow and logs the code to approve there;

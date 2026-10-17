@@ -129,6 +129,7 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
         auth,
     )
     .with_tenants(&ctx.manifest_template())
+    .with_partition(workspace::Workspaces::root_partition(peer.log.clone()))
 }
 
 /// What the workspaces of this door are built with: the root's endpoint and credentials, the data directory, the
@@ -1294,7 +1295,7 @@ mod tests {
         assert!(
             type_names(none["events"].as_array().unwrap())
                 .iter()
-                .all(|t| t == "CloudConfiguredV1"),
+                .all(|t| t == "CloudConfiguredV1" || t == "WorkspaceCreatedV1"),
             "{none}"
         );
         assert_eq!(
@@ -1831,6 +1832,212 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_root_tells_a_credential_only_the_facts_addressed_to_it_and_a_workspace_tells_its_members_its_own() {
+        let (a, b) = two_members().await;
+        let site = site(vec![(A, a), (B, b)]).await;
+        // Four credentials: the site's owner and another approved for all, two approved for deploy alone.
+        let other_owner = key(&site.app).await;
+        let carol = key_with(&site.app, Some("deploy"), None).await;
+        let dave = key_with(&site.app, Some("deploy"), None).await;
+        let identity = |key: &str| {
+            let app = site.app.clone();
+            let key = key.to_string();
+            async move {
+                get_as(&app, "", &key, "/queries/get-workspaces").await.1["identity"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let (carol_id, dave_id) = (identity(&carol).await, identity(&dave).await);
+        let root_events = |key: &str, query: &str| {
+            let app = site.app.clone();
+            let (key, query) = (key.to_string(), query.to_string());
+            async move {
+                let (s, b) = get_as(&app, "", &key, &format!("/events{query}")).await;
+                assert_eq!(s, StatusCode::OK, "{b}");
+                b["events"].as_array().cloned().unwrap_or_default()
+            }
+        };
+        let workspaces_named = |events: &[Value]| -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|e| e["data"]["workspace"].as_str().map(str::to_string))
+                .collect()
+        };
+        // Carol holds the root stream open before anything is made.
+        let res = site
+            .app
+            .clone()
+            .oneshot(
+                Request::get("/events/stream")
+                    .header("X-Api-Key", &carol)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut carol_stream = res.into_body().into_data_stream();
+
+        let ws1 = site.workspace("c1", "Research").await;
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &other_owner,
+            "c2",
+            "CreateWorkspace",
+            "create-workspace",
+            json!({ "name": "Ops" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        let ws2 = events_as(&site.app, "", &other_owner, "c2", "WorkspaceCreatedV1").await[0]["data"]["workspace"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &site.key,
+            "i1",
+            "InviteMember",
+            "invite-member",
+            json!({ "workspace": ws1, "identity": carol_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &site.key, "i1", "MemberInvitedV1").await;
+
+        // Each owner reads its own workspace's facts and nothing of the other's, approved for all or not.
+        let mine = root_events(&site.key, "").await;
+        assert!(
+            type_names(&mine).contains(&"WorkspaceCreatedV1".to_string())
+                && type_names(&mine).contains(&"MemberInvitedV1".to_string()),
+            "{mine:#?}"
+        );
+        assert!(workspaces_named(&mine).iter().all(|w| *w == ws1), "{mine:#?}");
+        let theirs = root_events(&other_owner, "").await;
+        assert_eq!(type_names(&theirs), ["WorkspaceCreatedV1"]);
+        assert_eq!(workspaces_named(&theirs), std::slice::from_ref(&ws2));
+        assert_eq!(
+            root_events(&other_owner, "?type=MemberInvitedV1").await,
+            Vec::<Value>::new(),
+            "the invitation into the first is not the second owner's to read"
+        );
+        // The invitee reads the invitation addressed to it before accepting, and nothing else: on the log and on
+        // the stream it held open, whose first frame is that invitation.
+        let hers = root_events(&carol, "").await;
+        assert_eq!(type_names(&hers), ["MemberInvitedV1"], "{hers:#?}");
+        assert_eq!(hers[0]["data"]["identity"], carol_id);
+        let frame = tokio::time::timeout(Duration::from_secs(5), carol_stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame = String::from_utf8_lossy(&frame).to_string();
+        assert!(
+            frame.contains("MemberInvitedV1") && !frame.contains("WorkspaceCreatedV1"),
+            "{frame}"
+        );
+        assert_eq!(
+            root_events(&dave, "").await,
+            Vec::<Value>::new(),
+            "nothing is addressed to Dave yet"
+        );
+
+        // Joined, each reads its own join; a member of the second reads only the second's.
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &carol,
+            "a1",
+            "AcceptInvitation",
+            "accept-invitation",
+            json!({ "workspace": ws1 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &carol, "a1", "MemberJoinedV1").await;
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &other_owner,
+            "i2",
+            "InviteMember",
+            "invite-member",
+            json!({ "workspace": ws2, "identity": dave_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &other_owner, "i2", "MemberInvitedV1").await;
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &dave,
+            "a2",
+            "AcceptInvitation",
+            "accept-invitation",
+            json!({ "workspace": ws2 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &dave, "a2", "MemberJoinedV1").await;
+        let hers = root_events(&carol, "").await;
+        assert_eq!(type_names(&hers), ["MemberInvitedV1", "MemberJoinedV1"]);
+        assert!(workspaces_named(&hers).iter().all(|w| *w == ws1));
+        let his = root_events(&dave, "").await;
+        assert_eq!(type_names(&his), ["MemberInvitedV1", "MemberJoinedV1"]);
+        assert!(workspaces_named(&his).iter().all(|w| *w == ws2), "{his:#?}");
+        assert!(
+            workspaces_named(&root_events(&site.key, "").await)
+                .iter()
+                .all(|w| *w == ws1),
+            "the first owner hears nothing of the second's join"
+        );
+
+        // The workspace's own stream tells its members its membership, whatever their grant, under the workspace's
+        // schemas; the other workspace's facts are not on it.
+        let (s, b) = get_as(&site.app, &format!("/workspaces/{ws1}"), &carol, "/events").await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let on_ws1 = b["events"].as_array().unwrap();
+        assert_eq!(
+            type_names(on_ws1),
+            ["WorkspaceCreatedV1", "MemberInvitedV1", "MemberJoinedV1"],
+            "{on_ws1:#?}"
+        );
+        assert!(
+            on_ws1.iter().all(|e| e["data"]["workspace"] == ws1
+                && e["dataschema"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("{EP}/workspaces/{ws1}/"))),
+            "{on_ws1:#?}"
+        );
+        assert_eq!(on_ws1[1]["correlationid"], "i1", "told under the command that made it");
+        let (_, b) = get_as(&site.app, &format!("/workspaces/{ws2}"), &dave, "/events").await;
+        assert!(
+            b["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["data"]["workspace"] == ws2),
+            "{b}"
+        );
+        let (_, d) = get_as(
+            &site.app,
+            &format!("/workspaces/{ws1}"),
+            &carol,
+            "/events/member-joined/1.0",
+        )
+        .await;
+        assert_eq!(
+            d["title"], "MemberJoinedV1",
+            "the workspace documents the facts its stream carries"
+        );
+    }
+
+    #[tokio::test]
     async fn a_cloud_is_configured_by_the_owner_with_names_that_compose_machines_that_serve_one_cloud_per_workspace_and_is_archived_empty(
     ) {
         let (a, b) = two_members().await;
@@ -1866,7 +2073,11 @@ mod tests {
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(e["error"]["code"], "DUPLICATE_MEMBER");
         let (_, all) = get_as(&site.app, &format!("/workspaces/{ws}"), &site.key, "/events").await;
-        assert_eq!(all["events"], json!([]), "a refused command told nothing");
+        assert_eq!(
+            type_names(all["events"].as_array().unwrap()),
+            ["WorkspaceCreatedV1"],
+            "a refused command told nothing: the workspace's log holds its creation alone"
+        );
 
         // One machine, one cloud per workspace: the second cloud may not take a's endpoint while the first has it.
         site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;

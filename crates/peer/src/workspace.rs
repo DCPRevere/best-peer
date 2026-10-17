@@ -22,14 +22,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
 use best_peer_door::auth::Credential;
-use best_peer_door::{Auth, BestError, Door, Emitter, Envelope, EventLog};
+use best_peer_door::{Auth, BestError, Door, Emitter, Envelope, EventLog, Partition, Stored};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use crate::cloud::Cloud;
-use crate::domain::{self, Clouds, Membership, Service, NAME_SHAPE};
+use crate::domain::{self, Clouds, Membership, Service, MEMBERSHIP_EVENTS, NAME_SHAPE, WORKSPACE_EVENTS};
 use crate::endpoint::{Route, Upstream};
 use crate::holdings::Holdings;
 use crate::lifecycle::{list, new_id, require};
@@ -145,11 +145,37 @@ impl Workspaces {
         }
     }
 
-    /// Tells a membership fact: appended, then folded.
+    /// Tells a membership fact: appended at the root under the command that made it, folded, and told again on the
+    /// workspace's own stream, where its members hear it.
     fn tell(&self, em: &Emitter, r#type: &str, data: Value) -> Envelope {
         let e = em.emit(r#type, data);
         self.apply(&e);
+        if let Some(ws) = e.data["workspace"].as_str().and_then(|id| self.get(id)) {
+            ws.hear(&e);
+        }
         e
+    }
+
+    /// What a credential reads of the root log: the door's own facts under the door's rule, and of the membership
+    /// facts those addressed to it (the workspaces it made or joined, the invitations it received) and those under
+    /// its own commands; nothing of a workspace it is not in, whatever its grant (SPEC.md, Security Requirements:
+    /// tenant context derives from the credential, streams are isolated per tenant).
+    pub fn root_partition(log: Arc<EventLog>) -> Partition {
+        Arc::new(move |who: &Credential, s: &Stored| {
+            let e = &s.envelope;
+            if !MEMBERSHIP_EVENTS.contains(&e.r#type.as_str()) {
+                return None;
+            }
+            let me = who.holder();
+            let addressed = e.data["identity"].as_str() == Some(&me) || e.data["owner"].as_str() == Some(&me);
+            Some(addressed || log.visible_to(Some(&who.hash), s))
+        })
+    }
+
+    /// What a member reads of a workspace's log: the workspace's own facts (its membership, its clouds, its peers)
+    /// whatever its grant, and of the lifecycle what the door's rule gives it.
+    fn workspace_partition() -> Partition {
+        Arc::new(|_who: &Credential, s: &Stored| WORKSPACE_EVENTS.contains(&s.envelope.r#type.as_str()).then_some(true))
     }
 
     /// Folds one fact in, live and on replay: the record, the member list the workspace's door checks, and the
@@ -588,14 +614,17 @@ impl Workspace {
             me.fold(e);
         }
         me.materialise();
-        let door = Arc::new(Door::new(
-            &me.endpoint,
-            &ctx.service,
-            "A workspace: the clouds of one organization or team, each a pool of GPU peers, and the models and jobs its members place on them, told as events with the cloud and the peer named.",
-            domain::workspace_catalogue(me.clone()),
-            log,
-            ctx.auth.clone(),
-        ));
+        let door = Arc::new(
+            Door::new(
+                &me.endpoint,
+                &ctx.service,
+                "A workspace: the clouds of one organization or team, each a pool of GPU peers, and the models and jobs its members place on them, told as events with the cloud and the peer named.",
+                domain::workspace_catalogue(me.clone()),
+                log,
+                ctx.auth.clone(),
+            )
+            .with_partition(Workspaces::workspace_partition()),
+        );
         let router =
             best_peer_door::tenant_router(door.clone()).merge(crate::endpoint::router(me.clone(), ctx.auth.clone()));
         let _ = me.door.set(door);
@@ -610,6 +639,24 @@ impl Workspace {
 
     pub fn door(&self) -> &Arc<Door> {
         self.door.get().expect("the door is set at open")
+    }
+
+    /// A membership fact about this workspace, told at the root, told again on this workspace's own stream under
+    /// the same correlation, so its members hear who joined, was invited or left. A fact already here (a replay)
+    /// is not told twice.
+    fn hear(&self, e: &Envelope) {
+        let mut known = false;
+        self.log.replay(|k| known |= k.r#type == e.r#type && k.data == e.data);
+        if known {
+            return;
+        }
+        Emitter::new(
+            self.log.clone(),
+            &self.ctx.service,
+            &e.effective_correlation(),
+            self.dataschemas.clone(),
+        )
+        .emit(&e.r#type, e.data.clone());
     }
 
     pub fn router(&self) -> &Router {

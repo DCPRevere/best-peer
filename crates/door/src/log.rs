@@ -354,14 +354,19 @@ impl EventLog {
     /// The page `filter` selects, and when `sender` is given only the events under that sender's own commands:
     /// what a credential that does not act for every holder may read.
     pub fn list_for(&self, filter: &Filter, sender: Option<&str>) -> (Vec<Envelope>, Option<String>) {
+        self.list_where(filter, |s| self.visible_to(sender, s))
+    }
+
+    /// The page `filter` selects among the events `visible` admits: the reader's rule, whatever it is. `visible`
+    /// may read this log's own records; no lock but the events' is held while it runs.
+    pub fn list_where(&self, filter: &Filter, visible: impl Fn(&Stored) -> bool) -> (Vec<Envelope>, Option<String>) {
         let limit = filter.limit.unwrap_or(50).clamp(1, MAX_PAGE);
-        let accepted = self.accepted.lock().unwrap();
         let events = self.events.lock().unwrap();
         let mut page: Vec<&Stored> = events
             .iter()
             .filter(|s| filter.after.is_none_or(|a| s.seq > a))
             .filter(|s| filter.matches(s))
-            .filter(|s| sender.is_none_or(|who| Self::is_senders(&accepted, who, s)))
+            .filter(|s| visible(s))
             .take(limit + 1)
             .collect();
         let next = if page.len() > limit {

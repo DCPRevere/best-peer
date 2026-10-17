@@ -84,13 +84,18 @@ pub fn catalogue(svc: Arc<dyn Service>, membership: Arc<dyn Membership>) -> Cata
     c
 }
 
-/// A workspace door's catalogue: its clouds, and the lifecycle placed in them.
+/// A workspace door's catalogue: its clouds, the lifecycle placed in them, and the facts about its own membership,
+/// which its stream carries too.
 pub fn workspace_catalogue(ws: Arc<dyn Clouds>) -> Catalogue {
     let mut c = lifecycle(Catalogue::new(), ws.clone(), Where::Workspace)
         .query(clouds_query(ws.clone()))
         .command(configure_cloud(ws.clone()))
         .command(archive_cloud(ws));
-    for e in event_defs().into_iter().chain(cloud_event_defs()) {
+    for e in event_defs()
+        .into_iter()
+        .chain(cloud_event_defs())
+        .chain(membership_event_defs())
+    {
         c = c.event(e);
     }
     c
@@ -148,15 +153,41 @@ pub fn event_dataschemas(endpoint: &str) -> HashMap<String, String> {
     c.event_dataschemas(endpoint)
 }
 
-/// Event type to dataschema URI for a workspace's emitters: the lifecycle and the cloud facts, on the workspace's
-/// endpoint.
+/// Event type to dataschema URI for a workspace's emitters: the lifecycle, the cloud and the membership facts, on
+/// the workspace's endpoint.
 pub fn workspace_event_dataschemas(endpoint: &str) -> HashMap<String, String> {
     let mut c = Catalogue::new();
-    for e in event_defs().into_iter().chain(cloud_event_defs()) {
+    for e in event_defs()
+        .into_iter()
+        .chain(cloud_event_defs())
+        .chain(membership_event_defs())
+    {
         c = c.event(e);
     }
     c.event_dataschemas(endpoint)
 }
+
+/// The facts about a workspace's membership, told at the root under the command that made each and again on the
+/// workspace's own stream, for its members.
+pub const MEMBERSHIP_EVENTS: &[&str] = &[
+    "WorkspaceCreatedV1",
+    "MemberInvitedV1",
+    "MemberJoinedV1",
+    "MemberLeftV1",
+];
+
+/// The facts that are a workspace's own, which every member of it reads whatever their grant: its membership, its
+/// clouds and its peers. What a workload's holder alone reads stays the lifecycle's rule.
+pub const WORKSPACE_EVENTS: &[&str] = &[
+    "WorkspaceCreatedV1",
+    "MemberInvitedV1",
+    "MemberJoinedV1",
+    "MemberLeftV1",
+    "CloudConfiguredV1",
+    "CloudArchivedV1",
+    "PeerJoined",
+    "PeerLost",
+];
 
 /// What a credential may be approved for: `deploy` models (pull, deploy, undeploy), run `jobs` (run, stop); `all` is
 /// every scope and every holder's workloads, what a credential approved with nothing said is. Reading the hardware
@@ -481,7 +512,7 @@ fn workspaces_query(m: Arc<dyn Membership>) -> QueryDef {
     QueryDef {
         schema: "get-workspaces".into(),
         version: "1.0".into(),
-        description: "Who you are on this door and where you belong: identity, the opaque id of your credential, which an owner names to invite you; workspaces, every workspace you own or are a member of, each with its id, name, your role, its members, and the endpoint and manifest of its own door, where its clouds, devices, workloads, commands and events are; and invitations, the workspaces you were invited into and have not accepted, which accept-invitation takes. Nothing of a workspace you do not belong to is listed.".into(),
+        description: "Who you are on this door and where you belong: identity, the opaque id of your credential, which an owner names to invite you; workspaces, every workspace you own or are a member of, each with its id, name, your role, its members, and the endpoint and manifest of its own door, where its clouds, devices, workloads, commands and events are; and invitations, the workspaces you were invited into and have not accepted, which accept-invitation takes. Nothing of a workspace you do not belong to is listed, here or on this door's events: the root tells you the facts addressed to you (the workspaces you made or joined, the invitations you received) and the workspace's own stream tells its members the rest.".into(),
         parameters: None,
         response: json!({
             "type": "object",
