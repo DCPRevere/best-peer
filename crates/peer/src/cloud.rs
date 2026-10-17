@@ -1,10 +1,11 @@
-//! A peer that fronts peers: the cloud door. The same surface as a peer, where the devices are every member's,
-//! a deploy or a job is placed on the member with the room (the peer's own rule, applied across members) and sent
-//! there as the cloud's own command, and what the member tells about it comes back on the cloud's stream under the
-//! caller's correlation id, with the member named. The cloud holds no model and runs no job: it holds the log of what
-//! it placed, follows the members' streams, and squares its state with theirs on a timer, so a member that is gone is
-//! told as such for every workload it held. Members are a list the operator gives; each admits the cloud by its own
-//! sign-in, the device flow, with the code shown in the cloud's log for the person at that member's machine.
+//! A cloud: a named pool of machines inside a workspace, fronting the peers it is configured with. The same lifecycle
+//! as a peer, where the devices are every member's, named `cloud/peer/device`; a deploy or a job is placed on the
+//! member with the room (the peer's own rule, applied across members) and sent there as the cloud's own command, and
+//! what the member tells about it comes back on the workspace's stream under the caller's correlation id, with the
+//! cloud and the member named. The cloud holds no model and runs no job: it holds the fold of what it placed, follows
+//! the members' streams, and squares its state with theirs on a timer, so a member that is gone is told as such for
+//! every workload it held. Members are what `configure-cloud` listed; each admits the cloud by its own sign-in, the
+//! device flow, with the code shown in the door's log for the person at that member's machine.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,11 +24,13 @@ use serde_json::{json, Value};
 
 use crate::domain::Service;
 use crate::endpoint::{Route, Upstream};
+use crate::holdings::Holdings;
 use crate::lifecycle::{
     any_compute, mine, new_id, not_yours, parse, place, ready_deployment, require, within_share, workloads_view,
 };
 use crate::member::{Member, Refusal};
 use crate::state::{JobPhase, Phase, Reservation, State};
+use crate::transport::Transport;
 
 /// How often the cloud squares its state with its members', and the most a member may be silent before its
 /// workloads are told as ended: the same thirty seconds a peer gives a lost engine.
@@ -49,15 +52,31 @@ const TERMINAL: &[&str] = &[
     "CommandFailed",
 ];
 
-/// A member's credential and the cloud's place on its stream, kept across restarts in `<data>/members.json`.
+/// A member's credential and the cloud's place on its stream, kept across restarts in the cloud's `members.json`.
 #[derive(Serialize, Deserialize, Clone, Default)]
-struct Saved {
-    name: String,
-    endpoint: String,
+pub struct Saved {
+    pub name: String,
+    pub endpoint: String,
     #[serde(default)]
-    key: Option<String>,
+    pub key: Option<String>,
     #[serde(default)]
-    last_event: Option<String>,
+    pub last_event: Option<String>,
+}
+
+/// Writes a cloud's members file, for a test that stands in for the members' approvals.
+#[cfg(test)]
+pub fn save_members(file: &Path, saved: &[Saved]) -> std::io::Result<()> {
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    crate::tls::write_private(file, &serde_json::to_vec_pretty(saved).unwrap_or_default())
+}
+
+fn read_saved(file: &Path) -> Vec<Saved> {
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
 }
 
 /// What the cloud sent a member and still listens for, by the member and the correlation the member was given:
@@ -87,12 +106,19 @@ enum Contact {
 }
 
 pub struct Cloud {
+    /// The cloud's name: the first part of its device ids, and what every fact it tells carries as `cloud`.
+    pub name: String,
+    /// The workspace the cloud is in, for the log lines and the connection name it signs in under.
+    workspace: String,
     pub log: Arc<EventLog>,
     service: String,
+    /// The workspace's door, what `DeploymentReady` names an endpoint under.
     endpoint: String,
     dataschemas: Arc<HashMap<String, String>>,
     completions: Arc<HashMap<String, HashSet<String>>>,
-    pub members: Vec<Arc<Member>>,
+    members: Mutex<Vec<Arc<Member>>>,
+    transport: Arc<dyn Transport>,
+    holdings: Arc<Holdings>,
     pub state: Mutex<State>,
     issued: Mutex<HashMap<(String, String), Issued>>,
     pulls: Mutex<HashMap<String, Pull>>,
@@ -104,7 +130,11 @@ pub struct Cloud {
     /// a fact still on its way on the stream is not outrun.
     missing: Mutex<HashSet<String>>,
     file: Option<PathBuf>,
-    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The task following each member, by the member's name, and the reconcile tick.
+    tasks: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    ticking: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Whether `follow` was called: a member added after it is followed at once.
+    following: std::sync::atomic::AtomicBool,
 }
 
 /// A member's `get-hardware-state`, as the abstraction's types.
@@ -136,37 +166,46 @@ struct RunJobData {
 }
 
 impl Cloud {
-    /// A cloud over `members`, its log, and the file its members' credentials and cursors are kept in (none for a
-    /// cloud that forgets them at exit). A member already in the file keeps the credential it was issued.
+    /// A cloud `name` of workspace `workspace`, over `members` (name and endpoint), its workspace's log, and the
+    /// file its members' credentials and cursors are kept in (none for a cloud that forgets them at exit). A member
+    /// already in the file keeps the credential it was issued.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        name: &str,
+        workspace: &str,
         endpoint: &str,
         service: &str,
         log: Arc<EventLog>,
         dataschemas: Arc<HashMap<String, String>>,
         completions: Arc<HashMap<String, HashSet<String>>>,
-        members: Vec<Arc<Member>>,
+        members: &[(String, String)],
         file: Option<PathBuf>,
-    ) -> Self {
+        transport: Arc<dyn Transport>,
+        holdings: Arc<Holdings>,
+    ) -> Arc<Self> {
+        let saved = file.as_deref().map(read_saved).unwrap_or_default();
         let mut cursors = HashMap::new();
-        if let Some(saved) = file.as_ref().and_then(|f| read_saved(f)) {
-            for s in saved {
-                if let Some(m) = members.iter().find(|m| m.name == s.name && m.endpoint == s.endpoint) {
-                    if let Some(k) = s.key {
-                        m.set_key(k);
-                    }
-                    if let Some(id) = s.last_event {
-                        cursors.insert(s.name.clone(), id);
-                    }
+        let list: Vec<Arc<Member>> = members
+            .iter()
+            .map(|(n, e)| {
+                let kept = saved.iter().find(|s| s.endpoint == e.trim_end_matches('/'));
+                if let Some(id) = kept.and_then(|s| s.last_event.clone()) {
+                    cursors.insert(n.clone(), id);
                 }
-            }
-        }
-        Self {
+                Arc::new(Member::new(n, e, kept.and_then(|s| s.key.clone()), transport.clone()))
+            })
+            .collect();
+        let cloud = Arc::new(Self {
+            name: name.into(),
+            workspace: workspace.into(),
             log,
             service: service.into(),
             endpoint: endpoint.trim_end_matches('/').into(),
             dataschemas,
             completions,
-            members,
+            members: Mutex::new(list),
+            transport,
+            holdings: holdings.clone(),
             state: Mutex::new(State::default()),
             issued: Mutex::new(HashMap::new()),
             pulls: Mutex::new(HashMap::new()),
@@ -174,14 +213,31 @@ impl Cloud {
             reachable: Mutex::new(HashMap::new()),
             missing: Mutex::new(HashSet::new()),
             file,
-            tasks: Mutex::new(Vec::new()),
-        }
+            tasks: Mutex::new(HashMap::new()),
+            ticking: Mutex::new(None),
+            following: std::sync::atomic::AtomicBool::new(false),
+        });
+        let weak = Arc::downgrade(&cloud);
+        holdings.add(move |holder| {
+            weak.upgrade()
+                .map(|c| c.state.lock().unwrap().held_by(holder))
+                .unwrap_or(0)
+        });
+        cloud
     }
 
-    /// Folds every fact the log holds into the state. Run once, before the door opens.
+    /// Folds every fact the log holds about this cloud into the state. Run once, before the cloud is used.
     pub fn rebuild(&self) {
         let mut state = self.state.lock().unwrap();
-        self.log.replay(|e| state.apply(e));
+        self.log.replay(|e| {
+            if e.data["cloud"].as_str() == Some(&self.name) {
+                state.apply(e)
+            }
+        });
+    }
+
+    pub fn members(&self) -> Vec<Arc<Member>> {
+        self.members.lock().unwrap().clone()
     }
 
     /// Writes the members' credentials and cursors, whole or not at all.
@@ -189,7 +245,7 @@ impl Cloud {
         let Some(file) = &self.file else { return };
         let cursors = self.cursors.lock().unwrap();
         let saved: Vec<Saved> = self
-            .members
+            .members()
             .iter()
             .map(|m| Saved {
                 name: m.name.clone(),
@@ -199,7 +255,11 @@ impl Cloud {
             })
             .collect();
         let tmp = file.with_extension("json.tmp");
-        let written = crate::tls::write_private(&tmp, &serde_json::to_vec_pretty(&saved).unwrap_or_default())
+        let written = file
+            .parent()
+            .map(std::fs::create_dir_all)
+            .unwrap_or(Ok(()))
+            .and_then(|()| crate::tls::write_private(&tmp, &serde_json::to_vec_pretty(&saved).unwrap_or_default()))
             .and_then(|()| std::fs::rename(&tmp, file));
         if let Err(e) = written {
             tracing::warn!(file = %file.display(), error = %e, "the members' credentials could not be saved");
@@ -211,8 +271,9 @@ impl Cloud {
             .with_completions(self.completions.clone())
     }
 
-    /// Tells a fact of the cloud's own: appended, then folded.
-    fn tell(&self, em: &Emitter, r#type: &str, data: Value) -> Envelope {
+    /// Tells a fact of the cloud's own, with the cloud named: appended, then folded.
+    fn tell(&self, em: &Emitter, r#type: &str, mut data: Value) -> Envelope {
+        data["cloud"] = json!(self.name);
         let workload = data["deployment"].as_str().or(data["job"].as_str()).map(str::to_string);
         let e = em.emit(r#type, data);
         if let Some(w) = workload {
@@ -223,17 +284,18 @@ impl Cloud {
     }
 
     fn member(&self, name: &str) -> Option<Arc<Member>> {
-        self.members.iter().find(|m| m.name == name).cloned()
+        self.members.lock().unwrap().iter().find(|m| m.name == name).cloned()
     }
 
-    /// The name this cloud signs in to its members under: its host, one word.
+    /// The name this cloud signs in to its members under: the cloud's and the workspace's, one word, so a machine
+    /// serving two clouds, of one workspace or two, holds two credentials.
     fn connection_name(&self) -> String {
-        let host: String = host_of(&self.endpoint)
+        let word: String = format!("{}-{}", self.name, self.workspace)
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .take(40)
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+            .take(64)
             .collect();
-        format!("cloud-{}", host.trim_matches('-'))
+        word.trim_matches('-').to_string()
     }
 
     /// What the member names as `holder` for the workloads this cloud placed there.
@@ -244,30 +306,77 @@ impl Cloud {
     /// The members admitted and answering at the last tick: where anything can be placed.
     fn up(&self) -> Vec<Arc<Member>> {
         let reachable = self.reachable.lock().unwrap();
-        self.members
-            .iter()
+        self.members()
+            .into_iter()
             .filter(|m| m.admitted() && reachable.get(&m.name).copied().unwrap_or(true))
-            .cloned()
             .collect()
+    }
+
+    /// Each member with how it stands: `up`, `joining` (it has not admitted this cloud yet) or `unreachable`, as
+    /// of the last tick.
+    pub fn peers(&self) -> Vec<Value> {
+        let reachable = self.reachable.lock().unwrap();
+        self.members()
+            .iter()
+            .map(|m| {
+                let state = if !m.admitted() {
+                    "joining"
+                } else if reachable.get(&m.name).copied().unwrap_or(true) {
+                    "up"
+                } else {
+                    "unreachable"
+                };
+                json!({ "peer": m.name, "endpoint": m.endpoint, "state": state })
+            })
+            .collect()
+    }
+
+    /// The workloads this cloud holds, admitted ones included, by name; on `peer` alone when one is given.
+    pub fn holds(&self, peer: Option<&str>) -> Vec<Value> {
+        let s = self.state.lock().unwrap();
+        let on = |p: &Option<String>| peer.is_none_or(|w| p.as_deref() == Some(w));
+        let prefix = |p: &str| format!("{}/{p}/", self.name);
+        let reserved_on =
+            |d: &Option<DeviceId>| peer.is_none_or(|w| d.as_ref().is_some_and(|d| d.0.starts_with(&prefix(w))));
+        let mut out: Vec<Value> = s
+            .deployments
+            .values()
+            .filter(|d| on(&d.peer))
+            .map(|d| json!({ "deployment": d.id, "model": d.model, "peer": d.peer }))
+            .collect();
+        out.extend(
+            s.jobs
+                .values()
+                .filter(|j| on(&j.peer))
+                .map(|j| json!({ "job": j.id, "image": j.image.0, "peer": j.peer })),
+        );
+        out.extend(
+            s.reserved
+                .values()
+                .filter(|r| reserved_on(&r.device))
+                .map(|r| json!({ "admitted": r.id, "device": r.device.as_ref().map(|d| d.0.clone()) })),
+        );
+        out
     }
 
     /// Records whether a member answered, and tells the membership fact when that changed.
     fn contact(&self, member: &Member, now: bool, why: &str) -> Contact {
         let before = self.reachable.lock().unwrap().insert(member.name.clone(), now);
+        let em = self.emitter(&format!("{}/{}", self.name, member.name));
         match (before, now) {
             (Some(true), false) | (None, false) => {
-                tracing::warn!(peer = %member.name, %why, "a member peer is unreachable");
+                tracing::warn!(cloud = %self.name, peer = %member.name, %why, "a member peer is unreachable");
                 self.tell(
-                    &self.emitter(&format!("peer-{}", member.name)),
+                    &em,
                     "PeerLost",
                     json!({ "peer": member.name, "endpoint": member.endpoint, "reason": why }),
                 );
                 Contact::Lost
             }
             (Some(false), true) | (None, true) => {
-                tracing::info!(peer = %member.name, "a member peer answers");
+                tracing::info!(cloud = %self.name, peer = %member.name, "a member peer answers");
                 self.tell(
-                    &self.emitter(&format!("peer-{}", member.name)),
+                    &em,
                     "PeerJoined",
                     json!({ "peer": member.name, "endpoint": member.endpoint }),
                 );
@@ -277,16 +386,18 @@ impl Cloud {
         }
     }
 
-    /// Every admitted member's devices as one host, each device named `<peer>/<id>`, with the members as they
+    /// Every admitted member's devices as one host, each device named `cloud/peer/id`, with the members as they
     /// answered this time. A device's free memory is what the member's own placement would allow: the free memory
     /// it reports, less what the member has promised to workloads there that have not taken it yet. Whether a
     /// member is lost is the reconcile tick's to say, not a read's.
     async fn combined(&self) -> (Host, Vec<Value>) {
         let mut devices = Vec::new();
         let mut peers = Vec::new();
-        for m in &self.members {
+        for m in self.members() {
+            let row =
+                |state: &str| json!({ "cloud": self.name, "peer": m.name, "endpoint": m.endpoint, "state": state });
             if !m.admitted() {
-                peers.push(json!({ "peer": m.name, "endpoint": m.endpoint, "state": "joining" }));
+                peers.push(row("joining"));
                 continue;
             }
             let answered = async {
@@ -297,28 +408,31 @@ impl Cloud {
             .await;
             match answered {
                 Ok((promised, hs)) => {
+                    let mut up = row("up");
                     let seen: Seen = match serde_json::from_value(hs.clone()) {
                         Ok(h) => h,
                         Err(e) => {
-                            tracing::warn!(peer = %m.name, error = %e, "the member's hardware state could not be read");
-                            peers.push(json!({ "peer": m.name, "endpoint": m.endpoint, "state": "up", "driver": hs["driver"] }));
+                            tracing::warn!(cloud = %self.name, peer = %m.name, error = %e, "the member's hardware state could not be read");
+                            up["driver"] = hs["driver"].clone();
+                            peers.push(up);
                             continue;
                         }
                     };
-                    peers.push(json!({ "peer": m.name, "endpoint": m.endpoint, "state": "up", "driver": seen.driver }));
+                    up["driver"] = json!(seen.driver);
+                    peers.push(up);
                     for mut d in seen.devices {
                         let held = promised.get(&d.id.0).copied().unwrap_or(0);
                         d.memory.free_bytes = d.memory.free_bytes.min(d.memory.total_bytes.saturating_sub(held));
                         devices.push(Device {
-                            id: DeviceId(format!("{}/{}", m.name, d.id.0)),
+                            id: DeviceId(format!("{}/{}/{}", self.name, m.name, d.id.0)),
                             ..d
                         });
                     }
                 }
                 Err(e) => {
-                    peers.push(
-                        json!({ "peer": m.name, "endpoint": m.endpoint, "state": "unreachable", "reason": e.text() }),
-                    );
+                    let mut down = row("unreachable");
+                    down["reason"] = json!(e.text());
+                    peers.push(down);
                 }
             }
         }
@@ -332,9 +446,9 @@ impl Cloud {
         )
     }
 
-    /// The member a cloud device id names, and the device's id on it.
-    fn split_device(id: &str) -> Option<(&str, &str)> {
-        id.split_once('/')
+    /// The member a device id of this cloud names, and the device's id on it: `cloud/peer/device`.
+    fn split_device<'a>(&self, id: &'a str) -> Option<(&'a str, &'a str)> {
+        id.strip_prefix(&format!("{}/", self.name))?.split_once('/')
     }
 
     /// The command as the member receives it: the cloud's own, with an id and a correlation unique to the cloud
@@ -392,7 +506,7 @@ impl Cloud {
         key.split_once(':').unwrap_or(("", key))
     }
 
-    /// Whether the command with this key already made a workload the cloud knows: a command run again after a
+    /// Whether the command with this key already made a workload this cloud knows: a command run again after a
     /// restart is already placed, and the member runs it.
     fn already_placed(&self, key: &str) -> Option<String> {
         let (sender, id) = Self::sender_of(key);
@@ -406,11 +520,17 @@ impl Cloud {
         Some(peer)
     }
 
+    /// Whether this cloud holds the workload `id`, as a deployment or a job.
+    pub fn holds_workload(&self, id: &str) -> bool {
+        let s = self.state.lock().unwrap();
+        s.deployments.contains_key(id) || s.jobs.contains_key(id)
+    }
+
     // ----- what the members tell ----------------------------------------------------------------------------------
 
-    /// A fact a member told, relayed when it answers something the cloud sent there: told again on the cloud's log
-    /// under the caller's correlation, with the member named and the caller as the holder, and folded into the
-    /// state.
+    /// A fact a member told, relayed when it answers something the cloud sent there: told again on the workspace's
+    /// log under the caller's correlation, with the cloud and the member named and the caller as the holder, and
+    /// folded into the state.
     fn relay(&self, member: &Member, id: &str, e: &Envelope) {
         let issued = e.correlationid.as_deref().and_then(|mc| {
             self.issued
@@ -423,7 +543,7 @@ impl Cloud {
             let mut data = e.data.clone();
             data["peer"] = json!(member.name);
             if let Some(device) = data["device"].as_str().filter(|d| !d.is_empty() && !d.contains('/')) {
-                data["device"] = json!(format!("{}/{device}", member.name));
+                data["device"] = json!(format!("{}/{}/{device}", self.name, member.name));
             }
             if let Some(key) = pull {
                 self.on_pull_fact(member, &key, &em, &e.r#type, data);
@@ -514,50 +634,14 @@ impl Cloud {
 
     /// Follows every member for as long as the cloud runs: signs in where it is not admitted yet, or no longer is,
     /// then relays the member's stream, reconnecting from the last event it relayed; and squares the state with the
-    /// members on a timer.
+    /// members on a timer. A member added later is followed from the moment it is added.
     pub fn follow(self: &Arc<Self>) {
-        let mut tasks = self.tasks.lock().unwrap();
-        for m in &self.members {
-            let (me, member) = (self.clone(), m.clone());
-            tasks.push(tokio::spawn(async move {
-                loop {
-                    if !member.admitted() {
-                        me.sign_in(&member).await;
-                    }
-                    let last = me.cursors.lock().unwrap().get(&member.name).cloned();
-                    match member.stream(last.as_deref()).await {
-                        Ok(stream) => {
-                            let mut stream = std::pin::pin!(stream);
-                            loop {
-                                match tokio::time::timeout(STREAM_SILENCE, stream.next()).await {
-                                    Ok(Some((id, e))) => me.relay(&member, &id, &e),
-                                    Ok(None) => {
-                                        tracing::info!(peer = %member.name, "the member's stream ended; reconnecting");
-                                        break;
-                                    }
-                                    Err(_) => {
-                                        tracing::info!(peer = %member.name, "the member's stream went silent; reconnecting");
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) if e.is_unauthorized() => {
-                            tracing::warn!(peer = %member.name, "the member no longer honours this cloud's credential; signing in again");
-                            member.clear_key();
-                            me.save();
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::debug!(peer = %member.name, why = %e.text(), "the member's stream is not open");
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }));
+        self.following.store(true, std::sync::atomic::Ordering::SeqCst);
+        for m in self.members() {
+            self.follow_member(&m);
         }
         let me = self.clone();
-        tasks.push(tokio::spawn(async move {
+        *self.ticking.lock().unwrap() = Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(RECONCILE_EVERY).await;
                 me.reconcile().await;
@@ -565,10 +649,123 @@ impl Cloud {
         }));
     }
 
+    fn follow_member(self: &Arc<Self>, member: &Arc<Member>) {
+        let (me, member) = (self.clone(), member.clone());
+        let name = member.name.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                if !member.admitted() {
+                    me.sign_in(&member).await;
+                }
+                let last = me.cursors.lock().unwrap().get(&member.name).cloned();
+                match member.stream(last.as_deref()).await {
+                    Ok(stream) => {
+                        let mut stream = std::pin::pin!(stream);
+                        loop {
+                            match tokio::time::timeout(STREAM_SILENCE, stream.next()).await {
+                                Ok(Some((id, e))) => me.relay(&member, &id, &e),
+                                Ok(None) => {
+                                    tracing::info!(cloud = %me.name, peer = %member.name, "the member's stream ended; reconnecting");
+                                    break;
+                                }
+                                Err(_) => {
+                                    tracing::info!(cloud = %me.name, peer = %member.name, "the member's stream went silent; reconnecting");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) if e.is_unauthorized() => {
+                        tracing::warn!(cloud = %me.name, peer = %member.name, "the member no longer honours this cloud's credential; signing in again");
+                        member.clear_key();
+                        me.save();
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::debug!(cloud = %me.name, peer = %member.name, why = %e.text(), "the member's stream is not open");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+        if let Some(old) = self.tasks.lock().unwrap().insert(name, task) {
+            old.abort();
+        }
+    }
+
+    /// Stops following the members: nothing more is relayed or squared. What the cloud placed stays in its state.
+    pub fn halt(&self) {
+        for (_, t) in self.tasks.lock().unwrap().drain() {
+            t.abort();
+        }
+        if let Some(t) = self.ticking.lock().unwrap().take() {
+            t.abort();
+        }
+    }
+
+    /// Changes the members to `members`: one kept (same endpoint) keeps its credential, its cursor and its stream;
+    /// one removed is no longer followed; one added is signed in to and followed, when the cloud is following.
+    pub fn reconfigure(self: &Arc<Self>, members: &[(String, String)]) {
+        let before = self.members();
+        let saved = self.file.as_deref().map(read_saved).unwrap_or_default();
+        let mut after: Vec<Arc<Member>> = Vec::new();
+        let mut added: Vec<Arc<Member>> = Vec::new();
+        for (name, endpoint) in members {
+            let endpoint = endpoint.trim_end_matches('/');
+            match before.iter().find(|m| m.endpoint == endpoint) {
+                Some(kept) if kept.name == *name => after.push(kept.clone()),
+                kept => {
+                    // A new machine, or one renamed: the credential is the machine's to keep, the name is ours. A
+                    // machine that admitted this cloud before (its credential in the file) is admitted still.
+                    let key = kept.and_then(|k| k.key()).or_else(|| {
+                        saved
+                            .iter()
+                            .find(|s| s.endpoint == endpoint)
+                            .and_then(|s| s.key.clone())
+                    });
+                    let m = Arc::new(Member::new(name, endpoint, key, self.transport.clone()));
+                    if let Some(k) = kept {
+                        let mut cursors = self.cursors.lock().unwrap();
+                        if let Some(c) = cursors.remove(&k.name) {
+                            cursors.insert(name.clone(), c);
+                        }
+                    }
+                    added.push(m.clone());
+                    after.push(m);
+                }
+            }
+        }
+        let gone: Vec<Arc<Member>> = before
+            .iter()
+            .filter(|b| !after.iter().any(|a| Arc::ptr_eq(a, b)))
+            .cloned()
+            .collect();
+        *self.members.lock().unwrap() = after;
+        {
+            let mut tasks = self.tasks.lock().unwrap();
+            for g in &gone {
+                if let Some(t) = tasks.remove(&g.name) {
+                    t.abort();
+                }
+                self.reachable.lock().unwrap().remove(&g.name);
+                self.cursors.lock().unwrap().remove(&g.name);
+            }
+        }
+        if self.following.load(std::sync::atomic::Ordering::SeqCst) {
+            for m in &added {
+                self.follow_member(m);
+            }
+        }
+        self.save();
+    }
+
     /// The device-flow sign-in with a member, until it admits this cloud: the code goes to the log for the person
     /// at that member's machine, a code that expires is asked again.
     async fn sign_in(&self, member: &Member) {
-        let label = format!("the cloud door at {}", self.endpoint);
+        let label = format!(
+            "cloud {} of workspace {} at {}",
+            self.name, self.workspace, self.endpoint
+        );
         let connection = self.connection_name();
         loop {
             let asked = match member
@@ -584,19 +781,19 @@ impl Cloud {
             {
                 Ok(a) => a,
                 Err(e) => {
-                    tracing::warn!(peer = %member.name, why = %e.text(), "the member did not start the sign-in; trying again in five seconds");
+                    tracing::warn!(cloud = %self.name, peer = %member.name, why = %e.text(), "the member did not start the sign-in; trying again in five seconds");
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
             };
             let (Some(user_code), Some(device_code)) = (asked["user_code"].as_str(), asked["device_code"].as_str())
             else {
-                tracing::warn!(peer = %member.name, "the member's sign-in answer has no code; trying again in five seconds");
+                tracing::warn!(cloud = %self.name, peer = %member.name, "the member's sign-in answer has no code; trying again in five seconds");
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             };
             let interval = asked["interval"].as_u64().unwrap_or(5).max(1);
-            tracing::info!(peer = %member.name, code = %user_code, "to admit this cloud on {}, run on that machine: best-peer approve {user_code}", member.name);
+            tracing::info!(cloud = %self.name, workspace = %self.workspace, peer = %member.name, code = %user_code, "to admit cloud {} of workspace {} on {}, run on that machine: best-peer approve {user_code}", self.name, self.workspace, member.name);
             loop {
                 tokio::time::sleep(Duration::from_secs(interval)).await;
                 match member
@@ -614,7 +811,7 @@ impl Cloud {
                         if let Some(key) = token["access_token"].as_str() {
                             member.set_key(key.to_string());
                             self.save();
-                            tracing::info!(peer = %member.name, "admitted by the member");
+                            tracing::info!(cloud = %self.name, peer = %member.name, "admitted by the member");
                             self.contact(member, true, "");
                             return;
                         }
@@ -622,13 +819,13 @@ impl Cloud {
                     Err(Refusal::Refused { body, .. }) => match body["error"].as_str() {
                         Some("authorization_pending") | Some("slow_down") => continue,
                         Some(other) => {
-                            tracing::info!(peer = %member.name, %other, "the sign-in code is no longer good; a new one follows");
+                            tracing::info!(cloud = %self.name, peer = %member.name, %other, "the sign-in code is no longer good; a new one follows");
                             break;
                         }
                         None => continue,
                     },
                     Err(Refusal::Unreachable(why)) => {
-                        tracing::debug!(peer = %member.name, %why, "the member did not answer the token poll");
+                        tracing::debug!(cloud = %self.name, peer = %member.name, %why, "the member did not answer the token poll");
                     }
                 }
             }
@@ -641,10 +838,10 @@ impl Cloud {
     /// runs a workload of this cloud's, told as ended meanwhile, is asked to end it, so the two say the same.
     pub async fn reconcile(&self) {
         futures::future::join_all(
-            self.members
-                .iter()
+            self.members()
+                .into_iter()
                 .filter(|m| m.admitted())
-                .map(|m| self.reconcile_member(m)),
+                .map(|m| async move { self.reconcile_member(&m).await }),
         )
         .await;
     }
@@ -691,7 +888,7 @@ impl Cloud {
                 }
             }
             Err(e) if e.is_unauthorized() => {
-                tracing::warn!(peer = %m.name, "the member no longer honours this cloud's credential; signing in again");
+                tracing::warn!(cloud = %self.name, peer = %m.name, "the member no longer honours this cloud's credential; signing in again");
                 m.clear_key();
                 self.save();
             }
@@ -722,7 +919,8 @@ impl Cloud {
             if let Some(pull) = &i.pull {
                 self.on_pull_fact(m, pull, &i.em, "ImagePullFailed", json!({ "reason": why }));
             } else if i.ends.is_some() || key.is_empty() {
-                i.em.emit(
+                self.tell(
+                    &i.em,
                     "CommandFailed",
                     json!({ "type": mc, "reason": format!("{why}; what it was to end is told as ended") }),
                 );
@@ -731,7 +929,8 @@ impl Cloud {
                 if self.log.workload_of(sender, id).is_none() {
                     // Never started there: nothing of it exists to be told as ended.
                     self.state.lock().unwrap().reserved.remove(&key);
-                    i.em.emit(
+                    self.tell(
+                        &i.em,
                         "CommandFailed",
                         json!({ "type": mc, "reason": format!("{why} before the workload started; send it again when it answers") }),
                     );
@@ -755,16 +954,17 @@ impl Cloud {
                 })
                 .unwrap_or_default()
         };
+        let correlation = format!("{}/{}", self.name, m.name);
         for id in stray(&w["deployments"], "deployment") {
-            tracing::info!(peer = %m.name, deployment = %id, "the member still runs a deployment this cloud told as ended; ending it there");
-            let em = self.emitter(&format!("peer-{}", m.name));
+            tracing::info!(cloud = %self.name, peer = %m.name, deployment = %id, "the member still runs a deployment this cloud told as ended; ending it there");
+            let em = self.emitter(&correlation);
             let _ = self
                 .place_on(m, &em, "UndeployModel", "undeploy-model", json!({ "deployment": id }))
                 .await;
         }
         for id in stray(&w["jobs"], "job") {
-            tracing::info!(peer = %m.name, job = %id, "the member still runs a job this cloud told as ended; stopping it there");
-            let em = self.emitter(&format!("peer-{}", m.name));
+            tracing::info!(cloud = %self.name, peer = %m.name, job = %id, "the member still runs a job this cloud told as ended; stopping it there");
+            let em = self.emitter(&correlation);
             let _ = self.place_on(m, &em, "StopJob", "stop-job", json!({ "job": id })).await;
         }
     }
@@ -772,13 +972,13 @@ impl Cloud {
     /// Tells the end of a workload the cloud can no longer see, once; one already ending is ended too, since
     /// whatever was ending it cannot say so any more.
     fn end(&self, id: &str, deployment: bool, reason: &str) {
-        let (correlation, model_or_image) = {
+        let (correlation, model_or_image, peer) = {
             let mut s = self.state.lock().unwrap();
             if deployment {
                 match s.deployments.get_mut(id) {
                     Some(d) => {
                         d.phase = Phase::Ending;
-                        (d.correlation.clone(), d.model.clone())
+                        (d.correlation.clone(), d.model.clone(), d.peer.clone())
                     }
                     None => return,
                 }
@@ -786,7 +986,7 @@ impl Cloud {
                 match s.jobs.get_mut(id) {
                     Some(j) => {
                         j.phase = JobPhase::Stopping;
-                        (j.correlation.clone(), j.image.0.clone())
+                        (j.correlation.clone(), j.image.0.clone(), j.peer.clone())
                     }
                     None => return,
                 }
@@ -798,13 +998,13 @@ impl Cloud {
             self.tell(
                 &em,
                 "DeploymentEnded",
-                json!({ "deployment": id, "model": model_or_image, "exit_code": null, "reason": reason }),
+                json!({ "deployment": id, "model": model_or_image, "exit_code": null, "reason": reason, "peer": peer }),
             );
         } else {
             self.tell(
                 &em,
                 "JobFailed",
-                json!({ "job": id, "image": model_or_image, "reason": reason, "fix": "run it again once the peer is back" }),
+                json!({ "job": id, "image": model_or_image, "reason": reason, "fix": "run it again once the peer is back", "peer": peer }),
             );
         }
     }
@@ -825,7 +1025,12 @@ impl Service for Cloud {
         let mut v = crate::domain::host_state(&host);
         if let Some(devices) = v["devices"].as_array_mut() {
             for d in devices {
-                if let Some((peer, _)) = d["id"].as_str().and_then(Self::split_device) {
+                let peer = d["id"]
+                    .as_str()
+                    .and_then(|id| self.split_device(id))
+                    .map(|(peer, _)| peer.to_string());
+                if let Some(peer) = peer {
+                    d["cloud"] = json!(self.name);
                     d["peer"] = json!(peer);
                 }
             }
@@ -835,10 +1040,13 @@ impl Service for Cloud {
     }
 
     fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
-        Ok(workloads_view(&self.state.lock().unwrap(), who, &self.endpoint))
+        let held = self.holdings.held_by(&who.holder());
+        let mut v = workloads_view(&self.state.lock().unwrap(), who, &self.endpoint, Some(&self.name));
+        v["held_bytes"] = json!(held);
+        Ok(v)
     }
 
-    fn admit_pull(&self, who: &Credential) -> Result<(), BestError> {
+    fn admit_pull(&self, _cmd: Envelope, who: &Credential) -> Result<(), BestError> {
         require(who, "deploy")
     }
 
@@ -886,8 +1094,10 @@ impl Service for Cloud {
             return Ok(());
         }
         let (host, peers) = self.combined().await;
+        // What the credential holds is read before the state is locked: the door's holdings read this state too.
+        let held = self.holdings.held_by(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(&state, &who, data.memory_bytes)?;
+        within_share(held, &who, data.memory_bytes)?;
         let (device, compute) = place(
             &host,
             &state,
@@ -935,7 +1145,9 @@ impl Service for Cloud {
             );
             return;
         };
-        let member = Self::split_device(&device.0).and_then(|(peer, d)| self.member(peer).map(|m| (m, d)));
+        let member = self
+            .split_device(&device.0)
+            .and_then(|(peer, d)| self.member(peer).map(|m| (m, d)));
         let Some((member, member_device)) = member else {
             self.tell(
                 &em,
@@ -1038,8 +1250,9 @@ impl Service for Cloud {
             return Ok(());
         }
         let (host, peers) = self.combined().await;
+        let held = self.holdings.held_by(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(&state, &who, data.memory_bytes.unwrap_or(0))?;
+        within_share(held, &who, data.memory_bytes.unwrap_or(0))?;
         let placement = match data.memory_bytes {
             Some(needed) => place(
                 &host,
@@ -1056,11 +1269,17 @@ impl Service for Cloud {
                 let first = self.up().into_iter().next().ok_or_else(|| {
                     BestError::bad_request(
                         "NO_PEER",
-                        "no member peer answers: get-hardware-state lists the members and their state",
+                        format!(
+                            "no member peer of cloud {} answers: get-hardware-state lists the members and their state",
+                            self.name
+                        ),
                     )
-                    .with_details(json!({ "peers": peers }))
+                    .with_details(json!({ "cloud": self.name, "peers": peers }))
                 })?;
-                (DeviceId(format!("{}/", first.name)), best_peer_gpu::Compute::Cpu)
+                (
+                    DeviceId(format!("{}/{}/", self.name, first.name)),
+                    best_peer_gpu::Compute::Cpu,
+                )
             }
         };
         state.reserved.insert(
@@ -1099,7 +1318,9 @@ impl Service for Cloud {
             );
             return;
         };
-        let member = Self::split_device(&device.0).and_then(|(peer, d)| self.member(peer).map(|m| (m, d)));
+        let member = self
+            .split_device(&device.0)
+            .and_then(|(peer, d)| self.member(peer).map(|m| (m, d)));
         let Some((member, member_device)) = member else {
             self.tell(
                 &em,
@@ -1226,73 +1447,9 @@ fn promised_by_device(w: &Value) -> HashMap<String, u64> {
     out
 }
 
-fn read_saved(file: &Path) -> Option<Vec<Saved>> {
-    serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()
-}
-
-/// `BEST_PEER_MEMBERS`: `name=endpoint` or `endpoint` entries, comma-separated; a name not given is the endpoint's
-/// host.
-pub fn parse_members(text: &str) -> Result<Vec<(String, String)>, String> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    for entry in text.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-        let (name, endpoint) = match entry.split_once('=') {
-            Some((n, e)) if !n.contains("://") => (n.trim().to_string(), e.trim().to_string()),
-            _ => (host_of(entry), entry.to_string()),
-        };
-        if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
-            return Err(format!(
-                "BEST_PEER_MEMBERS entry {entry:?} is not a base URL: name=https://host:7777 or https://host:7777"
-            ));
-        }
-        if name.is_empty() || name.contains('/') {
-            return Err(format!(
-                "BEST_PEER_MEMBERS entry {entry:?} has no usable name: name=https://host:7777"
-            ));
-        }
-        if out.iter().any(|(n, _)| *n == name) {
-            return Err(format!(
-                "BEST_PEER_MEMBERS names {name} twice: give each member its own name"
-            ));
-        }
-        out.push((name, endpoint.trim_end_matches('/').to_string()));
-    }
-    if out.is_empty() {
-        return Err("BEST_PEER_MEMBERS is set but names no member".into());
-    }
-    Ok(out)
-}
-
-fn host_of(endpoint: &str) -> String {
-    let host = endpoint
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or_default();
-    match host.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or_default().to_string(),
-        None => host.split(':').next().unwrap_or_default().to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_member_list_names_each_member_once_by_its_host_or_as_told() {
-        let m = parse_members("https://10.0.0.5:7777, b=http://10.0.0.6:7777/").unwrap();
-        assert_eq!(
-            m,
-            [
-                ("10.0.0.5".to_string(), "https://10.0.0.5:7777".to_string()),
-                ("b".to_string(), "http://10.0.0.6:7777".to_string())
-            ]
-        );
-        assert!(parse_members("10.0.0.5:7777").unwrap_err().contains("base URL"));
-        assert!(parse_members("a=https://x, a=https://y").unwrap_err().contains("twice"));
-        assert!(parse_members(" ").unwrap_err().contains("no member"));
-    }
 
     #[test]
     fn a_member_command_is_named_for_the_cloud_command_and_fits_an_envelope() {

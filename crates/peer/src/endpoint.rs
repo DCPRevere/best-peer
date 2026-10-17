@@ -122,7 +122,7 @@ async fn forward(gw: &Gateway, req: Request) -> Result<Response, BestError> {
 }
 
 /// The credential, from the door's own header or the `Authorization: Bearer` the OpenAI-compatible clients send.
-fn credential(headers: &HeaderMap) -> &str {
+pub fn credential(headers: &HeaderMap) -> &str {
     let own = headers
         .get(AUTH_HEADER)
         .and_then(|v| v.to_str().ok())

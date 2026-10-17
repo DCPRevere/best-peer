@@ -3,8 +3,11 @@
 A peer is one binary on a machine with a GPU that puts that machine behind a
 [Behavioral State Protocol](https://behavioralstate.io) door. An agent that knows only the door's manifest can read the
 hardware state, deploy a model, follow its lifecycle on the event stream, run a prompt against the endpoint the event
-named, run a job and undeploy. Nothing is written for the agent beyond the manifest. Peers find, name and vouch for
-each other through BEST doors too, so the same word carries to the end game: a network of peers and no centre.
+named, run a job and undeploy. Nothing is written for the agent beyond the manifest. The same door hosts workspaces, the
+protocol's tenants: an organization or team creates one, invites the identities who may use it, and configures
+clouds in it, named pools of peers whose owners admit the cloud at their console; a workload is placed in a cloud of
+a workspace and every fact about it names the cloud, the peer and the device. Peers find, name and vouch for each
+other through BEST doors too, so the same word carries to the end game: a network of peers and no centre.
 
 best-peer is an implementation of BEST written in Rust from the spec text alone, sharing no code with any other, so
 the spec is proven portable and its gaps surface. It wraps an existing runtime (containers with the NVIDIA container
@@ -87,21 +90,22 @@ decides who is in, as with SSH keys, and what they may do: approved with nothing
 `--may deploy --memory 40G` makes one that may deploy models but run no job, and hold 40 GiB of device memory at
 most across its workloads, which it alone sees, prompts and ends.
 
-**4. More than one machine.** Run a peer on each, then one more `best-peer` anywhere with the list of them, and
-that one is a cloud door: the same manifest, commands, queries and events, where the devices are every member's
-(`a/gpu-0`), a deploy goes to the member with the room, and the facts come back with the member named:
-
-```bash
-BEST_PEER_LISTEN=0.0.0.0:7777 BEST_PEER_ENDPOINT=https://<the cloud's address>:7777 \
-BEST_PEER_MEMBERS=a=https://<machine a>:7777,b=https://<machine b>:7777 \
-BEST_PEER_TRUST=<a's cert.pem>,<b's cert.pem> ./best-peer
-```
-
-It signs in to each member as any agent would and logs the code: `to admit this cloud on a, run on that machine:
-best-peer approve <code>`. Once admitted, the member is `up` in the cloud's `get-hardware-state`; a member that
-stops answering is `PeerLost` on the cloud's stream, with every workload it held told as ended, and `PeerJoined`
-when it answers again. Prompts to the cloud's endpoints pass through to the member's. See [Run](#run) for the
-variables.
+**4. More than one machine.** Run a peer on each, and one more `best-peer` anywhere as the door your team enters
+by (a laptop with `BEST_PEER_GPU=none` will do; `BEST_PEER_TRUST=<a's cert.pem>,<b's cert.pem>` when the machines
+serve their own certificates). The pool is made through that door, by the agent, from the manifest alone: the
+person says "create a workspace called research, then configure a cloud called lab in it with the peers
+a=https://<machine a>:7777 and b=https://<machine b>:7777". The agent sends `create-workspace` at the root, reads
+the workspace's endpoint from `get-workspaces`, and sends `configure-cloud` there. The door signs in to each
+machine as any agent would and logs the code for its owner: `to admit cloud lab of workspace ws-… on a, run on that
+machine: best-peer approve <code>`. Once admitted, the machine is `up` in the workspace's `get-clouds` and its
+devices are in its `get-hardware-state` as `lab/a/gpu-0`; a deploy in the workspace names the cloud and goes to
+the peer with the room, every fact comes back on the workspace's stream with the cloud and the peer named, and
+prompts to the workspace's endpoints pass through to the peer's. A machine that stops answering is `PeerLost` on
+that stream, with every workload it held told as ended, and `PeerJoined` when it answers again. The same machine
+may serve a cloud of another workspace too; one cloud per workspace. Who else may use the pool is the owner's to
+say: `invite-member` with the identity their `get-workspaces` shows them, and they `accept-invitation`. A door
+started with `BEST_PEER_MEMBERS` set refuses to start and names these commands: the pool is configured through the
+door, not the process.
 
 **5. What the agent does from there.** Reads the hardware state (a card shows its memory, temperature, power,
 utilisation and the CUDA version; the host CPU is listed after it), deploys a model on it, follows the events to
@@ -113,11 +117,11 @@ the terminal output of the peer, whatever happened: the release notes say what i
 
 | Crate | What it owns |
 |---|---|
-| `crates/door` | The BEST surface, from the spec text: the manifest, the catalogues and schema documents, command ingest with refusals that say what to send and an idempotent `id`, the event log on disk with its paged history and its live stream, queries, workflows, and sign-in by the device flow with the guidance verbatim. Who approves is an `Approver` the peer chooses. |
+| `crates/door` | The BEST surface, from the spec text: the manifest, the catalogues and schema documents, command ingest with refusals that say what to send and an idempotent `id`, the event log on disk with its paged history and its live stream, queries, workflows, and sign-in by the device flow with the guidance verbatim; a door that hosts tenants declares their manifests' template and serves each tenant's capabilities as a door of its own. Who approves is an `Approver` the peer chooses. |
 | `crates/gpu` | The accelerator abstraction: a vendor-neutral snapshot of the host's devices (`Gpu`), each naming the compute APIs it offers (CUDA, ROCm, oneAPI, Metal, Vulkan, CPU) so a workload asks for an API and memory, never for a vendor. Ships the `Fake` tests run against. |
 | `crates/runtime` | The container runtime abstraction (`Runtime`): pull with progress, start with devices handed over by id and the ports published, stop, observe, and what the engine does on its own told as events. Ships the `Fake`. |
 | `crates/engine` | The inference engine abstraction (`Engine`): which engines serve a model (Ollama, vLLM), what to run for each, and how a served model is made ready, with progress. Ships the `Fake`. |
-| `crates/peer` | The `best-peer` binary: the door over the three abstractions, with the peer's own commands, queries and events, its state folded from the events it told, and `best-peer approve`, the operator's side of sign-in. |
+| `crates/peer` | The `best-peer` binary: the door over the three abstractions, with the peer's own commands, queries and events, its state folded from the events it told; the workspaces it hosts, each a tenant door with its clouds of peers, folded from their own logs; and `best-peer approve`, the operator's side of sign-in. |
 | `crates/host` | The host itself as a device: a `Gpu` adapter reporting the CPU and system memory, so a peer with no accelerator serves the whole lifecycle. |
 | `crates/nvml` | The `Gpu` adapter for NVIDIA cards through NVML: memory, temperature, power, utilisation and the CUDA version, read live; the peer refuses to start without the driver unless told the host has none. |
 | `crates/docker` | The `Runtime` adapter over the Docker Engine API: NVIDIA devices handed over through the container toolkit by their NVML UUID. |
@@ -151,19 +155,28 @@ host changes or fewer than thirty days of it remain, which the start-up line say
 where the door is that `best-peer approve` reads, so it reaches the peer over the same TLS, pinned to that
 certificate and no other.
 
-`BEST_PEER_MEMBERS` makes this peer a cloud door over the peers listed (`name=https://host:7777`, comma-separated;
-a name not given is the host). It holds no model and runs no job: `get-hardware-state` lists every member's devices
-as `<name>/<id>` with the members and their state, `deploy-model` and `run-job` are placed by the peer's own rule
-across members (or on the device named) and sent there as the cloud's command, `pull-image` goes to every member,
-and what a member tells comes back on the cloud's stream under the caller's correlation id with `peer` named; the
-endpoint `DeploymentReady` names is on the cloud's door and passes through to the member's with the cloud's own
-credential for it. The cloud signs in to each member by the device flow and logs the code to approve there; the
-credentials and its place on each member's stream live in `members.json` under the data folder. `BEST_PEER_TRUST`
-lists PEM files to trust beyond the public roots, for members serving their own certificates. Every thirty seconds
-the cloud squares its state with its members: one that does not answer within fifteen seconds is told as `PeerLost`,
-with its workloads told as ended and its commands in flight failed; `PeerJoined` when it answers again, and what it
-still runs of the cloud's by then is ended there, so the two agree; a workload a member no longer lists at two ticks
-running is told as ended. `BEST_PEER_GPU` and `BEST_PEER_RUNTIME` are not read on a cloud.
+Every door hosts **workspaces**, the BEST tenants. The root manifest declares their template
+(`/.well-known/best/{tenantId}`), and a workspace's own door is at `/workspaces/<id>` under the root, with its own
+log, catalogue, stream and correlation space; a credential opens the workspaces it belongs to and nothing of the
+others, and `get-workspaces` at the root lists them with each one's endpoint and manifest. At the root:
+`create-workspace` (whoever sends it is the owner), `invite-member` (the owner, naming the invitee's `identity`,
+the opaque id of their credential that `get-workspaces` shows them), `accept-invitation` and `leave-workspace`;
+owner and member are the only roles, and the owner stays. In a workspace: `configure-cloud` names a **cloud**, a
+pool of peers as `peer` and `endpoint`, and makes or changes it (one machine serves one cloud per workspace, and a
+peer still holding a workload is not removed); `archive-cloud` retires an empty one, and `get-clouds` lists them
+with each peer's state. The cloud signs in to each member by the device flow and logs the code to approve there;
+the credentials and its place on each member's stream live in `workspaces/<id>/clouds/<cloud>/members.json` under
+the data folder. The workspace's `get-hardware-state` lists every cloud's devices as `cloud/peer/device` with the
+peers and their state; `deploy-model`, `run-job` and `pull-image` take the `cloud` (a `device` names it too) and
+are placed by the peer's own rule across its members and sent there as the cloud's command; what a member tells
+comes back on the workspace's stream under the caller's correlation id with `cloud` and `peer` named; the endpoint
+`DeploymentReady` names is on the workspace's door and passes through to the member's with the cloud's own
+credential for it. `BEST_PEER_TRUST` lists PEM files to trust beyond the public roots, for members serving their own
+certificates. Every thirty seconds each cloud squares its state with its members: one that does not answer within
+fifteen seconds is told as `PeerLost`, with its workloads told as ended and its commands in flight failed;
+`PeerJoined` when it answers again, and what it still runs of the cloud's by then is ended there, so the two agree;
+a workload a member no longer lists at two ticks running is told as ended. A credential's share is counted across
+the whole door: its workloads at the root and in every workspace together.
 
 `BEST_PEER_GPU` (default `nvml`) is how the peer sees the hardware: through the NVIDIA driver's own library, every
 card with its memory, temperature, power, utilisation and the CUDA version the driver offers, read live at every
@@ -189,6 +202,8 @@ Everything an agent needs is in the catalogues. `get-hardware-state` says what d
 `get-workloads` says what already holds memory on them. `deploy-model` names a model, an engine (`ollama` runs on
 CUDA, ROCm or CPU; `vllm` on CUDA) and the device memory it needs; the peer places it on a device offering an API the
 engine runs on with that much room after what is already promised, or refuses at once with the reason and what to do.
+On a workspace's door the same commands take the `cloud` to place in (or a `device` as `cloud/peer/device`, which
+names it), the devices are every cloud's peers', and every row and event carries `cloud` and `peer`.
 The facts follow on the event stream under the command's correlation id, in order: `ImagePulling`, `ImagePulled`,
 `DeploymentStarted`, `WeightsLoading`, then `DeploymentReady` with the OpenAI-compatible endpoint prompts go to, or
 `DeploymentFailed`. What the engine does on its own later (`OutOfMemory`, `DeploymentEnded`) is told under the same
@@ -256,6 +271,11 @@ best-peer approve ABCD-EFGH
 That presents the machine's admin token, which only its owner can read, and the agent's next poll gets its credential:
 a key shown once, kept hashed, bound to the connection name the person gave. An operator who wants an identity
 provider instead plugs one in behind the `Approver` trait; the door never knows which stands behind it.
+
+**Where a credential belongs** is the workspaces it created or accepted an invitation into, on this door, and
+`get-workspaces` says which, with the identity the credential is known by there, an opaque id another workspace's
+owner names to invite it; the token answer's `endpoint` is the root, where that query is. A credential that has not
+joined any workspace still uses the machine's own surface at the root.
 
 **What a credential may do** is set at the approval and travels with the key. The manifest's authentication block
 lists the scopes: `deploy` (pull-image, deploy-model, undeploy-model) and `jobs` (run-job, stop-job); `all` is every

@@ -22,6 +22,7 @@ use tokio::sync::broadcast;
 
 use crate::domain::Service;
 use crate::endpoint::{Route, Upstream};
+use crate::holdings::Holdings;
 use crate::state::{JobPhase, Owner, Phase, Reservation, State};
 use crate::transport::Transport;
 
@@ -87,6 +88,8 @@ pub struct Peer {
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// How prompts reach the engines: plain HTTP on this host.
     transport: Arc<dyn Transport>,
+    /// What a credential holds across the door, for its share: this peer's own promises and every workspace's.
+    holdings: Arc<Holdings>,
 }
 
 #[derive(Deserialize)]
@@ -157,7 +160,24 @@ impl Peer {
             unowned: Mutex::new(HashMap::new()),
             tasks: Mutex::new(Vec::new()),
             transport: Arc::new(crate::transport::Http::plain()),
+            holdings: Arc::new(Holdings::default()),
         }
+    }
+
+    /// Measures shares against the whole door's holdings, not this peer's alone.
+    pub fn with_holdings(mut self, holdings: Arc<Holdings>) -> Self {
+        self.holdings = holdings;
+        self
+    }
+
+    /// Registers what this peer has promised with the door's holdings, so a share is counted across surfaces.
+    pub fn register_holdings(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        self.holdings.add(move |holder| {
+            weak.upgrade()
+                .map(|p| p.state.lock().unwrap().held_by(holder))
+                .unwrap_or(0)
+        });
     }
 
     /// Folds every fact the log holds into the state, then squares it with the engine. Run once, before the door
@@ -341,7 +361,7 @@ impl Peer {
     // ----- pull-image -----------------------------------------------------------------------------------------------
 
     /// A pull is a deploy's first step and needs the same scope.
-    pub fn admit_pull(&self, who: &Credential) -> Result<(), BestError> {
+    pub fn admit_pull(&self, _cmd: Envelope, who: &Credential) -> Result<(), BestError> {
         require(who, "deploy")
     }
 
@@ -367,8 +387,10 @@ impl Peer {
         require(&who, "deploy")?;
         let data: DeployData = parse(&cmd.data)?;
         let host = self.hardware().await?;
+        // What the credential holds is read before the state is locked: the door's holdings read this state too.
+        let held = self.holdings.held_by(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(&state, &who, data.memory_bytes)?;
+        within_share(held, &who, data.memory_bytes)?;
         let (device, compute) = place(
             &host,
             &state,
@@ -704,8 +726,9 @@ impl Peer {
             Some(_) => Some(self.hardware().await?),
             None => None,
         };
+        let held = self.holdings.held_by(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(&state, &who, data.memory_bytes.unwrap_or(0))?;
+        within_share(held, &who, data.memory_bytes.unwrap_or(0))?;
         let placement = match (data.memory_bytes, &host) {
             (Some(needed), Some(host)) => Some(place(
                 host,
@@ -981,8 +1004,10 @@ impl Peer {
 
     /// `get-workloads`: what is deployed and what runs, now.
     pub fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
-        let s = self.state.lock().unwrap();
-        Ok(workloads_view(&s, who, &self.endpoint))
+        let held = self.holdings.held_by(&who.holder());
+        let mut v = workloads_view(&self.state.lock().unwrap(), who, &self.endpoint, None);
+        v["held_bytes"] = json!(held);
+        Ok(v)
     }
 }
 
@@ -996,8 +1021,8 @@ impl Service for Peer {
         Peer::workloads(self, who)
     }
 
-    fn admit_pull(&self, who: &Credential) -> Result<(), BestError> {
-        Peer::admit_pull(self, who)
+    fn admit_pull(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        Peer::admit_pull(self, cmd, who)
     }
 
     async fn pull_image(self: Arc<Self>, cmd: Envelope, em: Emitter) {
@@ -1077,21 +1102,29 @@ pub(crate) fn ready_deployment<'a>(
     }
 }
 
-/// `get-workloads`' body: what `state` holds for `who`, each ready deployment's endpoint on the door at `endpoint`.
-pub(crate) fn workloads_view(s: &State, who: &Credential, endpoint: &str) -> Value {
+/// `get-workloads`' body: what `state` holds for `who`, each ready deployment's endpoint on the door at `endpoint`,
+/// each row with the `cloud` when the state is a cloud's. `held_bytes` is this state's alone; a door with more
+/// than one surface puts the whole door's in.
+pub(crate) fn workloads_view(s: &State, who: &Credential, endpoint: &str, cloud: Option<&str>) -> Value {
     let mine = |holder: &str| who.grant.is_all() || holder == who.holder();
+    let with_cloud = |mut row: Value| {
+        if let Some(c) = cloud {
+            row["cloud"] = json!(c);
+        }
+        row
+    };
     let deployments: Vec<Value> = s
         .deployments
         .values()
         .filter(|d| mine(&d.holder))
         .map(|d| {
-            json!({
+            with_cloud(json!({
                 "deployment": d.id, "model": d.model, "engine": d.engine, "device": d.device.0,
                 "memory_bytes": d.memory_bytes, "holder": d.holder, "peer": d.peer,
                 // Computed, not read back from the log: a deployment made by an earlier peer is on the door too.
                 "endpoint": d.endpoint.as_ref().map(|_| format!("{endpoint}/deployments/{}{}", d.id, d.engine.openai_path())),
                 "phase": match d.phase { Phase::Starting => "starting", Phase::Ready => "ready", Phase::Ending => "ending" }
-            })
+            }))
         })
         .collect();
     let jobs: Vec<Value> = s
@@ -1099,11 +1132,11 @@ pub(crate) fn workloads_view(s: &State, who: &Credential, endpoint: &str) -> Val
         .values()
         .filter(|j| mine(&j.holder))
         .map(|j| {
-            json!({
+            with_cloud(json!({
                 "job": j.id, "image": j.image.0, "device": j.device.as_ref().map(|d| d.0.clone()),
                 "memory_bytes": j.memory_bytes, "holder": j.holder, "peer": j.peer,
                 "phase": match j.phase { JobPhase::Running => "running", JobPhase::Stopping => "stopping" }
-            })
+            }))
         })
         .collect();
     json!({ "deployments": deployments, "jobs": jobs, "held_bytes": s.held_by(&who.holder()), "share_bytes": who.grant.memory_bytes })
@@ -1124,12 +1157,12 @@ pub(crate) fn require(who: &Credential, scope: &str) -> Result<(), BestError> {
     .with_details(json!({ "needs": scope, "may": who.grant.scopes })))
 }
 
-/// A deploy or a job past the credential's share is refused with what it holds and what to do.
-pub(crate) fn within_share(state: &State, who: &Credential, needed: u64) -> Result<(), BestError> {
+/// A deploy or a job past the credential's share is refused with what it holds and what to do. `held` is what the
+/// credential holds across the door, admitted workloads included.
+pub(crate) fn within_share(held: u64, who: &Credential, needed: u64) -> Result<(), BestError> {
     let Some(share) = who.grant.memory_bytes else {
         return Ok(());
     };
-    let held = state.held_by(&who.holder());
     if held.saturating_add(needed) <= share {
         return Ok(());
     }
