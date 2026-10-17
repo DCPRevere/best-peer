@@ -2,7 +2,7 @@
 //! stream and correlation space, and inside each the clouds, named pools of machines. An identity (a credential
 //! signed in by the device flow) creates a workspace and owns it, invites other identities, who accept and become
 //! members, and may leave; an identity belongs to as many workspaces as it creates or is invited into. Machines join
-//! a cloud another way: their owner approves the cloud's door at the console, the admission a peer has always had.
+//! a cloud another way: their owner approves the cloud's door at the console, as they admit any agent.
 //!
 //! [`Workspaces`] is the fold of the root log's membership facts and the registry of the live [`Workspace`] doors;
 //! it serves the root's four membership commands and `get-workspaces`, and dispatches `/workspaces/{id}/...` to the
@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
+use axum::body::Body;
 use axum::extract::{Path as UrlPath, Request, State};
 use axum::http::Uri;
 use axum::response::{IntoResponse, Response};
@@ -22,6 +23,7 @@ use axum::routing::{any, get};
 use axum::{Json, Router};
 use best_peer_door::auth::Credential;
 use best_peer_door::{Auth, BestError, Door, Emitter, Envelope, EventLog};
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -159,8 +161,7 @@ impl Workspaces {
         match e.r#type.as_str() {
             "WorkspaceCreatedV1" => {
                 let owner = text("owner");
-                let mut records = self.records.lock().unwrap();
-                if records.contains_key(&id) {
+                if self.records.lock().unwrap().contains_key(&id) {
                     return;
                 }
                 let mut r = Record {
@@ -168,10 +169,17 @@ impl Workspaces {
                     ..Default::default()
                 };
                 r.members.insert(owner, Role::Owner);
-                let ws = Workspace::open(self.ctx.clone(), &id, r.members.clone());
-                records.insert(id.clone(), r);
-                let started = self.live.lock().unwrap().insert(id, ws.clone());
-                debug_assert!(started.is_none());
+                // The door is opened before anything is recorded, and outside the locks: one that cannot be opened
+                // leaves no record, so the fact is in the log and the workspace is not, which the log line says.
+                match Workspace::open(self.ctx.clone(), &id, r.members.clone()) {
+                    Ok(ws) => {
+                        self.records.lock().unwrap().insert(id.clone(), r);
+                        self.live.lock().unwrap().insert(id, ws);
+                    }
+                    Err(why) => {
+                        tracing::error!(workspace = %id, %why, "the workspace's door cannot be opened; it is not served")
+                    }
+                }
             }
             "MemberInvitedV1" => {
                 let mut records = self.records.lock().unwrap();
@@ -310,11 +318,22 @@ async fn dispatch(
     parts.uri = uri;
     // What the root's router matched (its path parameters) is not the workspace's door's to read.
     parts.extensions.clear();
+    let streaming = rest.starts_with("/events/stream");
     let req = Request::from_parts(parts, body);
-    match ws.router().clone().oneshot(req).await {
+    let res = match ws.router().clone().oneshot(req).await {
         Ok(res) => res,
         Err(never) => match never {},
+    };
+    if !streaming {
+        return res;
     }
+    // An open stream is a door held open: it closes at the next frame once the credential is no member's.
+    let holder = who.holder();
+    let (parts, body) = res.into_parts();
+    let frames = body
+        .into_data_stream()
+        .take_while(move |_| futures::future::ready(ws.is_member(&holder)));
+    Response::from_parts(parts, Body::from_stream(frames))
 }
 
 #[async_trait]
@@ -359,6 +378,14 @@ impl Membership for Workspaces {
             .split_once(':')
             .map(|(sender, _)| best_peer_door::auth::holder_of_hash(sender))
             .unwrap_or_default();
+        // The workspace's place on disk is made before the fact is told: a fact told is a workspace that exists.
+        if let Err(e) = EventLog::open(&Workspace::dir(&self.ctx, &id)) {
+            em.emit(
+                "CommandFailed",
+                json!({ "type": cmd.r#type, "reason": format!("the workspace's log cannot be kept under the data directory: {e}; fix the directory and send it again") }),
+            );
+            return;
+        }
         self.tell(
             &em,
             "WorkspaceCreatedV1",
@@ -458,6 +485,18 @@ impl Membership for Workspaces {
             )
             .with_details(json!({ "workspace": id, "role": "owner" })));
         }
+        // What one holds in a workspace counts against one's share and is one's to end: it goes before one does.
+        let holds: Vec<Value> = self.get(id).map(|ws| ws.held_by(&who.holder())).unwrap_or_default();
+        if !holds.is_empty() {
+            return Err(BestError::bad_request(
+                "HOLDS_WORKLOADS",
+                format!(
+                    "you still hold {} workload(s) in workspace {id}: undeploy or stop them first (its get-workloads lists them), then leave",
+                    holds.len()
+                ),
+            )
+            .with_details(json!({ "workspace": id, "holds": holds })));
+        }
         Ok(())
     }
 
@@ -515,13 +554,18 @@ struct MemberData {
 }
 
 impl Workspace {
+    /// Where the workspace `id` keeps its log and its clouds' credentials.
+    fn dir(ctx: &Context, id: &str) -> PathBuf {
+        ctx.dir.join("workspaces").join(id)
+    }
+
     /// The workspace `id` over its own log under the data directory, its clouds built from the log, none following
-    /// yet; `members` is who may enter.
-    fn open(ctx: Arc<Context>, id: &str, members: BTreeMap<String, Role>) -> Arc<Self> {
-        let dir = ctx.dir.join("workspaces").join(id);
+    /// yet; `members` is who may enter. A log that cannot be opened is the error, never a panic.
+    fn open(ctx: Arc<Context>, id: &str, members: BTreeMap<String, Role>) -> Result<Arc<Self>, String> {
+        let dir = Self::dir(&ctx, id);
         let log = Arc::new(
             EventLog::open(&dir)
-                .unwrap_or_else(|e| panic!("cannot keep the log of workspace {id} in {}: {e}", dir.display())),
+                .map_err(|e| format!("cannot keep the log of workspace {id} in {}: {e}", dir.display()))?,
         );
         let endpoint = ctx.workspace_endpoint(id);
         let me = Arc::new(Self {
@@ -556,7 +600,12 @@ impl Workspace {
             best_peer_door::tenant_router(door.clone()).merge(crate::endpoint::router(me.clone(), ctx.auth.clone()));
         let _ = me.door.set(door);
         let _ = me.router.set(router);
-        me
+        Ok(me)
+    }
+
+    /// What `holder` holds in this workspace, across its clouds, by name: deployments, jobs and admitted commands.
+    fn held_by(&self, holder: &str) -> Vec<Value> {
+        self.live_clouds().iter().flat_map(|c| c.holds_of(holder)).collect()
     }
 
     pub fn door(&self) -> &Arc<Door> {
@@ -625,6 +674,13 @@ impl Workspace {
     /// they agree.
     fn cloud_for(&self, data: &Value) -> Result<Arc<Cloud>, BestError> {
         let named = data["cloud"].as_str();
+        if let Some(d) = data["device"].as_str().filter(|d| !d.contains('/')) {
+            return Err(BestError::bad_request(
+                "INVALID_DEVICE",
+                format!("device {d} names no cloud: a device here is cloud/peer/device, as this workspace's get-hardware-state lists them"),
+            )
+            .with_details(json!({ "device": d })));
+        }
         let from_device = data["device"].as_str().and_then(|d| d.split('/').next());
         let name = match (named, from_device) {
             (Some(c), Some(d)) if c != d => {
@@ -1071,7 +1127,7 @@ impl Upstream for Workspace {
     }
 }
 
-/// `BEST_PEER_MEMBERS` once made a peer a cloud door; a door started with it is told what replaced it.
+/// A door started with `BEST_PEER_MEMBERS` set is refused, with the commands that configure a cloud.
 pub fn members_variable_replaced(value: &str) -> String {
     format!(
         "BEST_PEER_MEMBERS is set ({value}) and no longer read: a cloud is configured through the door, not the process. Start the peer without it, sign in, then create-workspace at the root and configure-cloud in the workspace with the same members as name=endpoint; the README's \"More than one machine\" has the steps"

@@ -520,6 +520,30 @@ impl Cloud {
         Some(peer)
     }
 
+    /// What `holder` holds in this cloud, by name: deployments, jobs and admitted commands.
+    pub fn holds_of(&self, holder: &str) -> Vec<Value> {
+        let s = self.state.lock().unwrap();
+        let mut out: Vec<Value> = s
+            .deployments
+            .values()
+            .filter(|d| d.holder == holder)
+            .map(|d| json!({ "deployment": d.id, "model": d.model, "cloud": self.name, "peer": d.peer }))
+            .collect();
+        out.extend(
+            s.jobs
+                .values()
+                .filter(|j| j.holder == holder)
+                .map(|j| json!({ "job": j.id, "image": j.image.0, "cloud": self.name, "peer": j.peer })),
+        );
+        out.extend(
+            s.reserved
+                .values()
+                .filter(|r| r.holder == holder)
+                .map(|r| json!({ "admitted": r.id, "cloud": self.name })),
+        );
+        out
+    }
+
     /// Whether this cloud holds the workload `id`, as a deployment or a job.
     pub fn holds_workload(&self, id: &str) -> bool {
         let s = self.state.lock().unwrap();
@@ -634,9 +658,12 @@ impl Cloud {
 
     /// Follows every member for as long as the cloud runs: signs in where it is not admitted yet, or no longer is,
     /// then relays the member's stream, reconnecting from the last event it relayed; and squares the state with the
-    /// members on a timer. A member added later is followed from the moment it is added.
+    /// members on a timer. A member added later is followed from the moment it is added. Following is begun once:
+    /// a second call changes nothing.
     pub fn follow(self: &Arc<Self>) {
-        self.following.store(true, std::sync::atomic::Ordering::SeqCst);
+        if self.following.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         for m in self.members() {
             self.follow_member(&m);
         }
@@ -1094,7 +1121,9 @@ impl Service for Cloud {
             return Ok(());
         }
         let (host, peers) = self.combined().await;
-        // What the credential holds is read before the state is locked: the door's holdings read this state too.
+        // One admission at a time across the door, and what the credential holds is read before the state is
+        // locked, since the door's holdings read this state too.
+        let _admitting = self.holdings.admitting();
         let held = self.holdings.held_by(&who.holder());
         let mut state = self.state.lock().unwrap();
         within_share(held, &who, data.memory_bytes)?;
@@ -1250,6 +1279,7 @@ impl Service for Cloud {
             return Ok(());
         }
         let (host, peers) = self.combined().await;
+        let _admitting = self.holdings.admitting();
         let held = self.holdings.held_by(&who.holder());
         let mut state = self.state.lock().unwrap();
         within_share(held, &who, data.memory_bytes.unwrap_or(0))?;

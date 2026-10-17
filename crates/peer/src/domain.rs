@@ -629,7 +629,7 @@ fn leave_workspace(m: Arc<dyn Membership>) -> CommandDef {
         schema: "leave-workspace".into(),
         version: "1.0".into(),
         command_type: "LeaveWorkspace".into(),
-        description: "Leaves a workspace you are a member of: its door closes to your credential and get-workspaces no longer lists it. What you deployed or ran there keeps running, as the workspace's, for a credential approved for all to end. The outcome is a MemberLeftV1 event with this command's correlation id. Refused when you are not a member, or when you are the owner: a workspace keeps its owner.".into(),
+        description: "Leaves a workspace you are a member of: its door closes to your credential, an event stream you hold open there ends, and get-workspaces no longer lists it. The outcome is a MemberLeftV1 event with this command's correlation id. Refused when you are not a member; when you are the owner, since a workspace keeps its owner; or while you still hold a workload there (undeploy or stop it first: its get-workloads lists them).".into(),
         data_schema: json!({
             "type": "object",
             "required": ["workspace"],
@@ -879,7 +879,7 @@ pub fn membership_event_defs() -> Vec<EventDef> {
         event(
             "member-left",
             "MemberLeftV1",
-            "An identity left a workspace: its door closes to their credential; what they deployed or ran there keeps running as the workspace's.",
+            "An identity left a workspace: its door closes to their credential.",
             &["workspace", "identity"],
             json!({ "workspace": s("The workspace"), "identity": s("The identity that left") }),
         ),

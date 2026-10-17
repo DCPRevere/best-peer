@@ -387,7 +387,9 @@ impl Peer {
         require(&who, "deploy")?;
         let data: DeployData = parse(&cmd.data)?;
         let host = self.hardware().await?;
-        // What the credential holds is read before the state is locked: the door's holdings read this state too.
+        // One admission at a time across the door, and what the credential holds is read before the state is
+        // locked, since the door's holdings read this state too.
+        let _admitting = self.holdings.admitting();
         let held = self.holdings.held_by(&who.holder());
         let mut state = self.state.lock().unwrap();
         within_share(held, &who, data.memory_bytes)?;
@@ -726,6 +728,7 @@ impl Peer {
             Some(_) => Some(self.hardware().await?),
             None => None,
         };
+        let _admitting = self.holdings.admitting();
         let held = self.holdings.held_by(&who.holder());
         let mut state = self.state.lock().unwrap();
         within_share(held, &who, data.memory_bytes.unwrap_or(0))?;
@@ -1169,7 +1172,7 @@ pub(crate) fn within_share(held: u64, who: &Credential, needed: u64) -> Result<(
     Err(BestError::bad_request(
         "SHARE_EXCEEDED",
         format!(
-            "this credential may hold {share} bytes of device memory and holds {held}: {needed} more does not fit; undeploy or stop something of yours first (get-workloads lists them), or ask for a larger share"
+            "this credential may hold {share} bytes of device memory and holds {held} across this door, every workspace counted: {needed} more does not fit; undeploy or stop something of yours first (get-workloads on each door you use lists them, with held_bytes the total), or ask for a larger share"
         ),
     )
     .with_details(json!({ "share_bytes": share, "held_bytes": held, "needed_bytes": needed, "room_bytes": share.saturating_sub(held) })))

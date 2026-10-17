@@ -91,8 +91,9 @@ decides who is in, as with SSH keys, and what they may do: approved with nothing
 most across its workloads, which it alone sees, prompts and ends.
 
 **4. More than one machine.** Run a peer on each, and one more `best-peer` anywhere as the door your team enters
-by (a laptop with `BEST_PEER_GPU=none` will do; `BEST_PEER_TRUST=<a's cert.pem>,<b's cert.pem>` when the machines
-serve their own certificates). The pool is made through that door, by the agent, from the manifest alone: the
+by: a laptop will do, with `BEST_PEER_GPU=none` and the runtime it has (`BEST_PEER_RUNTIME=fake` when it has none:
+its own device then serves nothing real, and the clouds are what the door is for), and
+`BEST_PEER_TRUST=<a's cert.pem>,<b's cert.pem>` when the machines serve their own certificates. The pool is made through that door, by the agent, from the manifest alone: the
 person says "create a workspace called research, then configure a cloud called lab in it with the peers
 a=https://<machine a>:7777 and b=https://<machine b>:7777". The agent sends `create-workspace` at the root, reads
 the workspace's endpoint from `get-workspaces`, and sends `configure-cloud` there. The door signs in to each
@@ -160,8 +161,8 @@ Every door hosts **workspaces**, the BEST tenants. The root manifest declares th
 log, catalogue, stream and correlation space; a credential opens the workspaces it belongs to and nothing of the
 others, and `get-workspaces` at the root lists them with each one's endpoint and manifest. At the root:
 `create-workspace` (whoever sends it is the owner), `invite-member` (the owner, naming the invitee's `identity`,
-the opaque id of their credential that `get-workspaces` shows them), `accept-invitation` and `leave-workspace`;
-owner and member are the only roles, and the owner stays. In a workspace: `configure-cloud` names a **cloud**, a
+the opaque id of their credential that `get-workspaces` shows them), `accept-invitation` and `leave-workspace`
+(refused while one still holds a workload there); owner and member are the only roles, and the owner stays. In a workspace: `configure-cloud` names a **cloud**, a
 pool of peers as `peer` and `endpoint`, and makes or changes it (one machine serves one cloud per workspace, and a
 peer still holding a workload is not removed); `archive-cloud` retires an empty one, and `get-clouds` lists them
 with each peer's state. The cloud signs in to each member by the device flow and logs the code to approve there;

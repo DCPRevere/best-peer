@@ -4,16 +4,24 @@
 //! has promised to a holder, and a share is measured against the sum, so a workload admitted in one workspace is
 //! counted when another is asked for.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 type Source = Box<dyn Fn(&str) -> u64 + Send + Sync>;
 
 #[derive(Default)]
 pub struct Holdings {
     sources: Mutex<Vec<Source>>,
+    /// Held while a surface measures a share and reserves against it, so two admissions cannot both read the room
+    /// before either takes it. Taken before any surface's state lock, never after one.
+    admission: Mutex<()>,
 }
 
 impl Holdings {
+    /// One admission at a time across the door: the guard is held from the share's measure to the reservation.
+    pub fn admitting(&self) -> MutexGuard<'_, ()> {
+        self.admission.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Adds a surface: `held` answers the device memory it has promised to a holder, admitted workloads included.
     pub fn add(&self, held: impl Fn(&str) -> u64 + Send + Sync + 'static) {
         self.sources.lock().unwrap().push(Box::new(held));

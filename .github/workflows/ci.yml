@@ -106,6 +106,6 @@ jobs:
           curl -sf -H "X-Api-Key: $key" "$tenant/queries/get-hardware-state" | python3 -c 'import json,sys; ids=[d["id"] for d in json.load(sys.stdin)["devices"]]; assert ids==["lab/a/cpu-0","lab/b/cpu-0"], ids'
           npx -y @behavioralstate/best-validate@0.4.2 "$base" --tenant "$ws"
           npx -y @behavioralstate/best-validate@0.4.2 "$base" --tenant "$ws" --api-key "$key" --auth-type apikey --auth-header X-Api-Key --probe-registration
-          # The variable that once made a cloud door is refused with what replaced it.
+          # BEST_PEER_MEMBERS is refused at start, with the commands that configure a cloud.
           if BEST_PEER_DATA="$(mktemp -d)" BEST_PEER_LISTEN=127.0.0.1:7784 BEST_PEER_MEMBERS=a=http://127.0.0.1:7781 ./target/release/best-peer 2> "$door/refused"; then echo "::error::BEST_PEER_MEMBERS was accepted"; exit 1; fi
           grep -q "configure-cloud" "$door/refused"

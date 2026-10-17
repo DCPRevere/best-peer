@@ -521,6 +521,7 @@ mod tests {
     use axum::http::{header, Request, StatusCode};
     use best_peer_door::{Envelope, FakeApprover, Filter};
     use best_peer_runtime::ContainerId;
+    use futures::StreamExt;
     use http_body_util::BodyExt;
 
     #[test]
@@ -1352,6 +1353,13 @@ mod tests {
         let (s, e) = site.deploy(&ws2, "d2", Some("ops-pool"), 4, Some("lab/a/gpu-0")).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(e["error"]["code"], "CLOUD_MISMATCH");
+        let (s, e) = site.deploy(&ws2, "d2", None, 4, Some("gpu-0")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(e["error"]["code"], "INVALID_DEVICE");
+        assert!(
+            e["error"]["message"].as_str().unwrap().contains("cloud/peer/device"),
+            "{e}"
+        );
         let (s, b) = site.deploy(&ws2, "d2", None, 4, Some("ops-pool/a/gpu-0")).await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         let events = site.events(&ws2, "d2", "DeploymentReady").await;
@@ -1641,8 +1649,121 @@ mod tests {
         let (_, w) = get_as(&site.app, &p1, &bob, "/queries/get-workloads").await;
         assert_eq!(w["deployments"][0]["deployment"], bob_dep);
 
-        // Left both: sees neither; what was deployed stays, the workspace's, for the owner to end. The owner cannot
-        // leave.
+        // Another member, approved for all, holds the first workspace's stream open.
+        let carol = key(&site.app).await;
+        let (_, w) = get_as(&site.app, "", &carol, "/queries/get-workspaces").await;
+        let carol_id = w["identity"].as_str().unwrap().to_string();
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &site.key,
+            "i3",
+            "InviteMember",
+            "invite-member",
+            json!({ "workspace": ws1, "identity": carol_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &site.key, "i3", "MemberInvitedV1").await;
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &carol,
+            "a3",
+            "AcceptInvitation",
+            "accept-invitation",
+            json!({ "workspace": ws1 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &carol, "a3", "MemberJoinedV1").await;
+        let res = site
+            .app
+            .clone()
+            .oneshot(
+                Request::get(format!("{p1}/events/stream"))
+                    .header("X-Api-Key", &carol)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut carol_stream = res.into_body().into_data_stream();
+        let (s, _) = site.deploy(&ws1, "d9", Some("lab"), 1, None).await;
+        assert_eq!(s, StatusCode::CREATED);
+        let frame = tokio::time::timeout(Duration::from_secs(5), carol_stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&frame).contains("ImagePulling"),
+            "a member hears the workspace"
+        );
+        site.events(&ws1, "d9", "DeploymentReady").await;
+
+        // Leaving while holding a workload is refused: what one holds counts against one's share and is one's to
+        // end. Undeployed, one leaves; a stream held open ends at the next frame; the owner cannot leave.
+        let (s, e) = send_as(
+            &site.app,
+            "",
+            &bob,
+            "l2",
+            "LeaveWorkspace",
+            "leave-workspace",
+            json!({ "workspace": ws2 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "HOLDS_WORKLOADS");
+        assert_eq!(e["error"]["details"]["holds"][0]["cloud"], "ops-pool");
+        let bob_dep2 = e["error"]["details"]["holds"][0]["deployment"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (s, _) = send_as(
+            &site.app,
+            &p2,
+            &bob,
+            "bu2",
+            "UndeployModel",
+            "undeploy-model",
+            json!({ "deployment": bob_dep2 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, &p2, &bob, "bu2", "Undeployed").await;
+        let (s, _) = send_as(
+            &site.app,
+            &p1,
+            &bob,
+            "bu1",
+            "UndeployModel",
+            "undeploy-model",
+            json!({ "deployment": bob_dep }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, &p1, &bob, "bu1", "Undeployed").await;
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &carol,
+            "l3",
+            "LeaveWorkspace",
+            "leave-workspace",
+            json!({ "workspace": ws1 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &carol, "l3", "MemberLeftV1").await;
+        let (s, _) = site.deploy(&ws1, "d10", Some("lab"), 1, None).await;
+        assert_eq!(s, StatusCode::CREATED);
+        let next = tokio::time::timeout(Duration::from_secs(5), carol_stream.next())
+            .await
+            .unwrap();
+        assert!(next.is_none(), "the stream ended when the door closed: {next:?}");
         let (s, b) = send_as(
             &site.app,
             "",
@@ -1689,11 +1810,6 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(e["error"]["code"], "NO_SUCH_WORKSPACE");
-        assert_eq!(
-            site.query(&ws1, "get-workloads").await["deployments"][0]["deployment"],
-            bob_dep,
-            "the owner sees what was left running"
-        );
         let (s, e) = send_as(
             &site.app,
             "",
