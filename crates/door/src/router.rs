@@ -327,18 +327,17 @@ async fn ingest(
         )
         .with_details(json!({ "attribute": "correlationid", "correlationid": correlation }))
     };
-    if door
-        .log
-        .owner_of_correlation(&correlation)
-        .is_some_and(|owner| owner != sender.hash)
-    {
-        return Err(taken());
-    }
-    {
+    // Both checks under the one lock, so two senders racing on a new correlation cannot both pass: a command is
+    // recorded before its in-flight entry goes, so a second sender finds the entry or the owner.
+    let _in_flight = {
         let mut inflight = door.inflight.lock().unwrap();
-        if inflight
-            .iter()
-            .any(|((s, _), (_, c))| *s != sender.hash && *c == correlation)
+        if door
+            .log
+            .owner_of_correlation(&correlation)
+            .is_some_and(|owner| owner != sender.hash)
+            || inflight
+                .iter()
+                .any(|((s, _), (_, c))| *s != sender.hash && *c == correlation)
         {
             return Err(taken());
         }
@@ -347,23 +346,22 @@ async fn ingest(
             Some(_) => return Err(conflict()),
             None => inflight.insert(key.clone(), (hash.clone(), correlation.clone())),
         };
-    }
+        InFlight {
+            door: door.clone(),
+            key: key.clone(),
+        }
+    };
     if let Some(admit) = &def.admit {
-        if let Err(refusal) = admit(
+        admit(
             envelope.clone(),
             sender.clone(),
             command_key(&sender.hash, &envelope.id),
         )
-        .await
-        {
-            door.inflight.lock().unwrap().remove(&key);
-            return Err(refusal);
-        }
+        .await?;
     }
     let accepted = door
         .log
         .accept_command(&sender.hash, &envelope.id, &hash, &correlation, &envelope);
-    door.inflight.lock().unwrap().remove(&key);
     let answered = match accepted {
         Accept::Conflict => return Err(conflict()),
         Accept::Duplicate { correlation: original } => original,
@@ -373,6 +371,19 @@ async fn ingest(
         }
     };
     Ok(created(&envelope.id, &answered))
+}
+
+/// A command between its checks and its record: its in-flight entry goes when the request ends, however it ends,
+/// so a client that hangs up or a check that panics holds no correlation and no id for anyone.
+struct InFlight {
+    door: Shared,
+    key: (String, String),
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.door.inflight.lock().unwrap().remove(&self.key);
+    }
 }
 
 /// The emitter of `sender`'s command `envelope`: its correlation, its key, and what completes it.

@@ -107,6 +107,8 @@ pub struct Unfinished {
 pub struct EventLog {
     events: Mutex<Vec<Stored>>,
     accepted: Mutex<HashMap<(String, String), AcceptedLine>>,
+    /// Who owns each correlation id: the sender whose accepted command first carried it, with that command's order.
+    owners: Mutex<HashMap<String, (u64, String)>>,
     /// How many commands were ever accepted: the next one's order.
     accepted_count: Mutex<u64>,
     events_file: Mutex<Option<File>>,
@@ -121,6 +123,7 @@ impl EventLog {
         Self {
             events: Mutex::new(Vec::new()),
             accepted: Mutex::new(HashMap::new()),
+            owners: Mutex::new(HashMap::new()),
             accepted_count: Mutex::new(0),
             events_file: Mutex::new(None),
             accepted_file: Mutex::new(None),
@@ -157,11 +160,23 @@ impl EventLog {
                             let mut count = log.accepted_count.lock().unwrap();
                             a.order = *count;
                             *count += 1;
+                            log.own(&a);
                             accepted.insert((a.sender.clone(), a.id.clone()), a);
                         }
                     }
                 }
                 Err(e) => tracing::warn!(error = %e, "an accepted-command line could not be read and is skipped"),
+            }
+        }
+        // A correlation two senders used before it belonged to one: the first keeps it, the other reads none of
+        // its facts under it. The facts stay as told; the operator is told where.
+        {
+            let accepted = log.accepted.lock().unwrap();
+            let owners = log.owners.lock().unwrap();
+            for a in accepted.values() {
+                if owners.get(&a.correlation).is_some_and(|(_, owner)| *owner != a.sender) {
+                    tracing::warn!(correlation = %a.correlation, command = %a.id, "a correlation id another credential used first was also used by this command's sender, who reads nothing under it now");
+                }
             }
         }
         *log.events_file.lock().unwrap() = Some(append_to(&events_path)?);
@@ -231,9 +246,19 @@ impl EventLog {
                     order,
                 };
                 write_line(&self.accepted_file, &line, "accepted command");
+                self.own(&line);
                 accepted.insert(key, line);
                 Accept::New
             }
+        }
+    }
+
+    /// Binds the correlation of an accepted command to its sender, unless an earlier command bound it already.
+    fn own(&self, a: &AcceptedLine) {
+        let mut owners = self.owners.lock().unwrap();
+        let earlier = owners.get(&a.correlation).is_some_and(|(order, _)| *order < a.order);
+        if !earlier {
+            owners.insert(a.correlation.clone(), (a.order, a.sender.clone()));
         }
     }
 
@@ -351,8 +376,8 @@ impl EventLog {
         self.list_for(filter, None)
     }
 
-    /// The page `filter` selects, and when `sender` is given only the events under that sender's own commands:
-    /// what a credential that does not act for every holder may read.
+    /// The page `filter` selects, and when `sender` is given only the events under the correlations that sender
+    /// owns: what a credential that does not act for every holder may read.
     pub fn list_for(&self, filter: &Filter, sender: Option<&str>) -> (Vec<Envelope>, Option<String>) {
         self.list_where(filter, |s| self.visible_to(sender, s))
     }
@@ -381,35 +406,27 @@ impl EventLog {
     /// The sender a correlation id belongs to: the one whose accepted command first carried it on this door. A
     /// correlation id is an identifier, never proof, so it is the first use that binds it, and a later command from
     /// another sender naming it is refused at ingest.
-    pub fn correlation_owner<'a>(accepted: &'a HashMap<(String, String), AcceptedLine>, corr: &str) -> Option<&'a str> {
-        accepted
-            .values()
-            .filter(|a| a.correlation == corr)
-            .min_by_key(|a| a.order)
-            .map(|a| a.sender.as_str())
-    }
-
-    /// `correlation_owner`, for the ingest.
     pub fn owner_of_correlation(&self, corr: &str) -> Option<String> {
-        Self::correlation_owner(&self.accepted.lock().unwrap(), corr).map(str::to_string)
+        self.owners.lock().unwrap().get(corr).map(|(_, s)| s.clone())
     }
 
-    /// Whether `s` is under a command `sender` sent: every fact about a workload is told under the correlation id
-    /// of the command that made it, so a sender's events are the events under the correlations it owns, the ones
-    /// its commands used first. An event under no command is nobody's and is read by a credential that acts for
-    /// every holder only.
-    pub fn is_senders(accepted: &HashMap<(String, String), AcceptedLine>, sender: &str, s: &Stored) -> bool {
+    /// Whether `s` is under a correlation `sender` owns: every fact about a workload is told under the correlation
+    /// id of the command that made it, so a sender's events are the events under the correlations its commands
+    /// used first. An event under no correlation is nobody's and is read by a credential that acts for every holder
+    /// only.
+    fn is_senders(owners: &HashMap<String, (u64, String)>, sender: &str, s: &Stored) -> bool {
         let Some(corr) = s.envelope.correlationid.as_deref() else {
             return false;
         };
-        Self::correlation_owner(accepted, corr) == Some(sender)
+        owners.get(corr).is_some_and(|(_, owner)| owner == sender)
     }
 
-    /// `is_senders` for a stream, which holds no lock across events.
+    /// Whether `sender` reads `s`: everything when no sender is given (a credential that acts for every holder),
+    /// else what is under the correlations it owns. Holds no lock across events.
     pub fn visible_to(&self, sender: Option<&str>, s: &Stored) -> bool {
         match sender {
             None => true,
-            Some(who) => Self::is_senders(&self.accepted.lock().unwrap(), who, s),
+            Some(who) => Self::is_senders(&self.owners.lock().unwrap(), who, s),
         }
     }
 
@@ -620,6 +637,32 @@ mod tests {
             events.iter().map(|e| e.r#type.as_str()).collect::<Vec<_>>(),
             vec!["A", "B", "C"]
         );
+    }
+
+    #[test]
+    fn a_correlation_belongs_to_the_sender_that_first_used_it_through_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = EventLog::open(dir.path()).unwrap();
+        let cmd = ev("PullImage", "c");
+        assert_eq!(first.accept_command("alice", "a1", "h", "c", &cmd), Accept::New);
+        // Accepted before the rule bound a correlation to its first sender: the log keeps the fact.
+        assert_eq!(first.accept_command("bob", "b1", "h", "c", &cmd), Accept::New);
+        assert_eq!(first.owner_of_correlation("c").as_deref(), Some("alice"));
+        let fact = first.append(ev("ImagePulled", "c"));
+        assert!(first.visible_to(Some("alice"), &fact));
+        assert!(
+            !first.visible_to(Some("bob"), &fact),
+            "the second sender reads nothing under it"
+        );
+        assert!(first.visible_to(None, &fact));
+        drop(first);
+        let again = EventLog::open(dir.path()).unwrap();
+        assert_eq!(
+            again.owner_of_correlation("c").as_deref(),
+            Some("alice"),
+            "the file's order decides"
+        );
+        assert_eq!(again.owner_of_correlation("never"), None);
     }
 
     #[test]

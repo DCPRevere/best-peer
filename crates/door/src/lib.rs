@@ -101,7 +101,8 @@ impl Door {
     }
 
     /// Whether `who` reads the event `s`: the partition's word when it has one, else the door's rule, under which a
-    /// credential that acts for every holder reads everything and another reads the events under its own commands.
+    /// credential that acts for every holder reads everything and another reads the events under the correlations
+    /// it owns, the ones its commands used first.
     pub fn visible_to(&self, who: &auth::Credential, s: &Stored) -> bool {
         if let Some(decided) = self.partition.as_ref().and_then(|p| p(who, s)) {
             return decided;

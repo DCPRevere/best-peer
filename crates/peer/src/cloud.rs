@@ -454,8 +454,16 @@ impl Cloud {
     /// The command as the member receives it: the cloud's own, with an id and a correlation unique to the cloud
     /// command it stands for, so a retry is the same command there too, and the facts the member tells come back
     /// to the right emitter. A command of the cloud's own, for no caller, is named by the workload it ends.
-    fn to_member(&self, schema_base: &str, key: &str, r#type: &str, schema: &str, data: Value) -> (Envelope, String) {
-        let mc = member_correlation(key, &data);
+    fn to_member(
+        &self,
+        member: &Member,
+        schema_base: &str,
+        key: &str,
+        r#type: &str,
+        schema: &str,
+        data: Value,
+    ) -> (Envelope, String) {
+        let mc = member_correlation(key, &data, self.holder_on(member).as_deref());
         let envelope = Envelope {
             specversion: "1.0".into(),
             id: mc.clone(),
@@ -493,7 +501,7 @@ impl Cloud {
     ) -> Result<(), BestError> {
         let ends = data["deployment"].as_str().or(data["job"].as_str()).map(str::to_string);
         let base = member.schema_base().await;
-        let (envelope, mc) = self.to_member(&base, em.command_key(), r#type, schema, data);
+        let (envelope, mc) = self.to_member(member, &base, em.command_key(), r#type, schema, data);
         self.listen_for(&member.name, &mc, em, None, ends);
         member.send(&envelope).await.map(|_| ()).map_err(|e| {
             self.issued.lock().unwrap().remove(&(member.name.clone(), mc));
@@ -1099,7 +1107,7 @@ impl Service for Cloud {
         );
         for m in members {
             let base = m.schema_base().await;
-            let (envelope, mc) = self.to_member(&base, &key, "PullImage", "pull-image", json!({ "image": image }));
+            let (envelope, mc) = self.to_member(&m, &base, &key, "PullImage", "pull-image", json!({ "image": image }));
             self.listen_for(&m.name, &mc, &em, Some(key.clone()), None);
             if let Err(e) = m.send(&envelope).await {
                 self.issued.lock().unwrap().remove(&(m.name.clone(), mc));
@@ -1156,7 +1164,7 @@ impl Service for Cloud {
         };
         // Run again after a restart: the member runs it; listen for the rest of its facts and say nothing twice.
         if let Some(peer) = self.already_placed(em.command_key()) {
-            let mc = member_correlation(em.command_key(), &json!({}));
+            let mc = member_correlation(em.command_key(), &json!({}), None);
             self.listen_for(&peer, &mc, &em, None, None);
             return;
         }
@@ -1330,7 +1338,7 @@ impl Service for Cloud {
             return;
         };
         if let Some(peer) = self.already_placed(em.command_key()) {
-            let mc = member_correlation(em.command_key(), &json!({}));
+            let mc = member_correlation(em.command_key(), &json!({}), None);
             self.listen_for(&peer, &mc, &em, None, None);
             return;
         }
@@ -1448,11 +1456,12 @@ impl Upstream for Cloud {
 
 /// The id and correlation a member is given for a cloud command: unique to the cloud command (its sender's holder
 /// and its id, the id hashed when that would be too long for an envelope), or, for a command of the cloud's own,
-/// the workload it ends.
-fn member_correlation(key: &str, data: &Value) -> String {
+/// the cloud's identity on the member (`own`, the holder of its credential there) and the workload it ends, so a
+/// cloud the member admitted again under a new credential owns its new correlations and is refused for none.
+fn member_correlation(key: &str, data: &Value, own: Option<&str>) -> String {
     let (sender, id) = key.split_once(':').unwrap_or(("", key));
     match (sender.is_empty(), data["deployment"].as_str().or(data["job"].as_str())) {
-        (true, Some(workload)) => format!("cloud-{workload}"),
+        (true, Some(workload)) => format!("cloud-{}-{workload}", own.unwrap_or("none")),
         _ => {
             let holder = holder_of_hash(sender);
             if holder.len() + 1 + id.len() > 200 {
@@ -1483,14 +1492,15 @@ mod tests {
 
     #[test]
     fn a_member_command_is_named_for_the_cloud_command_and_fits_an_envelope() {
-        let short = member_correlation("abcdef0123456789abcdef:d1", &json!({}));
+        let short = member_correlation("abcdef0123456789abcdef:d1", &json!({}), None);
         assert_eq!(short, "abcdef0123456789-d1");
-        let long = member_correlation(&format!("abcdef0123456789abcdef:{}", "x".repeat(250)), &json!({}));
+        let long = member_correlation(&format!("abcdef0123456789abcdef:{}", "x".repeat(250)), &json!({}), None);
         assert!(long.len() <= 64, "{long}");
         assert!(long.starts_with("abcdef0123456789-"));
         assert_eq!(
-            member_correlation(":anything", &json!({ "deployment": "dep-1" })),
-            "cloud-dep-1"
+            member_correlation(":anything", &json!({ "deployment": "dep-1" }), Some("0123456789abcdef")),
+            "cloud-0123456789abcdef-dep-1",
+            "a command of the cloud's own carries the cloud's identity on the member"
         );
     }
 }
