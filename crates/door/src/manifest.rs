@@ -1,6 +1,8 @@
 //! `GET /.well-known/best`: the one entry to everything the door offers, built from what the door actually has. A
 //! capability is `active` only when its routes answer; the sign-in guidance's manifest text rides in the
-//! authentication block, verbatim.
+//! authentication block, verbatim. A door that hosts tenants declares their manifests' template, and its own service
+//! carries the authentication block too, so the root's capabilities read as the root's (SPEC.md, Multi-Tenancy); a
+//! tenant's manifest is the same document for that tenant's door, self-contained, with no `tenants` block.
 
 use serde_json::{json, Value};
 
@@ -31,25 +33,30 @@ pub fn manifest(door: &Door) -> Value {
         { "method": "GET", "path": "/events/stream", "description": "What happens next, as server-sent events" }
     ]);
     events["push"] = json!({ "sse": true, "mcp": false });
-    json!({
+    let authentication = json!({
+        "type": "apiKey",
+        "scheme": crate::auth::AUTH_HEADER,
+        "in": "header",
+        "scopes": door.auth.scopes(),
+        "tokenUrl": door.auth.token_url(),
+        "deviceAuthorizationUrl": door.auth.device_authorization_url(),
+        "note": guidance::MANIFEST_TEXT
+    });
+    let mut service = json!({
+        "version": BEST_VERSION,
+        "description": door.description,
+        "spec": "https://behavioralstate.io/specs/agents",
+        "http": { "endpoint": door.endpoint }
+    });
+    if door.tenants.is_some() {
+        service["authentication"] = authentication.clone();
+    }
+    let mut best = json!({
         "best": {
             "version": BEST_VERSION,
-            "authentication": {
-                "type": "apiKey",
-                "scheme": crate::auth::AUTH_HEADER,
-                "in": "header",
-                "scopes": door.auth.scopes(),
-                "tokenUrl": door.auth.token_url(),
-                "deviceAuthorizationUrl": door.auth.device_authorization_url(),
-                "note": guidance::MANIFEST_TEXT
-            },
+            "authentication": authentication,
             "services": {
-                door.service.as_str(): {
-                    "version": BEST_VERSION,
-                    "description": door.description,
-                    "spec": "https://behavioralstate.io/specs/agents",
-                    "http": { "endpoint": door.endpoint }
-                }
+                door.service.as_str(): service
             },
             "capabilities": [
                 cap("io.best.agents.commands", "What this peer can be asked to do; the catalogue lists each command.", "commands", active(door.catalogue.has_commands())),
@@ -58,5 +65,9 @@ pub fn manifest(door: &Door) -> Value {
                 cap("io.best.agents.workflows", "Recipes that chain this peer's commands and queries; none is published yet.", "workflows", "planned")
             ]
         }
-    })
+    });
+    if let Some(template) = &door.tenants {
+        best["best"]["tenants"] = json!({ "manifest": template });
+    }
+    best
 }

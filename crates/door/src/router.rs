@@ -1,6 +1,7 @@
 //! The HTTP routes the spec names (SPEC.md, HTTP Transport and the four capabilities), over a [`Door`]. The manifest
 //! and the two OAuth endpoints are public; everything else needs the credential in the `X-Api-Key` header. Every
-//! error the door answers, the framework's included, is in the BEST error format.
+//! error the door answers, the framework's included, is in the BEST error format. A tenant's door has the protected
+//! routes alone ([`tenant_router`]): its manifest is the root's to serve, and sign-in is the root's.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -41,7 +42,17 @@ pub fn router(door: Shared) -> Router {
         .route("/auth/token", post(token))
         .route("/auth/verify", get(verify))
         .route("/auth/approve", post(approve));
-    let protected = Router::new()
+    shaped(public.merge(protected(&door)), door)
+}
+
+/// The routes of a tenant's door: the four capabilities behind the credential, and nothing public. The host mounts
+/// it under the tenant's endpoint, with the path below that endpoint, and serves the tenant's manifest itself.
+pub fn tenant_router(door: Shared) -> Router {
+    shaped(protected(&door), door)
+}
+
+fn protected(door: &Shared) -> Router<Shared> {
+    Router::new()
         .route("/commands", get(command_catalogue).post(ingest))
         .route("/commands/:schema/:version", get(command_document))
         .route("/events", get(list_events))
@@ -52,9 +63,12 @@ pub fn router(door: Shared) -> Router {
         .route("/queries/:schema", get(execute_query))
         .route("/workflows", get(workflow_index))
         .route("/workflows/:id", get(workflow))
-        .layer(middleware::from_fn_with_state(door.clone(), require_key));
-    public
-        .merge(protected)
+        .layer(middleware::from_fn_with_state(door.clone(), require_key))
+}
+
+/// Every refusal in the BEST shape, the body bounded, an unknown route named.
+fn shaped(routes: Router<Shared>, door: Shared) -> Router {
+    routes
         .fallback(unknown_route)
         .layer(middleware::map_response(best_shaped))
         .layer(DefaultBodyLimit::max(MAX_BODY))
@@ -815,6 +829,75 @@ mod tests {
         }
         let (s, _, _) = call(&app, get("/commands", Some("bp_wrong"))).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_door_that_hosts_tenants_says_so_in_its_manifest_and_a_tenant_door_has_the_capabilities_alone() {
+        let root = door();
+        let template = format!("{EP}/.well-known/best/{{tenantId}}");
+        let hosting = Arc::new(
+            Door::new(
+                EP,
+                "io.best.agents",
+                "A test peer.",
+                Catalogue::new(),
+                root.log.clone(),
+                root.auth.clone(),
+            )
+            .with_tenants(&template),
+        );
+        let m = manifest::manifest(&hosting);
+        assert_eq!(m["best"]["tenants"]["manifest"], template);
+        assert_eq!(
+            m["best"]["services"]["io.best.agents"]["authentication"]["deviceAuthorizationUrl"],
+            format!("{EP}/auth/device"),
+            "the root's own capabilities sit on a service with its own authentication block"
+        );
+        let plain = manifest::manifest(&root);
+        assert!(plain["best"].get("tenants").is_none());
+        assert!(plain["best"]["services"]["io.best.agents"]
+            .get("authentication")
+            .is_none());
+
+        // A tenant's door: its endpoint under the root's, the same credentials, no manifest and no sign-in of its own.
+        let key = sign_in(&router(root.clone()), "test", "my-peer").await;
+        let tenant = door_over_with(Arc::new(EventLog::ephemeral()), Some(root.auth.clone()));
+        let tenant = Arc::new(Door::new(
+            &format!("{EP}/tenants/t1"),
+            "io.best.agents",
+            "A tenant.",
+            Catalogue::new().query(QueryDef {
+                schema: "get-peer".into(),
+                version: "1.0".into(),
+                description: "Who this tenant is.".into(),
+                parameters: None,
+                response: json!({ "type": "object" }),
+                handler: Arc::new(|_who, _p| Box::pin(async move { Ok(json!({ "name": "t1" })) })),
+            }),
+            tenant.log.clone(),
+            root.auth.clone(),
+        ));
+        let app = tenant_router(tenant);
+        let (s, _, b) = call(&app, get("/queries/get-peer", Some(&key))).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["name"], "t1");
+        let (s, _, c) = call(&app, get("/queries", Some(&key))).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            c["queries"][0]["dataschema"],
+            format!("{EP}/tenants/t1/queries/get-peer/1.0")
+        );
+        let (s, _, _) = call(&app, get("/queries/get-peer", None)).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let (s, _, b) = call(&app, get("/.well-known/best", None)).await;
+        assert_eq!(
+            s,
+            StatusCode::NOT_FOUND,
+            "the tenant's manifest is the root's to serve: {b}"
+        );
+        let (s, _, b) = call(&app, post_form("/auth/device", &[("client_id", "x")])).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "sign-in is the root's: {b}");
+        assert_eq!(b["error"]["code"], "NOT_FOUND");
     }
 
     #[tokio::test]

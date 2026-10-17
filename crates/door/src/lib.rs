@@ -7,6 +7,11 @@
 //!
 //! What the door does not know: which hardware or engine stands behind the handlers, and who approves a sign-in. The
 //! first two are the peer's abstractions; the last is an [`Approver`] the peer chooses.
+//!
+//! A door may host tenants (SPEC.md, Multi-Tenancy): the root door declares the URI template of their manifests, and
+//! each tenant is a [`Door`] of its own, with its endpoint under the root's and its own log, served through
+//! [`tenant_router`] where the host mounts it. The root serves the tenant manifests; the host decides which tenant a
+//! credential opens.
 
 pub mod auth;
 pub mod catalogue;
@@ -22,7 +27,7 @@ pub use catalogue::{AdmitHook, Catalogue, CommandDef, Emitter, EventDef, QueryDe
 pub use envelope::Envelope;
 pub use error::BestError;
 pub use log::{Accept, EventLog, Filter, Stored, Unfinished};
-pub use router::{payload_hash, resume, router};
+pub use router::{payload_hash, resume, router, tenant_router};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,6 +53,10 @@ pub struct Door {
     pub inflight: std::sync::Mutex<HashMap<(String, String), (String, String)>>,
     /// Command type to the event types that complete it.
     pub completions: Arc<HashMap<String, std::collections::HashSet<String>>>,
+    /// The URI template of the tenant manifests this door hosts (`{tenantId}` the one variable), when it hosts
+    /// tenants: the manifest's `tenants` block, and the root service then declares its own authentication, so
+    /// its capabilities read as the root's, not a tenant's.
+    pub tenants: Option<String>,
 }
 
 impl Door {
@@ -72,7 +81,15 @@ impl Door {
             event_dataschemas,
             inflight: std::sync::Mutex::new(HashMap::new()),
             completions,
+            tenants: None,
         }
+    }
+
+    /// Declares the tenant manifests this door hosts: their URI template, with `{tenantId}` where the tenant's id
+    /// goes.
+    pub fn with_tenants(mut self, template: &str) -> Self {
+        self.tenants = Some(template.into());
+        self
     }
 
     /// The absolute `dataschema` URI of a command, query or event schema document on this door.
