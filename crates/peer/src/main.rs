@@ -2036,22 +2036,8 @@ mod tests {
             "the workspace documents the facts its stream carries"
         );
 
-        // A correlation another sender names opens nothing: Dave reuses the invitation's and reads only his own.
-        let (s, _) = send_as(
-            &site.app,
-            "",
-            &dave,
-            "dc",
-            "CreateWorkspace",
-            "create-workspace",
-            json!({ "name": "Dave's", "__corr": "i1" }),
-        )
-        .await;
-        assert_eq!(
-            s,
-            StatusCode::BAD_REQUEST,
-            "the schema takes no stray field; the correlation goes on the envelope"
-        );
+        // A correlation another sender names opens nothing: Dave names the invitation's on a command of his own and
+        // is refused by the field; the log holds nothing of it for him.
         let req = Request::post("/commands")
             .header("X-Api-Key", &dave)
             .header(header::CONTENT_TYPE, "application/cloudevents+json")
@@ -2064,16 +2050,12 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        assert_eq!(
-            site.app.clone().oneshot(req).await.unwrap().status(),
-            StatusCode::CREATED
-        );
-        let under_i1 = events_as(&site.app, "", &dave, "i1", "WorkspaceCreatedV1").await;
-        assert_eq!(type_names(&under_i1), ["WorkspaceCreatedV1"], "{under_i1:#?}");
-        assert_eq!(
-            under_i1[0]["data"]["owner"], dave_id,
-            "Carol's invitation under the same correlation is not his"
-        );
+        let res = site.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let e = body(res).await;
+        assert_eq!(e["error"]["code"], "CORRELATION_TAKEN", "{e}");
+        assert_eq!(e["error"]["details"]["attribute"], "correlationid");
+        assert_eq!(root_events(&dave, "?correlationId=i1").await, Vec::<Value>::new());
 
         // Left and invited again, the second cycle is heard too: the facts are told by their ids, never deduplicated
         // away by their words.

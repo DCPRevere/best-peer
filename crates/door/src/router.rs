@@ -315,8 +315,33 @@ async fn ingest(
         Some(Accept::Duplicate { correlation: original }) => return Ok(created(&envelope.id, &original)),
         _ => {}
     }
+    // A correlation id belongs to the sender that first used it on this door: a credential reads the facts under
+    // the correlations it owns, so another sender naming one is refused, with the field and the fix (SPEC.md,
+    // Security Requirements: an identifier is never proof; the replay scope includes the sender).
+    let taken = || {
+        BestError::bad_request(
+            "CORRELATION_TAKEN",
+            format!(
+                "correlationid {correlation} was first used by another credential on this door and is theirs: name a correlation id of your own, or a new id when the command carries no correlationid, since the id then serves as one"
+            ),
+        )
+        .with_details(json!({ "attribute": "correlationid", "correlationid": correlation }))
+    };
+    if door
+        .log
+        .owner_of_correlation(&correlation)
+        .is_some_and(|owner| owner != sender.hash)
+    {
+        return Err(taken());
+    }
     {
         let mut inflight = door.inflight.lock().unwrap();
+        if inflight
+            .iter()
+            .any(|((s, _), (_, c))| *s != sender.hash && *c == correlation)
+        {
+            return Err(taken());
+        }
         match inflight.get(&key) {
             Some((h, original)) if *h == hash => return Ok(created(&envelope.id, original)),
             Some(_) => return Err(conflict()),
@@ -710,7 +735,9 @@ mod tests {
                 response: json!({ "type": "object", "properties": { "name": { "type": "string" } } }),
                 handler: Arc::new(|_who, p| Box::pin(async move { Ok(json!({ "name": "peer", "echo": p.get("x") })) })),
             });
-        let auth = auth.unwrap_or_else(|| Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() }))));
+        let auth = auth.unwrap_or_else(|| {
+            Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() })).with_scopes(&["deploy"]))
+        });
         Arc::new(Door::new(EP, "io.best.agents", "A test peer.", catalogue, log, auth))
     }
 
@@ -746,22 +773,24 @@ mod tests {
             .unwrap()
     }
 
-    /// Registers through the device flow and returns a working key.
+    /// Registers through the device flow and returns a working key, approved with nothing said: all.
     async fn sign_in(app: &Router, client: &str, connection: &str) -> String {
+        sign_in_with(app, client, connection, None).await
+    }
+
+    /// The same, approved for the scopes `may` names when given.
+    async fn sign_in_with(app: &Router, client: &str, connection: &str, may: Option<&str>) -> String {
         let (s, _, a) = call(
             app,
             post_form("/auth/device", &[("client_id", client), ("connection", connection)]),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{a}");
-        let (s, _, ok) = call(
-            app,
-            post_form(
-                "/auth/approve",
-                &[("user_code", a["user_code"].as_str().unwrap()), ("proof", "ok")],
-            ),
-        )
-        .await;
+        let mut fields = vec![("user_code", a["user_code"].as_str().unwrap()), ("proof", "ok")];
+        if let Some(m) = may {
+            fields.push(("may", m));
+        }
+        let (s, _, ok) = call(app, post_form("/auth/approve", &fields)).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(ok["admitted"]["connection"], connection);
         let (s, h, t) = call(
@@ -1014,9 +1043,10 @@ mod tests {
         assert_eq!(c["error"]["code"], "CONFLICT");
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert_eq!(d.log.len(), 1, "the duplicate ran no handler");
-        // Another sender's identical id is their own command.
+        // Another sender's identical id is their own command, but as a correlation it is the first sender's: with
+        // no correlationid of their own the command is refused; with one, it goes.
         let other = sign_in(&app, "other", "other-peer").await;
-        let (s, _, _) = call(
+        let (s, _, e) = call(
             &app,
             post_json(
                 "/commands",
@@ -1026,9 +1056,124 @@ mod tests {
             ),
         )
         .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "CORRELATION_TAKEN");
+        let mut own = command("cmd-1", json!("ollama/ollama:0.6"));
+        own["correlationid"] = json!("theirs");
+        let (s, _, _) = call(&app, post_json("/commands", &other, "application/json", own)).await;
         assert_eq!(s, StatusCode::CREATED);
         settle(&d, 2).await;
         assert_eq!(d.log.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_correlation_id_belongs_to_the_sender_that_first_used_it_and_another_sender_naming_it_is_refused() {
+        let d = door();
+        let app = router(d.clone());
+        // Alice acts for every holder; Bob is approved for deploy alone, so he reads the facts under his own
+        // correlations and no other.
+        let alice = sign_in(&app, "test", "my-peer").await;
+        let bob = sign_in_with(&app, "other", "other-peer", Some("deploy")).await;
+        let with_correlation = |id: &str, corr: &str| {
+            let mut c = command(id, json!("ollama/ollama:0.6"));
+            c["correlationid"] = json!(corr);
+            c
+        };
+        let (s, _, b) = call(
+            &app,
+            post_json(
+                "/commands",
+                &alice,
+                "application/json",
+                with_correlation("a1", "shared"),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        settle(&d, 1).await;
+        // Bob names Alice's correlation on a command of his own: refused by the field, with the fix; so is an id of
+        // his that would serve as that correlation. Alice's own reuse goes.
+        let (s, _, e) = call(
+            &app,
+            post_json("/commands", &bob, "application/json", with_correlation("b1", "shared")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "CORRELATION_TAKEN");
+        assert_eq!(e["error"]["details"]["attribute"], "correlationid");
+        assert!(e["error"]["message"].as_str().unwrap().contains("of your own"), "{e}");
+        let (s, _, e) = call(
+            &app,
+            post_json(
+                "/commands",
+                &bob,
+                "application/json",
+                command("shared", json!("ollama/ollama:0.6")),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "CORRELATION_TAKEN");
+        let (s, _, _) = call(
+            &app,
+            post_json(
+                "/commands",
+                &alice,
+                "application/json",
+                with_correlation("a2", "shared"),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        settle(&d, 2).await;
+        assert_eq!(d.log.len(), 2, "the refused commands ran nothing");
+        // Bob reads nothing under it, on the log and on a stream he holds open, before or after; Alice reads hers.
+        let (s, _, b) = call(&app, get("/events?correlationId=shared", Some(&bob))).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["events"], json!([]));
+        let (_, _, a) = call(&app, get("/events?correlationId=shared", Some(&alice))).await;
+        assert_eq!(a["events"].as_array().unwrap().len(), 2);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/events/stream?correlationId=shared")
+                    .header(AUTH_HEADER, &bob)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut body = res.into_body().into_data_stream();
+        d.log.append(Envelope::event(
+            "io.best.agents",
+            "DeploymentReady",
+            json!({ "deployment": "dep-a", "endpoint": "http://peer.test/deployments/dep-a/v1" }),
+            Some("shared".into()),
+            None,
+        ));
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(300), body.next()).await;
+        assert!(
+            frame.is_err(),
+            "nothing under Alice's correlation reaches Bob: {frame:?}"
+        );
+        // A correlation of Bob's own is his to read, and Alice may not take it.
+        let (s, _, _) = call(
+            &app,
+            post_json("/commands", &bob, "application/json", with_correlation("b2", "bobs")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        settle(&d, 4).await;
+        let (_, _, b) = call(&app, get("/events?correlationId=bobs", Some(&bob))).await;
+        assert_eq!(b["events"].as_array().unwrap().len(), 1);
+        let (s, _, e) = call(
+            &app,
+            post_json("/commands", &alice, "application/json", with_correlation("a3", "bobs")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(e["error"]["code"], "CORRELATION_TAKEN");
     }
 
     #[tokio::test]

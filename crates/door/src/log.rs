@@ -378,16 +378,31 @@ impl EventLog {
         (page.into_iter().map(|s| s.envelope.clone()).collect(), next)
     }
 
-    /// Everything after the event with `id`, for a reconnecting stream. An id this log never told is not a position
-    /// in it, so nothing is replayed: the client reads history with `GET /events` and follows from now.
+    /// The sender a correlation id belongs to: the one whose accepted command first carried it on this door. A
+    /// correlation id is an identifier, never proof, so it is the first use that binds it, and a later command from
+    /// another sender naming it is refused at ingest.
+    pub fn correlation_owner<'a>(accepted: &'a HashMap<(String, String), AcceptedLine>, corr: &str) -> Option<&'a str> {
+        accepted
+            .values()
+            .filter(|a| a.correlation == corr)
+            .min_by_key(|a| a.order)
+            .map(|a| a.sender.as_str())
+    }
+
+    /// `correlation_owner`, for the ingest.
+    pub fn owner_of_correlation(&self, corr: &str) -> Option<String> {
+        Self::correlation_owner(&self.accepted.lock().unwrap(), corr).map(str::to_string)
+    }
+
     /// Whether `s` is under a command `sender` sent: every fact about a workload is told under the correlation id
-    /// of the command that made it, so a sender's events are the events under its own commands. An event under no
-    /// command is nobody's and is read by a credential that acts for every holder only.
+    /// of the command that made it, so a sender's events are the events under the correlations it owns, the ones
+    /// its commands used first. An event under no command is nobody's and is read by a credential that acts for
+    /// every holder only.
     pub fn is_senders(accepted: &HashMap<(String, String), AcceptedLine>, sender: &str, s: &Stored) -> bool {
         let Some(corr) = s.envelope.correlationid.as_deref() else {
             return false;
         };
-        accepted.values().any(|a| a.sender == sender && a.correlation == corr)
+        Self::correlation_owner(accepted, corr) == Some(sender)
     }
 
     /// `is_senders` for a stream, which holds no lock across events.

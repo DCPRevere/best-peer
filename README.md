@@ -244,7 +244,9 @@ and how fast is the engine's.
 Every command of this peer follows one pattern, and nothing else is needed to drive it:
 
 1. `POST /commands` answers `201` with the correlation id, once the command passed its schema and the peer's
-   current state (a deploy no device has the memory for is refused here, not failed later). From that moment the
+   current state (a deploy no device has the memory for is refused here, not failed later). A correlation id
+   belongs to the credential that first used it on this door: another credential naming it is refused with the
+   field and the fix, since what a credential reads is the facts under its own correlations. From that moment the
    command ends in a completing event, through a restart if need be: a command accepted and not yet run when the
    peer stops is run when it starts again, through the same state check, or failed with a `CommandFailed` that
    says why; one whose workload had already started and did not survive the restart is failed with the fix.
