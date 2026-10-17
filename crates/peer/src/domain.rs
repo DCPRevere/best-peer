@@ -176,6 +176,9 @@ pub const MEMBERSHIP_EVENTS: &[&str] = &[
     "MemberLeftV1",
 ];
 
+/// The commands that change a workspace's membership, whose failures are their sender's alone to read.
+pub const MEMBERSHIP_COMMANDS: &[&str] = &["CreateWorkspace", "InviteMember", "AcceptInvitation", "LeaveWorkspace"];
+
 /// The facts that are a workspace's own, which every member of it reads whatever their grant: its membership, its
 /// clouds and its peers. What a workload's holder alone reads stays the lifecycle's rule.
 pub const WORKSPACE_EVENTS: &[&str] = &[

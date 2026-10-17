@@ -29,7 +29,9 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use crate::cloud::Cloud;
-use crate::domain::{self, Clouds, Membership, Service, MEMBERSHIP_EVENTS, NAME_SHAPE, WORKSPACE_EVENTS};
+use crate::domain::{
+    self, Clouds, Membership, Service, MEMBERSHIP_COMMANDS, MEMBERSHIP_EVENTS, NAME_SHAPE, WORKSPACE_EVENTS,
+};
 use crate::endpoint::{Route, Upstream};
 use crate::holdings::Holdings;
 use crate::lifecycle::{list, new_id, require};
@@ -125,6 +127,12 @@ impl Workspaces {
         for e in &facts {
             me.apply(e);
         }
+        // A fact the root told that its workspace did not hear (the door stopped in between) is heard now.
+        for e in facts.iter().filter(|e| MEMBERSHIP_EVENTS.contains(&e.r#type.as_str())) {
+            if let Some(ws) = e.data["workspace"].as_str().and_then(|id| me.get(id)) {
+                ws.hear(e);
+            }
+        }
         me
     }
 
@@ -157,18 +165,21 @@ impl Workspaces {
     }
 
     /// What a credential reads of the root log: the door's own facts under the door's rule, and of the membership
-    /// facts those addressed to it (the workspaces it made or joined, the invitations it received) and those under
-    /// its own commands; nothing of a workspace it is not in, whatever its grant (SPEC.md, Security Requirements:
-    /// tenant context derives from the credential, streams are isolated per tenant).
+    /// facts those addressed to it by identity (the workspace it made, the invitation it received or sent, its own
+    /// join or leave) and nothing else, whatever its grant and whatever correlation it names; the failure of a
+    /// membership command is its sender's alone (SPEC.md, Security Requirements: tenant context derives from the
+    /// credential, streams are isolated per tenant).
     pub fn root_partition(log: Arc<EventLog>) -> Partition {
         Arc::new(move |who: &Credential, s: &Stored| {
             let e = &s.envelope;
-            if !MEMBERSHIP_EVENTS.contains(&e.r#type.as_str()) {
-                return None;
+            if MEMBERSHIP_EVENTS.contains(&e.r#type.as_str()) {
+                let me = who.holder();
+                let names = |field: &str| e.data[field].as_str() == Some(me.as_str());
+                return Some(names("identity") || names("owner") || names("invited_by"));
             }
-            let me = who.holder();
-            let addressed = e.data["identity"].as_str() == Some(&me) || e.data["owner"].as_str() == Some(&me);
-            Some(addressed || log.visible_to(Some(&who.hash), s))
+            let failed_membership = e.r#type == "CommandFailed"
+                && MEMBERSHIP_COMMANDS.contains(&e.data["type"].as_str().unwrap_or_default());
+            failed_membership.then(|| log.visible_to(Some(&who.hash), s))
         })
     }
 
@@ -641,22 +652,19 @@ impl Workspace {
         self.door.get().expect("the door is set at open")
     }
 
-    /// A membership fact about this workspace, told at the root, told again on this workspace's own stream under
-    /// the same correlation, so its members hear who joined, was invited or left. A fact already here (a replay)
-    /// is not told twice.
+    /// A membership fact about this workspace, told at the root, told again on this workspace's own stream: the same
+    /// fact, with the same id, correlation and time, under the workspace's schema, so its members hear who joined,
+    /// was invited or left. A fact already on this log, by its id, is not told twice, so the start's repair of what a
+    /// stop left untold and a live telling agree.
     fn hear(&self, e: &Envelope) {
-        let mut known = false;
-        self.log.replay(|k| known |= k.r#type == e.r#type && k.data == e.data);
-        if known {
+        if self.log.contains_id(&e.id) {
             return;
         }
-        Emitter::new(
-            self.log.clone(),
-            &self.ctx.service,
-            &e.effective_correlation(),
-            self.dataschemas.clone(),
-        )
-        .emit(&e.r#type, e.data.clone());
+        self.log.append(Envelope {
+            dataschema: self.dataschemas.get(&e.r#type).cloned(),
+            source: self.ctx.service.clone(),
+            ..e.clone()
+        });
     }
 
     pub fn router(&self) -> &Router {

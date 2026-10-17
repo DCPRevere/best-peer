@@ -398,6 +398,11 @@ impl EventLog {
         }
     }
 
+    /// Whether an event with this id is in the log: a fact told on two logs is the same fact, by its id.
+    pub fn contains_id(&self, id: &str) -> bool {
+        self.events.lock().unwrap().iter().any(|s| s.envelope.id == id)
+    }
+
     pub fn since_id(&self, id: &str) -> Vec<Stored> {
         let events = self.events.lock().unwrap();
         match events.iter().position(|s| s.envelope.id == id) {

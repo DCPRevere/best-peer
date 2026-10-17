@@ -2035,6 +2035,111 @@ mod tests {
             d["title"], "MemberJoinedV1",
             "the workspace documents the facts its stream carries"
         );
+
+        // A correlation another sender names opens nothing: Dave reuses the invitation's and reads only his own.
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &dave,
+            "dc",
+            "CreateWorkspace",
+            "create-workspace",
+            json!({ "name": "Dave's", "__corr": "i1" }),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::BAD_REQUEST,
+            "the schema takes no stray field; the correlation goes on the envelope"
+        );
+        let req = Request::post("/commands")
+            .header("X-Api-Key", &dave)
+            .header(header::CONTENT_TYPE, "application/cloudevents+json")
+            .body(Body::from(
+                json!({
+                    "specversion": "1.0", "id": "dc", "correlationid": "i1", "source": "https://agent.test", "type": "CreateWorkspace",
+                    "datacontenttype": "application/json", "dataschema": format!("{EP}/commands/create-workspace/1.0"),
+                    "time": "2026-10-12T10:30:00Z", "data": { "name": "Dave's" }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            site.app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+        let under_i1 = events_as(&site.app, "", &dave, "i1", "WorkspaceCreatedV1").await;
+        assert_eq!(type_names(&under_i1), ["WorkspaceCreatedV1"], "{under_i1:#?}");
+        assert_eq!(
+            under_i1[0]["data"]["owner"], dave_id,
+            "Carol's invitation under the same correlation is not his"
+        );
+
+        // Left and invited again, the second cycle is heard too: the facts are told by their ids, never deduplicated
+        // away by their words.
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &carol,
+            "l1",
+            "LeaveWorkspace",
+            "leave-workspace",
+            json!({ "workspace": ws1 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &carol, "l1", "MemberLeftV1").await;
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &site.key,
+            "i1b",
+            "InviteMember",
+            "invite-member",
+            json!({ "workspace": ws1, "identity": carol_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &site.key, "i1b", "MemberInvitedV1").await;
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &carol,
+            "a1b",
+            "AcceptInvitation",
+            "accept-invitation",
+            json!({ "workspace": ws1 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &carol, "a1b", "MemberJoinedV1").await;
+        let (_, b) = get_as(&site.app, &format!("/workspaces/{ws1}"), &carol, "/events").await;
+        let on_ws1 = b["events"].as_array().unwrap();
+        assert_eq!(
+            type_names(on_ws1),
+            [
+                "WorkspaceCreatedV1",
+                "MemberInvitedV1",
+                "MemberJoinedV1",
+                "MemberLeftV1",
+                "MemberInvitedV1",
+                "MemberJoinedV1"
+            ],
+            "{on_ws1:#?}"
+        );
+        let hers = root_events(&carol, "").await;
+        assert_eq!(hers.len(), 5, "{hers:#?}");
+        assert_eq!(
+            hers.iter()
+                .map(|e| e["id"].as_str().unwrap())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            5
+        );
+        assert!(
+            on_ws1.iter().skip(1).all(|e| hers.iter().any(|h| h["id"] == e["id"])),
+            "the same facts, by id, on both logs"
+        );
     }
 
     #[tokio::test]
