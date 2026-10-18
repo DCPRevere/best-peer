@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::domain::Service;
-use crate::endpoint::{Route, Upstream};
 use crate::holdings::Holdings;
 use crate::lifecycle::{
     any_compute, mine, new_id, not_yours, parse, place, ready_deployment, require, within_share, workloads_view,
@@ -49,6 +48,8 @@ const TERMINAL: &[&str] = &[
     "JobFinished",
     "JobFailed",
     "JobStopped",
+    "PromptAnswered",
+    "PromptFailed",
     "CommandFailed",
 ];
 
@@ -111,6 +112,8 @@ fn read_saved(file: &Path) -> Vec<Saved> {
 #[derive(Clone)]
 struct Issued {
     em: Emitter,
+    /// The command's type, for the fact told when the member is lost before it answered.
+    r#type: String,
     /// The cloud command's key when this is one part of a pull fanned out to every member.
     pull: Option<String>,
     /// The workload this command ends, for an undeploy or a stop.
@@ -506,11 +509,20 @@ impl Cloud {
         (envelope, mc)
     }
 
-    fn listen_for(&self, member: &str, mc: &str, em: &Emitter, pull: Option<String>, ends: Option<String>) {
+    fn listen_for(
+        &self,
+        member: &str,
+        mc: &str,
+        em: &Emitter,
+        r#type: &str,
+        pull: Option<String>,
+        ends: Option<String>,
+    ) {
         self.issued.lock().unwrap().insert(
             (member.into(), mc.into()),
             Issued {
                 em: em.clone(),
+                r#type: r#type.into(),
                 pull,
                 ends,
             },
@@ -526,10 +538,13 @@ impl Cloud {
         schema: &str,
         data: Value,
     ) -> Result<(), BestError> {
-        let ends = data["deployment"].as_str().or(data["job"].as_str()).map(str::to_string);
+        // An undeploy or a stop ends the workload it names; a prompt names one and ends nothing.
+        let ends = matches!(r#type, "UndeployModel" | "StopJob")
+            .then(|| data["deployment"].as_str().or(data["job"].as_str()).map(str::to_string))
+            .flatten();
         let base = member.schema_base().await;
         let (envelope, mc) = self.to_member(member, &base, em.command_key(), r#type, schema, data);
-        self.listen_for(&member.name, &mc, em, None, ends);
+        self.listen_for(&member.name, &mc, em, r#type, None, ends);
         member.send(&envelope).await.map(|_| ()).map_err(|e| {
             self.issued.lock().unwrap().remove(&(member.name.clone(), mc));
             e.relayed(&member.name)
@@ -620,15 +635,6 @@ impl Cloud {
                         }
                         if let Some(w) = data["deployment"].as_str().or(data["job"].as_str()) {
                             em.bind_workload(w);
-                        }
-                    }
-                    "DeploymentReady" => {
-                        if let (Some(dep), Some(engine)) = (
-                            data["deployment"].as_str(),
-                            serde_json::from_value::<Kind>(data["engine"].clone()).ok(),
-                        ) {
-                            data["endpoint"] =
-                                json!(format!("{}/deployments/{dep}{}", self.endpoint, engine.openai_path()));
                         }
                     }
                     _ => {}
@@ -974,6 +980,13 @@ impl Cloud {
             let key = i.em.command_key().to_string();
             if let Some(pull) = &i.pull {
                 self.on_pull_fact(m, pull, &i.em, "ImagePullFailed", json!({ "reason": why }));
+            } else if i.r#type == "Prompt" {
+                // The answer is not coming: the prompt is told as failed, to be sent again when the peer is back.
+                self.tell(
+                    &i.em,
+                    "PromptFailed",
+                    json!({ "reason": why, "fix": "prompt again once the peer answers: PeerJoined on this stream says so", "peer": m.name }),
+                );
             } else if i.ends.is_some() || key.is_empty() {
                 self.tell(
                     &i.em,
@@ -1097,7 +1110,7 @@ impl Service for Cloud {
 
     fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
         let held = self.holdings.held_by(&who.holder());
-        let mut v = workloads_view(&self.state.lock().unwrap(), who, &self.endpoint, Some(&self.name));
+        let mut v = workloads_view(&self.state.lock().unwrap(), who, Some(&self.name));
         v["held_bytes"] = json!(held);
         Ok(v)
     }
@@ -1129,7 +1142,7 @@ impl Service for Cloud {
         for m in members {
             let base = m.schema_base().await;
             let (envelope, mc) = self.to_member(&m, &base, &key, "PullImage", "pull-image", json!({ "image": image }));
-            self.listen_for(&m.name, &mc, &em, Some(key.clone()), None);
+            self.listen_for(&m.name, &mc, &em, "PullImage", Some(key.clone()), None);
             if let Err(e) = m.send(&envelope).await {
                 self.issued.lock().unwrap().remove(&(m.name.clone(), mc));
                 self.on_pull_fact(
@@ -1186,7 +1199,7 @@ impl Service for Cloud {
         // Run again after a restart: the member runs it; listen for the rest of its facts and say nothing twice.
         if let Some(peer) = self.already_placed(em.command_key()) {
             let mc = member_correlation(em.command_key(), &json!({}), None);
-            self.listen_for(&peer, &mc, &em, None, None);
+            self.listen_for(&peer, &mc, &em, "DeployModel", None, None);
             return;
         }
         let reservation = self.state.lock().unwrap().reserved.get(em.command_key()).cloned();
@@ -1280,11 +1293,7 @@ impl Service for Cloud {
         };
         if let Err(e) = outcome {
             if let Some(d) = self.state.lock().unwrap().deployments.get_mut(&id) {
-                d.phase = if d.endpoint.is_some() {
-                    Phase::Ready
-                } else {
-                    Phase::Starting
-                };
+                d.phase = if d.ready { Phase::Ready } else { Phase::Starting };
             }
             self.tell(
                 &em,
@@ -1360,7 +1369,7 @@ impl Service for Cloud {
         };
         if let Some(peer) = self.already_placed(em.command_key()) {
             let mc = member_correlation(em.command_key(), &json!({}), None);
-            self.listen_for(&peer, &mc, &em, None, None);
+            self.listen_for(&peer, &mc, &em, "RunJob", None, None);
             return;
         }
         let reservation = self.state.lock().unwrap().reserved.get(em.command_key()).cloned();
@@ -1456,22 +1465,36 @@ impl Service for Cloud {
             );
         }
     }
-}
 
-impl Upstream for Cloud {
-    fn upstream_of(&self, deployment: &str, who: &Credential) -> Result<Route, BestError> {
-        let state = self.state.lock().unwrap();
-        let d = ready_deployment(&state, deployment, who)?;
-        let member = d
-            .peer
-            .as_deref()
-            .and_then(|p| self.member(p))
-            .ok_or_else(|| BestError::internal(format!("deployment {deployment} names no member peer")))?;
-        Ok(Route {
-            base: format!("{}/deployments/{deployment}", member.endpoint),
-            key: member.key(),
-            transport: member.transport.clone(),
-        })
+    fn admit_prompt(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        require(who, "prompt")?;
+        let id = cmd.data["deployment"].as_str().unwrap_or_default();
+        ready_deployment(&self.state.lock().unwrap(), id, who).map(|_| ())
+    }
+
+    /// A prompt goes to the member that holds the deployment, as the member's own prompt command; its answer comes
+    /// back on the member's stream and is relayed under the caller's correlation with the cloud and the peer named.
+    async fn prompt(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        let id = cmd.data["deployment"].as_str().unwrap_or_default().to_string();
+        let member = self
+            .state
+            .lock()
+            .unwrap()
+            .deployments
+            .get(&id)
+            .and_then(|d| d.peer.clone())
+            .and_then(|p| self.member(&p));
+        let outcome = match &member {
+            Some(m) => self.place_on(m, &em, "Prompt", "prompt", cmd.data.clone()).await,
+            None => Err(BestError::internal(format!("deployment {id} names no member peer"))),
+        };
+        if let Err(e) = outcome {
+            self.tell(
+                &em,
+                "PromptFailed",
+                json!({ "deployment": id, "reason": e.message, "fix": "read the peer's refusal in the reason, then prompt again", "peer": member.map(|m| m.name.clone()) }),
+            );
+        }
     }
 }
 
