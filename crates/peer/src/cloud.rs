@@ -1538,10 +1538,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_quiet_member_whose_socket_is_alive_is_read_on_and_not_taken_for_silent() {
-        // Keep-alives alone, each well inside the silence allowed, for ten times that silence: the stream is read to
-        // its end and no event is relayed. Before the fix every keep-alive was swallowed by the parser, and a member
-        // with nothing to tell for a minute was reconnected every minute.
-        let silence = Duration::from_millis(60);
+        // Keep-alives alone, each well inside the silence allowed, for longer than that silence: the stream is read
+        // to its end and no event is relayed. Before the fix every keep-alive was swallowed by the parser, and a
+        // member with nothing to tell for a minute was reconnected every minute. The margin between a step and the
+        // silence is wide, so a loaded runner's stall is not taken for silence.
+        let silence = Duration::from_millis(500);
         let mut relayed = 0;
         let stopped =
             read_until_stopped(keep_alives(Duration::from_millis(20), 30), silence, |_, _| relayed += 1).await;

@@ -40,21 +40,23 @@
 
 ## 4. Ship
 
-- **Every change is a pull request to `main`, the owner's included.** `main` is protected: nothing is pushed to it
-  directly, nothing is force-pushed. A piece of work is a branch, and lands as one commit on `main` (a squash merge),
-  the subject saying what changed and why, ending with the assistant's attribution line.
+- **Every change is a pull request to `main`, the owner's included.** `main` is protected: a pull request with `ci`
+  green is the only way onto it, nothing is force-pushed, and the one exception is the release commit below, which
+  the owner's bypass of the protection lets through. A piece of work is a branch, and lands as one commit on `main`
+  (a squash merge), the subject saying what changed and why, ending with the assistant's attribution line.
 - **Three gates, in this order; nothing moves on while one is open.**
-  1. **The local proof**, before the branch is pushed: section 3 on this machine, through the gate script, ending in
-     `GATE GREEN`; a change that touches a host is proven on that host by hand, with the proof on the issue.
+  1. **The local proof**, before the branch is pushed: section 3 on the maintainer's machine, every step green (the
+     owner wraps them in a script that ends in `GATE GREEN`; any maintainer runs the same commands); a change that
+     touches a host is proven on that host by hand, with the proof on the issue.
   2. **CI** on the pull request: section 3 again, on the fakes; a red check blocks the merge.
   3. **The review**: `/best-review` on the branch, the owner-run review of everything the pull request holds that
      `main` does not. Every finding is answered on its thread with a fix and a test, or set aside with its reason;
      nothing is dropped silently. The owner merges.
 - **The merge is what runs.** A host run by the owner builds `main` and runs it; the sha is its version.
 - **A release is a tag.** `scripts/release.sh <version> -m "<what it is>"` runs only on a clean `main` level with
-  origin, so everything it releases has passed both gates; it bumps the one version in `Cargo.toml` (every crate
-  inherits it), commits `Release <version>`, which holds nothing but the version and is the one commit the owner makes
-  on `main` directly, tags `v<version>` with the message and pushes both. The `release` workflow refuses a tag that is
+  origin, so everything it releases has passed the gates; it bumps the one version in `Cargo.toml` (every crate
+  inherits it), commits `Release <version>`, which holds nothing but the version and is the one commit that skips the
+  gates and goes onto `main` directly, by the owner, tags `v<version>` with the message and pushes both. The `release` workflow refuses a tag that is
   not on `main`, not on a `Release <version>` commit or not equal to `Cargo.toml`, waits for `ci` to pass on that
   commit, runs the checks on the locked tree, builds the binary for Linux x86_64 (glibc 2.35 or newer: the driver's
   library is loaded at run time, which a static binary cannot do), Windows x86_64 and macOS Apple silicon, checks
@@ -78,6 +80,6 @@
 
 ## 6. What we do not do
 
-- No release of a commit the gates have not passed; no tag made by hand.
+- No release of a commit the gates have not passed, the release commit itself excepted; no tag made by hand.
 - No push to `main` but the release commit; no force-push; no merge with an unanswered review finding or a red check.
 - No plan file, no `TODO`, no dated narrative: open work is an issue.
