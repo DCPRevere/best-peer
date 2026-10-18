@@ -43,10 +43,13 @@
 - **Every change is a pull request to `main`, the owner's included.** `main` is protected: nothing is pushed to it
   directly, nothing is force-pushed. A piece of work is a branch, and lands as one commit on `main` (a squash merge),
   the subject saying what changed and why, ending with the assistant's attribution line.
-- **CI is the first gate.** Section 3 runs on every pull request; a red check blocks the merge.
-- **The review gate is the second.** `/best-review` on the branch, the owner-run review of everything the pull request
-  holds that `main` does not. Every finding is answered on its thread with a fix and a test, or set aside with its
-  reason; nothing is dropped silently. The owner merges.
+- **Three gates, in this order; nothing moves on while one is open.**
+  1. **The local proof**, before the branch is pushed: section 3 on this machine, through the gate script, ending in
+     `GATE GREEN`; a change that touches a host is proven on that host by hand, with the proof on the issue.
+  2. **CI** on the pull request: section 3 again, on the fakes; a red check blocks the merge.
+  3. **The review**: `/best-review` on the branch, the owner-run review of everything the pull request holds that
+     `main` does not. Every finding is answered on its thread with a fix and a test, or set aside with its reason;
+     nothing is dropped silently. The owner merges.
 - **The merge is what runs.** A host run by the owner builds `main` and runs it; the sha is its version.
 - **A release is a tag.** `scripts/release.sh <version> -m "<what it is>"` runs only on a clean `main` level with
   origin, so everything it releases has passed both gates; it bumps the one version in `Cargo.toml` (every crate
