@@ -40,29 +40,41 @@
 
 ## 4. Ship
 
-- **Every change is made on `main`.** No feature branches, no pull requests: one commit per piece of work, the subject
-  saying what changed and why, ending with the assistant's attribution line.
-- **Before the push, the review gate**: `/best-review`, the owner-run review of everything `main` holds that origin
-  does not. Every finding is fixed on `main` with a test or set aside with its reason in the report; nothing is dropped
-  silently.
-- **The push is what runs.** A host run by the owner builds `main` and runs it; the sha is its version.
+- **Every change is a pull request to `main`, the owner's included.** `main` is protected: nothing is pushed to it
+  directly, nothing is force-pushed. A piece of work is a branch, and lands as one commit on `main` (a squash merge),
+  the subject saying what changed and why, ending with the assistant's attribution line.
+- **CI is the first gate.** Section 3 runs on every pull request; a red check blocks the merge.
+- **The review gate is the second.** `/best-review` on the branch, the owner-run review of everything the pull request
+  holds that `main` does not. Every finding is answered on its thread with a fix and a test, or set aside with its
+  reason; nothing is dropped silently. The owner merges.
+- **The merge is what runs.** A host run by the owner builds `main` and runs it; the sha is its version.
 - **A release is a tag.** `scripts/release.sh <version> -m "<what it is>"` runs only on a clean `main` level with
-  origin, so everything it releases has passed the gate; it bumps the one version in `Cargo.toml` (every crate
-  inherits it), commits `Release <version>`, which holds nothing but the version and is the one commit that skips
-  the gate, tags `v<version>` with the message and pushes both. The `release` workflow refuses a tag that is not on
-  `main`, not on a `Release <version>` commit or not equal to `Cargo.toml`, waits for `ci` to pass on that commit,
-  runs the checks on the locked tree, builds the binary for Linux x86_64 (glibc 2.35 or newer: the driver's library is loaded at run time, which a
-  static binary cannot do), Windows x86_64 and macOS Apple
-  silicon, checks each says the version, and publishes each archive twice, byte for byte the same: under its versioned
-  name, for pinning, and under a name without the version that `releases/latest/download` resolves, so the README's
-  commands name no version; with checksums, a build provenance attestation
-  and notes made from the release commit's message and the commits since the previous release. A release is cut when someone
-  other than the owner will run the binary, or when a slice's issue says a host needs it; before 1.0 the minor goes
-  up with a capability and the patch with a fix. A change to the workflow is tried with its `workflow_dispatch`,
-  which builds and keeps the archives as run artifacts and publishes nothing, whatever ref it is started from.
+  origin, so everything it releases has passed both gates; it bumps the one version in `Cargo.toml` (every crate
+  inherits it), commits `Release <version>`, which holds nothing but the version and is the one commit the owner makes
+  on `main` directly, tags `v<version>` with the message and pushes both. The `release` workflow refuses a tag that is
+  not on `main`, not on a `Release <version>` commit or not equal to `Cargo.toml`, waits for `ci` to pass on that
+  commit, runs the checks on the locked tree, builds the binary for Linux x86_64 (glibc 2.35 or newer: the driver's
+  library is loaded at run time, which a static binary cannot do), Windows x86_64 and macOS Apple silicon, checks
+  each says the version, and publishes each archive twice, byte for byte the same: under its versioned name, for
+  pinning, and under a name without the version that `releases/latest/download` resolves, so the README's commands
+  name no version; with checksums, a build provenance attestation and notes made from the release commit's message
+  and the commits since the previous release. A release is cut when someone other than the owner will run the
+  binary, or when a slice's issue says a host needs it; before 1.0 the minor goes up with a capability and the patch
+  with a fix. A change to the workflow is tried with its `workflow_dispatch`, which builds and keeps the archives as
+  run artifacts and publishes nothing, whatever ref it is started from.
 
-## 5. What we do not do
+## 5. A change from another maintainer
 
-- No release of a commit the review gate has not passed; no tag made by hand.
-- No force-pushes, no push with an unfixed review finding or a red check.
+- **The same pull request, from a branch of this repository**: a maintainer has write access and branches here; one
+  without it forks. One per need the implementation proved, held to sections 2, 3 and 4 as any change is. Its
+  description names the spec text it satisfies or the entry it adds to the spec follow-ups issue; a behaviour the
+  spec does not ask for is that entry first, so the spec and every implementation of it move together, and never a
+  surface of this implementation alone.
+- **A checkout that runs ahead of `main` on a host is that host's owner's to run**; what the spec promises of it is
+  only what `main` proves.
+
+## 6. What we do not do
+
+- No release of a commit the gates have not passed; no tag made by hand.
+- No push to `main` but the release commit; no force-push; no merge with an unanswered review finding or a red check.
 - No plan file, no `TODO`, no dated narrative: open work is an issue.
