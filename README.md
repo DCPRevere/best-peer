@@ -94,7 +94,15 @@ decides who is in, as with SSH keys, and what they may do: approved with nothing
 `--may deploy,prompt --memory 40G` makes one that may deploy models and prompt them but run no job, and hold 40 GiB
 of device memory at most across its workloads, which it alone sees, prompts and ends. `--deployments 2 --jobs 2` lets it
 run two of each at once at most. A key with a share runs its jobs in a closed box (no network, a ceiling on host
-memory) unless you add `--open-jobs`.
+memory) unless you add `--open-jobs`. `--expires 8h` ends the key after eight hours, so access lent for an afternoon
+ends without anyone remembering to take it back. To take a key back sooner, at your machine:
+
+```bash
+./best-peer revoke <name>
+```
+
+with the name it was approved under: every request carrying it is refused from then on, and an event stream it holds
+open ends within seconds. The agent can also give its key back itself, with the `revoke-agent` command.
 
 **4. More than one machine.** Run a peer on each, and one more `best-peer` anywhere as the door your team enters
 by: a laptop will do, with `BEST_PEER_GPU=none` and the runtime it has (`BEST_PEER_RUNTIME=fake` when it has none:
@@ -130,7 +138,7 @@ notes say what is proven and what is not yet.
 | `crates/gpu` | The accelerator abstraction: a vendor-neutral snapshot of the host's devices (`Gpu`), each naming the compute APIs it offers (CUDA, ROCm, oneAPI, Metal, Vulkan, CPU) so a workload asks for an API and memory, never for a vendor. Ships the `Fake` tests run against. |
 | `crates/runtime` | The container runtime abstraction (`Runtime`): pull with progress, start with devices handed over by id and the ports published, stop, observe, and what the engine does on its own told as events. Ships the `Fake`. |
 | `crates/engine` | The inference engine abstraction (`Engine`): which engines serve a model (Ollama, vLLM), what to run for each, how a served model is made ready, with progress, and how it is asked to answer a conversation. Ships the `Fake`. |
-| `crates/peer` | The `best-peer` binary: the door over the three abstractions, with the peer's own commands, queries and events, its state folded from the events it told; the workspaces it hosts, each a tenant door with its clouds of peers, folded from their own logs; and `best-peer approve`, the operator's side of sign-in. |
+| `crates/peer` | The `best-peer` binary: the door over the three abstractions, with the peer's own commands, queries and events, its state folded from the events it told; the workspaces it hosts, each a tenant door with its clouds of peers, folded from their own logs; and `best-peer approve` and `best-peer revoke`, the operator's side of sign-in. |
 | `crates/host` | The host itself as a device: a `Gpu` adapter reporting the CPU and system memory, so a peer with no accelerator serves the whole lifecycle. |
 | `crates/nvml` | The `Gpu` adapter for NVIDIA cards through NVML: memory, temperature, power, utilisation and the CUDA version, read live; the peer refuses to start without the driver unless told the host has none. |
 | `crates/docker` | The `Runtime` adapter over the Docker Engine API: NVIDIA devices handed over through the container toolkit by their NVML UUID. |
@@ -319,8 +327,11 @@ best-peer approve ABCD-EFGH
 ```
 
 That presents the machine's admin token, which only its owner can read, and the agent's next poll gets its credential:
-a key shown once, kept hashed, bound to the connection name the person gave. An operator who wants an identity
-provider instead plugs one in behind the `Approver` trait; the door never knows which stands behind it.
+a key shown once, kept hashed, bound to the connection name the person gave. The token is checked before anything
+else, so without it an approval learns neither whether a code is pending nor which scopes the door has. An operator
+who wants an identity provider instead plugs one in behind the `Approver` trait, which says whether a proof is the
+authority's (`attest`, asked first, and for a revoke) and admits a registration (`admit`); the door never knows which
+stands behind it.
 
 **Where a credential belongs** is the workspaces it created or accepted an invitation into, on this door, and
 `get-workspaces` says which, with the identity the credential is known by there, an opaque id another workspace's
@@ -332,7 +343,14 @@ lists the scopes: `deploy` (pull-image, deploy-model, undeploy-model), `jobs` (r
 (prompt); `all` is every scope and every holder's workloads, and what a key approved with nothing said is, so the owner's own box changes
 nothing. Reading is every key's: the hardware state, and its own workloads and events. `best-peer approve <code>
 --may deploy` grants scopes; `--memory 40G` sets the most device memory the key's workloads may hold together,
-counted across its deployments, jobs and commands admitted but not yet started. Every command document says which
+counted across its deployments, jobs and commands admitted but not yet started; `--expires 8h` ends the key after
+that long (`8h`, `30m`, `2d`, or seconds; 366 days at most, and 8 hours at most for a session credential, which an
+agent asks for when it cannot keep a secret: more is refused, never cut). `best-peer revoke <name>` takes a key back
+at once, by the connection name the agent signed in under or the holder id the events show, with the peer running
+and the same admin token; an agent takes back its own with the `revoke-agent` command, sent under it. Either way the
+key opens nothing from then on, on this door and every workspace door here, an event stream open under it ends
+within seconds, as one does when a key runs out, and what the key left running is the owner's to end. A revoke the
+disk did not keep says so: the key is closed until the peer restarts, and running the revoke again writes it. Every command document says which
 scope it needs. A command the key may not send is refused at ingest with `FORBIDDEN` and what it was approved for;
 a deploy or a job past the share with `SHARE_EXCEEDED`, what is held and the room left; a workload another key
 started, by name, whether a command, a prompt or the events are asked for, and a refusal names only what the key may

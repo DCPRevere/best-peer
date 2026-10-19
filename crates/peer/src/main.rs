@@ -6,8 +6,9 @@
 //! API, or the fakes when `BEST_PEER_RUNTIME=fake` (CI, a machine with no engine).
 //!
 //! `best-peer` serves; `best-peer approve <code>` admits an agent that asked, on the word of whoever controls this
-//! machine. Every door hosts workspaces, the BEST tenants: an identity creates one, invites others, and configures
-//! clouds in it, named pools of peers the same binary fronts and places on.
+//! machine, and `best-peer revoke <name>` takes a credential back. Every door hosts workspaces, the BEST tenants: an
+//! identity creates one, invites others, and configures clouds in it, named pools of peers the same binary fronts and
+//! places on.
 
 mod cloud;
 mod domain;
@@ -200,7 +201,7 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
         &ctx.endpoint,
         SERVICE,
         "A peer: a GPU host that deploys models and runs jobs on request and tells their lifecycle as events, and hosts workspaces, each with its clouds of peers.",
-        domain::catalogue(peer.clone(), workspaces),
+        domain::catalogue(peer.clone(), workspaces, auth.clone()),
         peer.log.clone(),
         auth,
     )
@@ -245,10 +246,11 @@ fn main() {
     match args.first().map(String::as_str) {
         None => serve(),
         Some("approve") => approve(&args[1..]),
+        Some("revoke") => revoke(&args[1..]),
         Some("--version" | "-V" | "version") => println!("best-peer {}", env!("CARGO_PKG_VERSION")),
         Some(other) => {
             eprintln!(
-                "unknown command {other:?}: run with no arguments to serve, `best-peer approve <code>`, or `best-peer --version`"
+                "unknown command {other:?}: run with no arguments to serve, `best-peer approve <code>`, `best-peer revoke <name>`, or `best-peer --version`"
             );
             std::process::exit(2);
         }
@@ -530,13 +532,109 @@ fn parse_memory(text: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{text:?} is more memory than exists"))
 }
 
+/// A span of time as a person writes it: `8h`, `30m`, `2d`, `90s`, or seconds.
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    let t = text.trim().to_ascii_lowercase();
+    let (digits, unit) = match t.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => (&t[..t.len() - 1], Some(c)),
+        _ => (t.as_str(), None),
+    };
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("{text:?} is not a span of time: write 8h, 30m, 2d, 90s or a number of seconds"))?;
+    let factor: u64 = match unit {
+        None | Some('s') => 1,
+        Some('m') => 60,
+        Some('h') => 3600,
+        Some('d') => 24 * 3600,
+        Some(u) => return Err(format!("{u} is not a unit of time: s, m, h or d")),
+    };
+    match n.checked_mul(factor).map(Duration::from_secs) {
+        Some(d) if d.is_zero() => Err(format!("{text:?} is not a span of time above zero")),
+        Some(d) if d <= best_peer_door::auth::MAX_EXPIRES => Ok(d),
+        _ => Err(format!(
+            "{text:?} is longer than a credential may be bounded to: 366d at most"
+        )),
+    }
+}
+
+/// The admin token and the record of the running peer, from the data directory, for the two commands the person at
+/// the machine runs; a form posted to the door's `path` with the token as the proof, and the door's answer whatever
+/// its status, since a refusal says why in its body.
+fn as_the_authority(path: &str, mut form: Vec<(&str, String)>) -> (u16, serde_json::Value) {
+    let dir = data_dir();
+    let token = std::fs::read_to_string(dir.join("admin-token"))
+        .map(|t| t.trim().to_string())
+        .unwrap_or_else(|e| {
+            fail(&format!(
+                "no admin token in {}: is the peer running on this machine with the same BEST_PEER_DATA? ({e})",
+                dir.display()
+            ))
+        });
+    let record = tls::Record::read(&dir).unwrap_or_else(|e| {
+        fail(&format!(
+            "no record of a running peer in {}: is the peer running on this machine with the same BEST_PEER_DATA? ({e})",
+            dir.display()
+        ))
+    });
+    let addr = record.dial();
+    form.push(("proof", token));
+    let body = serde_urlencoded::to_string(&form).unwrap_or_else(|e| fail(&format!("cannot encode the request: {e}")));
+    let req = axum::http::Request::post(path)
+        .header(axum::http::header::HOST, addr.to_string())
+        .header(axum::http::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|e| fail(&format!("cannot make the request: {e}")));
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| fail(&format!("cannot start: {e}")));
+    let (status, answer) = runtime
+        .block_on(tls::call(addr, record.certificate.as_deref(), req))
+        .unwrap_or_else(|why| fail(&why));
+    if status.as_u16() == 403 {
+        fail(&format!(
+            "the peer refused the admin token in {}: it is not the token of the peer listening on {}",
+            dir.display(),
+            record.listen
+        ));
+    }
+    (status.as_u16(), answer)
+}
+
+/// `best-peer revoke <name>`: takes back every live credential by that connection name or holder id, at once, with
+/// this machine's admin token as the proof, the way `approve` admits.
+fn revoke(args: &[String]) {
+    const USAGE: &str = "usage: best-peer revoke <name>: the connection name the agent signed in under, or the holder id get-workloads and the events show";
+    let (Some(name), None) = (args.first(), args.get(1)) else {
+        fail(USAGE)
+    };
+    let (status, answer) = as_the_authority("/auth/revoke", vec![("name", name.clone())]);
+    if status != 200 {
+        fail(&format!(
+            "the peer refused ({status}): {}",
+            answer["error_description"].as_str().unwrap_or("no reason given")
+        ));
+    }
+    for c in answer["revoked"].as_array().into_iter().flatten() {
+        let who = match c["agent_label"].as_str() {
+            Some(l) => format!("{l} ({})", c["client_id"].as_str().unwrap_or("?")),
+            None => c["client_id"].as_str().unwrap_or("?").to_string(),
+        };
+        println!(
+            "revoked the credential of {who} as connection {} (holder {}), issued {}: it opens nothing from now on",
+            c["name"].as_str().unwrap_or("?"),
+            c["holder"].as_str().unwrap_or("?"),
+            c["issued_at"].as_str().unwrap_or("?")
+        );
+    }
+}
+
 /// `best-peer approve <code>`: presents this machine's admin token to the peer running on it, for the code the
 /// person was shown. The token goes to the listen address only, never to the public endpoint, and over TLS to the
 /// certificate the peer serves and no other, when it serves one.
 fn approve(args: &[String]) {
-    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt | all] [--memory 40G] [--deployments N] [--jobs N] [--open-jobs]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said); how many deployments and jobs it may run at once across the door (no count when not said); with a share, whether its jobs leave the closed box (no network, a ceiling on host memory) a tenant's job gets";
+    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt | all] [--memory 40G] [--deployments N] [--jobs N] [--open-jobs] [--expires 8h]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said); how many deployments and jobs it may run at once across the door (no count when not said); with a share, whether its jobs leave the closed box (no network, a ceiling on host memory) a tenant's job gets; how long the credential lasts, 366d at most, and 8h at most for a session credential (the agent's choice when not said)";
     let Some(code) = args.first() else { fail(USAGE) };
     let (mut may, mut memory, mut open_jobs) = (None::<String>, None::<u64>, false);
+    let mut expires = None::<Duration>;
     let (mut deployments, mut jobs) = (None::<u32>, None::<u32>);
     let count = |flag: &str, text: Option<&String>| -> u32 {
         match text.map(|t| t.trim().parse::<u32>()) {
@@ -560,30 +658,19 @@ fn approve(args: &[String]) {
                     .unwrap_or_else(|| fail("--memory needs an amount, such as 40G, 512M or a number of bytes"));
                 memory = Some(parse_memory(amount).unwrap_or_else(|why| fail(&why)));
             }
+            "--expires" => {
+                let span = rest.next().unwrap_or_else(|| {
+                    fail("--expires needs a span of time, such as 8h, 30m, 2d or a number of seconds")
+                });
+                expires = Some(parse_duration(span).unwrap_or_else(|why| fail(&why)));
+            }
             "--open-jobs" => open_jobs = true,
             "--deployments" => deployments = Some(count("--deployments", rest.next())),
             "--jobs" => jobs = Some(count("--jobs", rest.next())),
             other => fail(&format!("unknown argument {other:?}. {USAGE}")),
         }
     }
-    let dir = data_dir();
-    let token = std::fs::read_to_string(dir.join("admin-token"))
-        .map(|t| t.trim().to_string())
-        .unwrap_or_else(|e| {
-            fail(&format!(
-                "no admin token in {}: is the peer running on this machine with the same BEST_PEER_DATA? ({e})",
-                dir.display()
-            ))
-        });
-    // Where the running peer is and what it serves, as it recorded at start.
-    let record = tls::Record::read(&dir).unwrap_or_else(|e| {
-        fail(&format!(
-            "no record of a running peer in {}: is the peer running on this machine with the same BEST_PEER_DATA? ({e})",
-            dir.display()
-        ))
-    });
-    let addr = record.dial();
-    let mut form: Vec<(&str, String)> = vec![("user_code", code.clone()), ("proof", token)];
+    let mut form: Vec<(&str, String)> = vec![("user_code", code.clone())];
     if let Some(m) = &may {
         form.push(("may", m.clone()));
     }
@@ -602,32 +689,18 @@ fn approve(args: &[String]) {
     if let Some(n) = jobs {
         form.push(("jobs", n.to_string()));
     }
-    let body = serde_urlencoded::to_string(&form).unwrap_or_else(|e| fail(&format!("cannot encode the request: {e}")));
-    let req = axum::http::Request::post("/auth/approve")
-        .header(axum::http::header::HOST, addr.to_string())
-        .header(axum::http::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(axum::body::Body::from(body))
-        .unwrap_or_else(|e| fail(&format!("cannot make the request: {e}")));
-    // The door's answer is read whatever its status: a refusal says why, in its body, and that is what the person
-    // at the machine needs to see (a scope the door does not have, a code that expired).
-    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| fail(&format!("cannot start: {e}")));
-    let (status, answer) = runtime
-        .block_on(tls::call(addr, record.certificate.as_deref(), req))
-        .unwrap_or_else(|why| fail(&why));
-    match status.as_u16() {
-        200 => {}
-        403 => fail(&format!(
-            "the peer refused the admin token in {}: it is not the token of the peer listening on {}",
-            dir.display(),
-            record.listen
-        )),
-        status => fail(&format!(
+    if let Some(d) = expires {
+        form.push(("expires_in", d.as_secs().to_string()));
+    }
+    let (status, answer) = as_the_authority("/auth/approve", form);
+    if status != 200 {
+        fail(&format!(
             "the peer refused ({status}): {}",
             answer["error_description"]
                 .as_str()
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("is {code} a live code shown by an agent in the last ten minutes?"))
-        )),
+        ));
     }
     let a = &answer["admitted"];
     let who = match a["agent_label"].as_str() {
@@ -651,8 +724,12 @@ fn approve(args: &[String]) {
             share.push_str(&format!(", {n} {kind} at once at most"));
         }
     }
+    let lasts = match a["expires_in"].as_u64() {
+        Some(s) => format!("ending in {s} s"),
+        None => "never ending".into(),
+    };
     println!(
-        "admitted {who} as connection {} with a {} credential that may {may}, {share}: the agent's next poll gets it",
+        "admitted {who} as connection {} with a {} credential that may {may}, {share}, {lasts}: the agent's next poll gets it",
         a["connection"].as_str().unwrap_or("(the host's name)"),
         a["lifetime"].as_str().unwrap_or("durable")
     );
@@ -3420,6 +3497,21 @@ mod tests {
     }
 
     #[test]
+    fn a_span_of_time_reads_as_a_person_writes_it() {
+        assert_eq!(parse_duration("8h").unwrap(), Duration::from_secs(8 * 3600));
+        assert_eq!(parse_duration("30M").unwrap(), Duration::from_secs(1800));
+        assert_eq!(parse_duration("2d").unwrap(), Duration::from_secs(2 * 86400));
+        assert_eq!(parse_duration("90s").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("3600").unwrap(), Duration::from_secs(3600));
+        assert!(parse_duration("soon").unwrap_err().contains("8h"));
+        assert!(parse_duration("4w").unwrap_err().contains("unit"));
+        assert!(parse_duration("0").unwrap_err().contains("above zero"));
+        assert_eq!(parse_duration("366d").unwrap(), Duration::from_secs(366 * 86400));
+        assert!(parse_duration("367d").unwrap_err().contains("366d"));
+        assert!(parse_duration("3000000000d").unwrap_err().contains("366d"));
+    }
+
+    #[test]
     fn an_amount_of_memory_reads_as_a_person_writes_it() {
         assert_eq!(parse_memory("40G").unwrap(), 40 << 30);
         assert_eq!(parse_memory("40GB").unwrap(), 40 << 30);
@@ -3888,6 +3980,88 @@ mod tests {
                 .contains("may run 1 deployment(s) at once"),
             "{failed}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_agent_revokes_its_own_credential_with_a_command_and_every_door_here_closes_to_it() {
+        let bed = fresh().await;
+        let team = key_with(&bed.app, Some("deploy"), None).await;
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &team,
+            "w1",
+            "CreateWorkspace",
+            "create-workspace",
+            json!({ "name": "Team" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let ws = bed.events_of("w1", "WorkspaceCreatedV1").await[0].data["workspace"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let at_ws = format!("/workspaces/{ws}");
+        assert_eq!(get_as(&bed.app, &at_ws, &team, "/commands").await.0, StatusCode::OK);
+        let res = bed
+            .app
+            .clone()
+            .oneshot(
+                Request::get("/events/stream")
+                    .header("X-Api-Key", &team)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut stream = res.into_body().into_data_stream();
+        // Any credential may revoke itself, whatever it was approved for, and nothing else is named.
+        let (s, b) = send_as(&bed.app, "", &team, "r1", "RevokeAgent", "revoke-agent", json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let told = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(frame) = stream.next().await {
+                let frame = String::from_utf8_lossy(&frame.unwrap()).to_string();
+                if frame.contains("AgentRevokedV1") {
+                    return frame.contains("\"correlationid\":\"r1\"");
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(
+            told,
+            Ok(true),
+            "the stream it held open read the outcome of its own revoke"
+        );
+        let revoked = &bed.events_of("r1", "AgentRevokedV1").await[0].data;
+        assert!(revoked["revoked_at"].is_string() && revoked["holder"].is_string());
+        for prefix in ["", at_ws.as_str()] {
+            let (s, b) = get_as(&bed.app, prefix, &team, "/commands").await;
+            assert_eq!(s, StatusCode::UNAUTHORIZED, "{prefix}: {b}");
+        }
+        let (s, _) = send_as(&bed.app, "", &team, "r2", "RevokeAgent", "revoke-agent", json!({})).await;
+        assert_eq!(
+            s,
+            StatusCode::UNAUTHORIZED,
+            "a credential taken back sends nothing more"
+        );
+        assert_eq!(
+            get_as(&bed.app, "", &bed.key, "/commands").await.0,
+            StatusCode::OK,
+            "the owner's is its own"
+        );
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &bed.key,
+            "r3",
+            "RevokeAgent",
+            "revoke-agent",
+            json!({ "holder": "x" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "it names no one else: {b}");
     }
 
     #[tokio::test]
