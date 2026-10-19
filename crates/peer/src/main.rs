@@ -651,12 +651,18 @@ fn as_the_authority(path: &str, mut form: Vec<(&str, String)>) -> (u16, serde_js
     let token = owned::read(&dir, "admin-token")
         .map(|t| t.trim().to_string())
         .unwrap_or_else(|e| {
+            if e.kind() == std::io::ErrorKind::PermissionDenied && e.get_ref().is_some() {
+                fail(&e.to_string())
+            }
             fail(&format!(
                 "no admin token in {}: is the peer running on this machine with the same BEST_PEER_DATA? ({e})",
                 dir.display()
             ))
         });
     let record = tls::Record::read(&dir).unwrap_or_else(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied && e.get_ref().is_some() {
+            fail(&e.to_string())
+        }
         fail(&format!(
             "no record of a running peer in {}: is the peer running on this machine with the same BEST_PEER_DATA? ({e})",
             dir.display()
