@@ -267,6 +267,16 @@ filesystem, which they keep the models on. Capabilities, privileges and the box 
 workspace's cloud, a job runs on the member as the cloud's credential: boxed when the member's owner approved the
 cloud with a share and did not open its jobs.
 
+`BEST_PEER_MODEL_STORE` names a store of models beside the registry: Ollama's library (`blobs/` and `manifests/`,
+what `OLLAMA_MODELS` holds after an `ollama pull`). A deploy on Ollama of a model the store holds is served from it,
+the store mounted read-only at `/models`, and pulls nothing; a model the store lacks is pulled from the registry as
+before. The peer looks for the model's manifest in the store itself before it starts the engine, so the store is a
+directory at the same path for the peer and the container engine, which it is when they share a host; one the peer
+cannot read refuses the start. vLLM is not served from a store: it pulls as before. A store is for containers: with
+`BEST_PEER_RUNTIME=native` or `fake` the peer refuses to start. An embedding model cannot be deployed from it, since
+a deployment answers conversations. A tenant told that a model failed reads of "the operator's model store", never
+its path.
+
 ## Deploy
 
 Everything an agent needs is in the catalogues. `get-hardware-state` says what devices are here and what each offers;

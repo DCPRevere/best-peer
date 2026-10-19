@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use best_peer_door::auth::{holder_of_hash, Credential};
 use best_peer_door::{BestError, Emitter, Envelope, EventLog};
-use best_peer_engine::{Engine, EngineError, Kind, Message, Options};
+use best_peer_engine::{Engine, EngineError, Kind, Message, Options, Source};
 use best_peer_gpu::{Compute, DeviceId, Gpu, Host};
-use best_peer_runtime::{Confinement, ContainerId, Event as RuntimeEvent, Runtime, RuntimeError, Spec};
+use best_peer_runtime::{Confinement, ContainerId, Event as RuntimeEvent, Mount, Runtime, RuntimeError, Spec};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Semaphore};
@@ -24,12 +24,14 @@ use crate::domain::Service;
 use crate::holdings::Holdings;
 use crate::state::{JobPhase, Owner, Phase, Reservation, State};
 
-/// The operator's overrides for the engines' images (a pinned tag, a mirror); none means the engine's default. And
-/// when a deploy or a job pulls its image.
+/// The operator's say over the engines: their images (a pinned tag, a mirror; none means the engine's default), a
+/// store of models (`BEST_PEER_MODEL_STORE`) beside the registry: a model found in it is served from it, seen
+/// read-only, and nothing is pulled; one not found is pulled as before. And when a deploy or a job pulls its image.
 #[derive(Clone, Debug, Default)]
 pub struct Images {
     pub ollama: Option<String>,
     pub vllm: Option<String>,
+    pub model_store: Option<String>,
     pub pull: Pull,
 }
 
@@ -395,6 +397,15 @@ impl Peer {
             .map_err(|e| BestError::internal(format!("the accelerator library failed: {e}")))
     }
 
+    /// Where `model` comes from for `kind`: the operator's store when the engine reads one and the model is in it,
+    /// the engine's registry otherwise.
+    fn source(&self, kind: Kind, model: &str) -> Source {
+        match (&self.images.model_store, kind) {
+            (Some(store), Kind::Ollama) if in_store(std::path::Path::new(store), model) => Source::Store,
+            _ => Source::Registry,
+        }
+    }
+
     /// The base URL the peer itself reaches an engine at.
     fn engine_base(&self, port: u16) -> String {
         format!("http://{}:{port}", self.engine_host)
@@ -462,7 +473,7 @@ impl Peer {
             Ok(Err(e)) => self.tell(
                 &em,
                 "PromptFailed",
-                json!({ "deployment": d.id, "reason": e.to_string(), "fix": fix_for_engine(&e) }),
+                json!({ "deployment": d.id, "reason": e.to_string(), "fix": fix_for_engine(&e, Source::Registry) }),
             ),
             Err(_) => self.tell(
                 &em,
@@ -551,9 +562,19 @@ impl Peer {
             );
             return;
         };
-        let recipe = data
+        let mut recipe = data
             .engine
             .recipe(&data.model, &compute, self.images.for_engine(data.engine));
+        let source = self.source(data.engine, &data.model);
+        let mut mounts = Vec::new();
+        if let (Source::Store, Some(store), Some(at)) = (source, &self.images.model_store, &recipe.store) {
+            recipe.env.extend(at.env.iter().cloned());
+            mounts.push(Mount {
+                host: store.clone(),
+                container: at.path.clone(),
+                read_only: true,
+            });
+        }
         let image = recipe.image.clone();
         let held = match self.ensure(&em, &image).await {
             Ok(held) => held,
@@ -581,6 +602,7 @@ impl Peer {
                 vec![device.clone()]
             },
             ports: vec![recipe.port],
+            mounts,
             confinement: self.confine.engine.clone(),
         };
         let started = match self.runtime.start(spec).await {
@@ -645,7 +667,8 @@ impl Peer {
             self.engine.ready(data.engine, &base, self.patience.ready).await?;
             let loaded = tokio::time::timeout(
                 self.patience.load,
-                self.engine.load(data.engine, &base, &data.model, loading.clone()),
+                self.engine
+                    .load(data.engine, &base, &data.model, source, loading.clone()),
             )
             .await
             .unwrap_or_else(|_| {
@@ -676,7 +699,7 @@ impl Peer {
                     &id,
                     &data.model,
                     &e.to_string(),
-                    fix_for_engine(&e),
+                    &fix_for_engine(&e, source),
                     Stage::AfterStart,
                 )
                 .await
@@ -935,6 +958,7 @@ impl Peer {
             env: vec![],
             devices,
             ports: vec![],
+            mounts: vec![],
             confinement: match reservation.boxed {
                 true => self.confine.job.clone(),
                 false => self.confine.open_job.clone(),
@@ -1566,12 +1590,45 @@ fn fix_for_runtime(e: &RuntimeError) -> &'static str {
     }
 }
 
-fn fix_for_engine(e: &EngineError) -> &'static str {
-    match e {
-        EngineError::NotReady { .. } => "the engine did not come up in time: read its container's logs on the host",
-        EngineError::ModelNotFound(_) => "the engine's library has no model by that name: check the name",
-        EngineError::Engine(_) => "read the engine's logs on the host",
+/// What to do about an engine's refusal; a peer serving from a store says where the model was looked for.
+fn fix_for_engine(e: &EngineError, source: Source) -> String {
+    match (e, source) {
+        (EngineError::NotReady { .. }, _) => {
+            "the engine did not come up in time: read its container's logs on the host".into()
+        }
+        (EngineError::ModelNotFound(_), Source::Registry) => {
+            "the engine's library has no model by that name: check the name".into()
+        }
+        (EngineError::ModelNotFound(_), Source::Store) => {
+            "the model is in the operator's model store only in part: ask whoever runs the peer to put it there again"
+                .into()
+        }
+        (EngineError::Engine(_), _) => "read the engine's logs on the host".into(),
     }
+}
+
+/// Whether Ollama's library at `store` holds `model`: its manifest, where `ollama pull` writes one. A name with no
+/// registry is Ollama's own, one with no namespace is in `library`, one with no tag is `latest`.
+pub(crate) fn in_store(store: &std::path::Path, model: &str) -> bool {
+    let after_slash = model.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let (name, tag) = match model[after_slash..].rfind(':') {
+        Some(i) => (&model[..after_slash + i], &model[after_slash + i + 1..]),
+        None => (model, "latest"),
+    };
+    let parts: Vec<&str> = name.split('/').collect();
+    let path: Vec<&str> = match parts.as_slice() {
+        [name] => vec!["registry.ollama.ai", "library", name],
+        [namespace, name] => vec!["registry.ollama.ai", namespace, name],
+        _ => parts,
+    };
+    if tag.is_empty() || path.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+        return false;
+    }
+    let mut manifest = store.join("manifests");
+    for p in path.iter().chain([&tag]) {
+        manifest.push(p);
+    }
+    manifest.is_file()
 }
 
 pub(crate) fn parse<T: serde::de::DeserializeOwned>(data: &Value) -> Result<T, BestError> {
