@@ -271,6 +271,11 @@ Every command of this peer follows one pattern, and nothing else is needed to dr
    the end, and follows from there with `GET /events/stream` and `Last-Event-ID`. There is no other channel for
    progress or outcome, and nothing to poll.
 
+Every string and list a command carries has a bound its schema document states (`maxLength`, `maxItems`), refused
+past it with `SCHEMA_VALIDATION` naming the field. A request body weighs 256 KiB at most on the door and 4 KiB less
+on a workspace's, refused with `PAYLOAD_TOO_LARGE` and `limit_bytes`: a cloud passes a command on to a member's door
+in an envelope of its own, so whatever the cloud took, the member takes.
+
 ## Sign in
 
 An agent signs a person in the way every BEST service is signed in to: it reads the manifest, posts to
