@@ -247,7 +247,8 @@ on another host sits on a network you trust. The peer alone reaches them: a prom
 the peer carries it to the engine. Prompts are answered sixteen at a time per peer; the rest wait their turn,
 accepted, in order. How many deployments and jobs a key runs at once is set when it is approved
 (`--deployments`, `--jobs`); a peer started with the old `BEST_PEER_DEPLOYMENTS_PER_HOLDER` or
-`BEST_PEER_JOBS_PER_HOLDER` refuses to start and says so.
+`BEST_PEER_JOBS_PER_HOLDER` refuses to start and says so. `BEST_PEER_COMMANDS_PER_MINUTE` (default 60) is how many new commands one
+credential with a share may send in any sixty seconds across the door; a number below 1 is refused at start.
 
 A container runs confined: no capabilities, no new privileges, a ceiling on tasks (every thread counts as one), and
 a small init as its first process, which reaps what the image leaves behind and passes a stop on to it. The job of a
@@ -332,6 +333,16 @@ Every command of this peer follows one pattern, and nothing else is needed to dr
 4. A consumer that was not listening catches up with `GET /events?correlationId=...`, following `nextCursor` to
    the end, and follows from there with `GET /events/stream` and `Last-Event-ID`. There is no other channel for
    progress or outcome, and nothing to poll.
+
+A credential approved with a share (`--memory`), the tenant's kind, sends 60 new commands in any sixty seconds at
+most, counted across the door and every workspace on it (`BEST_PEER_COMMANDS_PER_MINUTE`): the one past that is
+refused with `TOO_MANY_COMMANDS`, 429 and `Retry-After`, and was not accepted. A credential without a share, the
+owner's own, is not paced, so an evaluation or a batch of prompts runs as fast as the peer answers. A retry of an
+accepted command is answered as it was and is not counted, nor is a command refused before it is whole or by its
+admission (no room, no such workload). On a member, a cloud is one credential: when the member's owner approved it
+with a share, every tenant of the cloud shares the member's pace, and a member that refuses the cloud's command is
+told on the cloud's stream as the command's failure, with the member's reason, so a member's owner who hosts a busy
+cloud raises the pace or approves the cloud without a share.
 
 Every string and list a command carries has a bound its schema document states (`maxLength`, `maxItems`), refused
 past it with `SCHEMA_VALIDATION` naming the field. A request body weighs 256 KiB at most on the door and 4 KiB less

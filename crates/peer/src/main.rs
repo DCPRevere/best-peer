@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use best_peer_door::{Auth, Door, EventLog, LocalApprover};
+use best_peer_door::{Auth, Door, EventLog, Limits, LocalApprover, Pace};
 use best_peer_engine::Engine;
 use best_peer_gpu::Gpu;
 use best_peer_runtime::{Confinement, Runtime};
@@ -207,12 +207,13 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
     )
     .with_tenants(&ctx.manifest_template())
     .with_partition(workspace::Workspaces::root_partition(peer.log.clone()))
+    .with_limits(ctx.limits.clone())
 }
 
 /// What the workspaces of this door are built with: the root's endpoint and credentials, the data directory, the
 /// transport their clouds reach members through (HTTP with the trust `BEST_PEER_TRUST` adds, the PEM files of
-/// members' own certificates, and cleartext only where the peer's own rule allows it), and the holdings every
-/// surface counts a share against.
+/// members' own certificates, and cleartext only where the peer's own rule allows it), the holdings every surface
+/// counts a share against, and the pace every surface counts commands against (`BEST_PEER_COMMANDS_PER_MINUTE`).
 fn context(
     endpoint: &str,
     dir: &std::path::Path,
@@ -220,6 +221,8 @@ fn context(
     holdings: Arc<holdings::Holdings>,
     cleartext: Cleartext,
 ) -> workspace::Context {
+    let per_minute = commands_per_minute(std::env::var("BEST_PEER_COMMANDS_PER_MINUTE").ok().as_deref())
+        .unwrap_or_else(|why| fail(&why));
     let trust: Vec<PathBuf> = std::env::var("BEST_PEER_TRUST")
         .ok()
         .map(|t| {
@@ -238,6 +241,7 @@ fn context(
         transport: Arc::new(transport::Http::new(&trust, cleartext).unwrap_or_else(|why| fail(&why))),
         holdings,
         cleartext,
+        limits: Arc::new(Limits::new(Pace::per_minute(per_minute))),
     }
 }
 
@@ -251,6 +255,20 @@ pub fn pull_rule(text: Option<&str>) -> Result<Pull, String> {
         Some(t) => Err(format!(
             "BEST_PEER_PULL is {t}: set it to missing, to pull an image only when Docker does not hold it, or leave it unset to pull a tag each time"
         )),
+    }
+}
+
+/// How many commands a credential may send a minute, from `BEST_PEER_COMMANDS_PER_MINUTE`: the door's default
+/// unless the operator says more or less; nothing is not a pace.
+pub fn commands_per_minute(text: Option<&str>) -> Result<u32, String> {
+    match text.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok(best_peer_door::pace::COMMANDS_PER_MINUTE),
+        Some(t) => match t.parse::<u32>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!(
+                "BEST_PEER_COMMANDS_PER_MINUTE is {t}: say how many commands a credential may send a minute, 1 or more"
+            )),
+        },
     }
 }
 
@@ -920,6 +938,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: Arc::new(Switchboard::default()),
                 holdings,
+                limits: Arc::new(Limits::default()),
                 cleartext: Cleartext::Loopback,
             }),
             log,
@@ -1189,11 +1208,17 @@ mod tests {
 
     /// The members as `endpoint => bed`, the bed's own key being what its owner's approval would give the cloud.
     async fn site(members: Vec<(&str, Bed)>) -> Site {
+        site_pacing(members, Pace::default()).await
+    }
+
+    /// The same, the door taking commands at `pace`.
+    async fn site_pacing(members: Vec<(&str, Bed)>, pace: Pace) -> Site {
         site_over(
             members,
             Arc::new(tempfile::tempdir().unwrap()),
             Arc::new(EventLog::ephemeral()),
             None,
+            Arc::new(Limits::new(pace)),
         )
         .await
     }
@@ -1203,17 +1228,19 @@ mod tests {
         data: Arc<tempfile::TempDir>,
         log: Arc<EventLog>,
         auth: Option<Arc<Auth>>,
+        limits: Arc<Limits>,
     ) -> Site {
-        site_under(members, data, log, auth, Cleartext::Loopback).await
+        site_under(members, data, log, auth, Cleartext::Loopback, limits).await
     }
 
-    /// The same, under the cleartext rule given.
+    /// The same, under the cleartext rule given, the door holding credentials to `limits`.
     async fn site_under(
         members: Vec<(&str, Bed)>,
         data: Arc<tempfile::TempDir>,
         log: Arc<EventLog>,
         auth: Option<Arc<Auth>>,
         cleartext: Cleartext,
+        limits: Arc<Limits>,
     ) -> Site {
         let switchboard = Arc::new(Switchboard::default());
         let mut down = std::collections::HashMap::new();
@@ -1252,6 +1279,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: switchboard.clone(),
                 holdings,
+                limits,
                 cleartext,
             }),
             log.clone(),
@@ -2626,7 +2654,14 @@ mod tests {
         let (key_a, key_b) = (a.key.clone(), b.key.clone());
         let data = Arc::new(tempfile::tempdir().unwrap());
         let log = Arc::new(EventLog::ephemeral());
-        let first = site_over(vec![(A, a), (B, b)], data.clone(), log.clone(), None).await;
+        let first = site_over(
+            vec![(A, a), (B, b)],
+            data.clone(),
+            log.clone(),
+            None,
+            Arc::new(Limits::default()),
+        )
+        .await;
         let ws = first.workspace("c1", "Research").await;
         first
             .cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
@@ -2662,7 +2697,7 @@ mod tests {
         // The door starts again over the same data directory, root log and credentials (on a host, all on disk):
         // the workspace, its members and invitations, its cloud with the members' credentials and the deployment it
         // placed are all back.
-        let again = site_over(Vec::new(), data.clone(), log, Some(auth)).await;
+        let again = site_over(Vec::new(), data.clone(), log, Some(auth), Arc::new(Limits::default())).await;
         for (endpoint, bed) in [(A, &members[0]), (B, &members[1])] {
             again.switchboard.connect(endpoint, bed.app.clone());
         }
@@ -3003,7 +3038,15 @@ mod tests {
         let key_a = a.key.clone();
         let data = Arc::new(tempfile::tempdir().unwrap());
         let log = Arc::new(EventLog::ephemeral());
-        let first = site_under(vec![(OFF, a)], data.clone(), log.clone(), None, Cleartext::Vpn).await;
+        let first = site_under(
+            vec![(OFF, a)],
+            data.clone(),
+            log.clone(),
+            None,
+            Cleartext::Vpn,
+            Arc::new(Limits::default()),
+        )
+        .await;
         let ws = first.workspace("c1", "Research").await;
         first.cloud(&ws, "k1", "lab", &[("a", OFF, &key_a)]).await;
         let auth = first.auth.clone();
@@ -3011,7 +3054,7 @@ mod tests {
         drop(first.app);
         drop(first.workspaces);
 
-        let again = site_over(Vec::new(), data.clone(), log, Some(auth)).await;
+        let again = site_over(Vec::new(), data.clone(), log, Some(auth), Arc::new(Limits::default())).await;
         let found = again.workspaces.cleartext_members();
         assert_eq!(found, vec![(ws.clone(), "lab".into(), "a".into(), OFF.into())]);
         let why = cleartext_members_refused(&found).unwrap();
@@ -3114,6 +3157,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: Arc::new(Switchboard::default()),
                 holdings,
+                limits: Arc::new(Limits::default()),
                 cleartext: Cleartext::Loopback,
             }),
             log,
@@ -4251,6 +4295,74 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "it names no one else: {b}");
+    }
+
+    #[tokio::test]
+    async fn a_credential_with_a_share_is_paced_across_the_root_and_every_workspace_together() {
+        let site = site_pacing(Vec::new(), Pace::per_minute(2)).await;
+        let bob = key_with(&site.app, None, Some(GB)).await;
+        let send = |prefix: String, id: &'static str, r#type: &'static str, schema: &'static str, data: Value| {
+            let (app, bob) = (site.app.clone(), bob.clone());
+            async move { send_as(&app, &prefix, &bob, id, r#type, schema, data).await }
+        };
+        let (s, b) = send(
+            "".into(),
+            "w1",
+            "CreateWorkspace",
+            "create-workspace",
+            json!({ "name": "Bob's" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let ws = events_as(&site.app, "", &bob, "w1", "WorkspaceCreatedV1").await[0]["data"]["workspace"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let at_ws = format!("/workspaces/{ws}");
+        // A command its admission refuses gives back what it took.
+        let (s, b) = send(
+            at_ws.clone(),
+            "c0",
+            "ArchiveCloud",
+            "archive-cloud",
+            json!({ "cloud": "lab" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        let (s, b) = send(
+            "".into(),
+            "w2",
+            "CreateWorkspace",
+            "create-workspace",
+            json!({ "name": "Bob's other" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = send(at_ws, "c1", "ArchiveCloud", "archive-cloud", json!({ "cloud": "lab" })).await;
+        assert_eq!(
+            s,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the workspace counts what the root took: {b}"
+        );
+        assert_eq!(b["error"]["code"], "TOO_MANY_COMMANDS");
+        // The owner's key, approved with nothing said, is not paced.
+        for id in ["o1", "o2", "o3"] {
+            let (s, b) = send_as(
+                &site.app,
+                "",
+                &site.key,
+                id,
+                "CreateWorkspace",
+                "create-workspace",
+                json!({ "name": id }),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+        }
+        assert_eq!(commands_per_minute(None).unwrap(), 60);
+        assert_eq!(commands_per_minute(Some(" 120 ")).unwrap(), 120);
+        assert!(commands_per_minute(Some("0")).unwrap_err().contains("1 or more"));
+        assert!(commands_per_minute(Some("fast")).unwrap_err().contains("fast"));
     }
 
     #[tokio::test]

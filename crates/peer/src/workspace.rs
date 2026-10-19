@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
 use best_peer_door::auth::Credential;
-use best_peer_door::{Auth, BestError, Door, Emitter, Envelope, EventLog, Partition, Stored};
+use best_peer_door::{Auth, BestError, Door, Emitter, Envelope, EventLog, Limits, Partition, Stored};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -55,6 +55,8 @@ pub struct Context {
     pub holdings: Arc<Holdings>,
     /// Where a cloud may reach a member in cleartext: on loopback alone, unless the operator said a VPN carries it.
     pub cleartext: Cleartext,
+    /// What a credential with a share may do at once, counted across the root and every workspace.
+    pub limits: Arc<Limits>,
 }
 
 impl Context {
@@ -655,7 +657,8 @@ impl Workspace {
                 log,
                 ctx.auth.clone(),
             )
-            .with_partition(Workspaces::workspace_partition()),
+            .with_partition(Workspaces::workspace_partition())
+            .with_limits(ctx.limits.clone()),
         );
         let router = best_peer_door::tenant_router(door.clone());
         let _ = me.door.set(door);
