@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -42,6 +43,10 @@ const MAX_PENDING: usize = 64;
 pub const MAX_EXPIRES: Duration = Duration::from_secs(366 * 24 * 3600);
 /// Registrations one client may have pending at once.
 const MAX_PENDING_PER_CLIENT: usize = 5;
+/// Registrations one address may have pending at once, whatever clients it names: a client names itself, an address
+/// is what it has. A quarter of the door's, so no one address fills it. Loopback is not counted: what comes from it
+/// is this machine's own, or a proxy in front of the door that every caller shares.
+const MAX_PENDING_PER_ADDRESS: usize = 16;
 const MAX_CLIENT_ID: usize = 100;
 const MAX_AGENT_LABEL: usize = 200;
 /// Letters and digits a person can read back without ambiguity.
@@ -189,6 +194,8 @@ pub struct Pending {
     pub connection: Option<String>,
     pub agent_label: Option<String>,
     pub lifetime: Lifetime,
+    /// Where it is counted: what `counted_as` made of the address it came from.
+    from: Option<IpAddr>,
     created: Instant,
     last_poll: Option<Instant>,
     approved: bool,
@@ -202,6 +209,10 @@ pub struct Pending {
 impl Pending {
     fn expired(&self) -> bool {
         self.created.elapsed() >= DEVICE_CODE_TTL
+    }
+
+    fn expires_in(&self) -> Duration {
+        DEVICE_CODE_TTL.saturating_sub(self.created.elapsed())
     }
 }
 
@@ -383,6 +394,18 @@ pub struct Auth {
     pending: Mutex<HashMap<String, Pending>>,
     /// The scopes this door has, named by the service: what an approval may grant.
     scopes: Vec<String>,
+}
+
+/// Where a registration from `from` is counted: an IPv4 address alone, an IPv6 address by its /64 (one client holds
+/// a whole /64), every registration whose address the transport did not name in one place together, and loopback,
+/// this machine or a proxy on it, nowhere.
+fn counted_as(from: Option<IpAddr>) -> Option<IpAddr> {
+    match from.map(|a| a.to_canonical()) {
+        None => Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+        Some(a) if a.is_loopback() => None,
+        Some(IpAddr::V6(a)) => Some(IpAddr::V6(Ipv6Addr::from(u128::from(a) & !(u128::MAX >> 64)))),
+        Some(a) => Some(a),
+    }
 }
 
 impl Auth {
@@ -572,6 +595,13 @@ impl Auth {
 
     /// RFC 8628 §3.1–3.2 with BEST's parameters: a `connection` of another shape is refused with the shape.
     pub fn start_device(&self, req: DeviceRequest) -> Result<DeviceAnswer, OAuthError> {
+        self.start_device_from(req, None)
+    }
+
+    /// The same, from the address the transport named: one address has its own ceiling on registrations pending at
+    /// once, whatever clients it names (SPEC.md security: rate-limited per client). Loopback is not counted.
+    pub fn start_device_from(&self, req: DeviceRequest, from: Option<IpAddr>) -> Result<DeviceAnswer, OAuthError> {
+        let from = counted_as(from);
         let client_id = match req.client_id.as_deref().map(str::trim) {
             Some(c) if !c.is_empty() && c.len() <= MAX_CLIENT_ID => c.to_string(),
             Some(_) => {
@@ -608,18 +638,34 @@ impl Auth {
         };
         self.expire_pending();
         let mut pending = self.pending.lock().unwrap();
-        let live = pending.values().filter(|p| !p.expired()).count();
-        let mine = pending
-            .values()
-            .filter(|p| !p.expired() && p.client_id == client_id)
-            .count();
-        if live >= MAX_PENDING || mine >= MAX_PENDING_PER_CLIENT {
+        let waiting: Vec<&Pending> = pending.values().filter(|p| !p.expired() && !p.approved).collect();
+        let mine: Vec<&Pending> = waiting.iter().copied().filter(|p| p.client_id == client_id).collect();
+        let here: Vec<&Pending> = match from {
+            Some(a) => waiting.iter().copied().filter(|p| p.from == Some(a)).collect(),
+            None => Vec::new(),
+        };
+        let full = [
+            (waiting.len() >= MAX_PENDING, &waiting),
+            (mine.len() >= MAX_PENDING_PER_CLIENT, &mine),
+            (here.len() >= MAX_PENDING_PER_ADDRESS, &here),
+        ];
+        if full.iter().any(|(hit, _)| *hit) {
+            let wait = full
+                .iter()
+                .filter(|(hit, _)| *hit)
+                .filter_map(|(_, group)| group.iter().map(|p| p.expires_in()).min())
+                .max()
+                .unwrap_or(DEVICE_CODE_TTL)
+                .as_secs()
+                + 1;
             return Err(OAuthError {
                 status: 503,
                 error: "temporarily_unavailable",
                 description: format!(
-                    "too many registrations are waiting for approval ({mine} from {client_id}); finish or let one expire ({} s) before asking again",
-                    DEVICE_CODE_TTL.as_secs()
+                    "too many registrations are waiting for approval: {} from client {client_id} (at most {MAX_PENDING_PER_CLIENT}), {} from your address (at most {MAX_PENDING_PER_ADDRESS}), {} in all (at most {MAX_PENDING}); have one of yours approved, or ask again in {wait} s, when the oldest expires",
+                    mine.len(),
+                    here.len(),
+                    waiting.len()
                 ),
             });
         }
@@ -634,6 +680,7 @@ impl Auth {
                 connection: req.connection,
                 agent_label: req.agent_label,
                 lifetime,
+                from,
                 grant: Grant::default(),
                 expires: None,
                 created: Instant::now(),
@@ -1480,6 +1527,97 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_device_endpoint_has_a_ceiling_per_address_that_loopback_and_approved_ones_do_not_count_against() {
+        let auth = auth();
+        let from = |client: &str, ip: &str| {
+            auth.start_device_from(
+                DeviceRequest {
+                    client_id: Some(client.into()),
+                    ..Default::default()
+                },
+                Some(ip.parse().unwrap()),
+            )
+        };
+        // Clients naming themselves anew each time, from one address: the ceiling is the address's.
+        let mut first = None;
+        for i in 0..MAX_PENDING_PER_ADDRESS {
+            let a = from(&format!("client-{i}"), "203.0.113.9").unwrap();
+            first.get_or_insert(a);
+        }
+        let err = from("client-new", "203.0.113.9").unwrap_err();
+        assert_eq!((err.status, err.error), (503, "temporarily_unavailable"));
+        assert!(
+            err.description.contains("16 from your address") && err.description.contains("ask again in"),
+            "{}",
+            err.description
+        );
+        let wait: u64 = err
+            .description
+            .split("ask again in ")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        assert!(wait > 0 && wait <= DEVICE_CODE_TTL.as_secs() + 1, "{wait}");
+        assert!(
+            from("client-new", "::ffff:203.0.113.9").is_err(),
+            "an IPv4 address mapped into IPv6 is the same address"
+        );
+        // Another address is another count, and loopback is not counted: a proxy or this machine is everyone's.
+        from("client-new", "203.0.113.10").unwrap();
+        for i in 0..MAX_PENDING_PER_ADDRESS + 2 {
+            from(&format!("local-{i}"), "127.0.0.1").unwrap();
+        }
+        // One approved is no longer waiting: the address has room again.
+        let first = first.unwrap();
+        auth.approve(&first.user_code, "ok", Grant::default(), None)
+            .await
+            .unwrap();
+        from("client-after", "203.0.113.9").unwrap();
+    }
+
+    #[test]
+    fn an_ipv6_client_is_counted_by_its_64_and_an_address_not_named_is_counted_too() {
+        let auth = auth();
+        let from = |client: &str, ip: &str| {
+            auth.start_device_from(
+                DeviceRequest {
+                    client_id: Some(client.into()),
+                    ..Default::default()
+                },
+                Some(ip.parse().unwrap()),
+            )
+        };
+        // An IPv6 client is counted by its /64, which it holds whole.
+        for i in 0..MAX_PENDING_PER_ADDRESS {
+            from(&format!("v6-{i}"), &format!("2001:db8:1:2::{:x}", i + 1)).unwrap();
+        }
+        assert!(from("v6-new", "2001:db8:1:2:ffff::1").is_err(), "the same /64");
+        from("v6-new", "2001:db8:1:3::1").unwrap();
+        // Registrations whose address the transport did not name are counted together, not let through.
+        for i in 0..MAX_PENDING_PER_ADDRESS {
+            auth.start_device_from(
+                DeviceRequest {
+                    client_id: Some(format!("nameless-{i}")),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        }
+        let nameless = auth
+            .start_device_from(
+                DeviceRequest {
+                    client_id: Some("nameless-new".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(nameless.error, "temporarily_unavailable");
     }
 
     #[tokio::test]
