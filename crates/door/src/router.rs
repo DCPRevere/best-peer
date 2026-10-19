@@ -302,6 +302,8 @@ struct ApproveForm {
     open_jobs: Option<bool>,
     /// Seconds until the credential ends, whatever lifetime the agent asked for; absent for the agent's choice.
     expires_in: Option<u64>,
+    /// Whether the credential is held to the accelerators; absent for no.
+    accelerators_only: Option<bool>,
 }
 
 async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
@@ -317,6 +319,7 @@ async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) ->
         deployments: f.deployments,
         jobs: f.jobs,
         open_jobs: f.open_jobs.unwrap_or(false),
+        accelerators_only: f.accelerators_only.unwrap_or(false),
     };
     let admitted = door
         .auth

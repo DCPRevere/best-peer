@@ -145,6 +145,10 @@ pub struct Grant {
     /// host's memory, as the owner's own jobs have. The approver's word alone; a credential cannot ask for it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub open_jobs: bool,
+    /// Whether the credential sees and uses the accelerators alone, never a device that offers the host's CPU. The
+    /// approver's word alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub accelerators_only: bool,
 }
 
 impl Grant {

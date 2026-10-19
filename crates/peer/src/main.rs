@@ -715,10 +715,11 @@ fn revoke(args: &[String]) {
 /// person was shown. The token goes to the listen address only, never to the public endpoint, and over TLS to the
 /// certificate the peer serves and no other, when it serves one.
 fn approve(args: &[String]) {
-    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt | all] [--memory 40G] [--deployments N] [--jobs N] [--open-jobs] [--expires 8h]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said); how many deployments and jobs it may run at once across the door (no count when not said); with a share, whether its jobs leave the closed box (no network, a ceiling on host memory) a tenant's job gets; how long the credential lasts, 366d at most, and 8h at most for a session credential (the agent's choice when not said)";
+    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt | all] [--memory 40G] [--deployments N] [--jobs N] [--open-jobs] [--expires 8h] [--accelerators-only]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said); how many deployments and jobs it may run at once across the door (no count when not said); with a share, whether its jobs leave the closed box (no network, a ceiling on host memory) a tenant's job gets; how long the credential lasts, 366d at most, and 8h at most for a session credential (the agent's choice when not said); whether it sees and uses the accelerators alone, never the host's CPU";
     let Some(code) = args.first() else { fail(USAGE) };
     let (mut may, mut memory, mut open_jobs) = (None::<String>, None::<u64>, false);
     let mut expires = None::<Duration>;
+    let mut accelerators_only = false;
     let (mut deployments, mut jobs) = (None::<u32>, None::<u32>);
     let count = |flag: &str, text: Option<&String>| -> u32 {
         match text.map(|t| t.trim().parse::<u32>()) {
@@ -751,6 +752,7 @@ fn approve(args: &[String]) {
             "--open-jobs" => open_jobs = true,
             "--deployments" => deployments = Some(count("--deployments", rest.next())),
             "--jobs" => jobs = Some(count("--jobs", rest.next())),
+            "--accelerators-only" => accelerators_only = true,
             other => fail(&format!("unknown argument {other:?}. {USAGE}")),
         }
     }
@@ -775,6 +777,9 @@ fn approve(args: &[String]) {
     }
     if let Some(d) = expires {
         form.push(("expires_in", d.as_secs().to_string()));
+    }
+    if accelerators_only {
+        form.push(("accelerators_only", "true".into()));
     }
     let (status, answer) = as_the_authority("/auth/approve", form);
     if status != 200 {
@@ -808,10 +813,16 @@ fn approve(args: &[String]) {
             share.push_str(&format!(", {n} {kind} at once at most"));
         }
     }
+    if a["grant"]["accelerators_only"].as_bool() == Some(true) {
+        share.push_str(", on the accelerators alone");
+    }
     let lasts = match a["expires_in"].as_u64() {
         Some(s) => format!("ending in {s} s"),
         None => "never ending".into(),
     };
+    if a["grant"]["accelerators_only"].as_bool() == Some(true) {
+        share.push_str(", on the accelerators alone");
+    }
     println!(
         "admitted {who} as connection {} with a {} credential that may {may}, {share}, {lasts}: the agent's next poll gets it",
         a["connection"].as_str().unwrap_or("(the host's name)"),
@@ -1024,12 +1035,17 @@ mod tests {
 
     /// A credential approved with `may` and `memory`, as `best-peer approve --may --memory` would.
     async fn key_with(app: &axum::Router, may: Option<&str>, memory: Option<u64>) -> String {
-        key_full(app, may, memory, None, None, false).await
+        key_full(app, may, memory, None, None, false, false).await
+    }
+
+    /// The same, held to the accelerators when `accelerators_only`, as `approve --accelerators-only` would.
+    async fn key_held(app: &axum::Router, may: Option<&str>, memory: Option<u64>, accelerators_only: bool) -> String {
+        key_full(app, may, memory, None, None, false, accelerators_only).await
     }
 
     /// The same, its jobs opened by the approver when `open_jobs`, as `best-peer approve --open-jobs` would.
     async fn key_opened(app: &axum::Router, may: Option<&str>, memory: Option<u64>, open_jobs: bool) -> String {
-        key_full(app, may, memory, None, None, open_jobs).await
+        key_full(app, may, memory, None, None, open_jobs, false).await
     }
 
     /// The same, allowed so many deployments and jobs at once when given, as `approve --deployments --jobs` would.
@@ -1040,10 +1056,11 @@ mod tests {
         deployments: Option<u32>,
         jobs: Option<u32>,
     ) -> String {
-        key_full(app, may, memory, deployments, jobs, false).await
+        key_full(app, may, memory, deployments, jobs, false, false).await
     }
 
-    /// A credential approved with all of `best-peer approve`'s words: `may`, `memory`, the counts and `open_jobs`.
+    /// A credential approved with all of `best-peer approve`'s words: `may`, `memory`, the counts, `open_jobs` and
+    /// `accelerators_only`.
     async fn key_full(
         app: &axum::Router,
         may: Option<&str>,
@@ -1051,6 +1068,7 @@ mod tests {
         deployments: Option<u32>,
         jobs: Option<u32>,
         open_jobs: bool,
+        accelerators_only: bool,
     ) -> String {
         let form = |f: &[(&str, &str)]| {
             Request::post("/auth/device")
@@ -1076,6 +1094,9 @@ mod tests {
         }
         if let Some(n) = &jobs {
             fields.push(("jobs", n));
+        }
+        if accelerators_only {
+            fields.push(("accelerators_only", "true"));
         }
         let approve = Request::post("/auth/approve")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -3648,6 +3669,191 @@ mod tests {
         assert_eq!(parse_memory("1073741824").unwrap(), 1 << 30);
         assert!(parse_memory("lots").unwrap_err().contains("40G"));
         assert!(parse_memory("4X").unwrap_err().contains("unit"));
+    }
+
+    /// The ids of the devices `key` is shown under `prefix`.
+    async fn devices_shown(app: &axum::Router, prefix: &str, key: &str) -> Vec<String> {
+        let (_, v) = get_as(app, prefix, key, "/queries/get-hardware-state").await;
+        v["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_credential_held_to_the_accelerators_sees_and_uses_them_alone() {
+        let gpu = Arc::new(
+            best_peer_gpu::Fake::new()
+                .with_driver("fake 1.0")
+                .with_device(best_peer_gpu::Fake::cuda_card("gpu-0", "Card A", 24, "12.4"))
+                .with_device(best_peer_gpu::Fake::host_cpu("cpu-0", 64)),
+        );
+        let bed = bed(
+            gpu,
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let held = key_held(&bed.app, Some("deploy,jobs"), Some(8 * GB), true).await;
+        let shared = key_with(&bed.app, Some("deploy,jobs"), Some(8 * GB)).await;
+        assert_eq!(devices_shown(&bed.app, "", &bed.key).await, vec!["cpu-0", "gpu-0"]);
+        assert_eq!(devices_shown(&bed.app, "", &held).await, vec!["gpu-0"]);
+        for (id, r#type, schema, data) in [
+            (
+                "t0",
+                "DeployModel",
+                "deploy-model",
+                json!({ "model": "a:7b", "engine": "ollama", "memory_bytes": GB, "device": "cpu-0" }),
+            ),
+            (
+                "t1",
+                "RunJob",
+                "run-job",
+                json!({ "image": "busybox", "memory_bytes": GB, "device": "cpu-0" }),
+            ),
+        ] {
+            let (s, b) = send_as(&bed.app, "", &held, id, r#type, schema, data).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+            assert_eq!(b["error"]["code"], "ACCELERATORS_ONLY");
+            assert_eq!(b["error"]["details"]["devices"], json!(["gpu-0"]));
+            let message = b["error"]["message"].as_str().unwrap();
+            assert!(message.starts_with("device cpu-0 offers the CPU alone"), "{message}");
+            assert!(message.contains("name one of gpu-0, or leave device out"), "{message}");
+        }
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &held,
+            "t2",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "memory_bytes": GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        // A share alone does not hide the CPU: that is the approver's separate word.
+        assert_eq!(devices_shown(&bed.app, "", &shared).await, vec!["cpu-0", "gpu-0"]);
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &shared,
+            "s0",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "a:7b", "engine": "ollama", "memory_bytes": GB, "device": "cpu-0" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+    }
+
+    #[tokio::test]
+    async fn a_credential_held_to_the_accelerators_on_a_door_with_none_is_told_why_it_runs_nothing() {
+        let bed = bed(
+            Arc::new(best_peer_gpu::Fake::new().with_device(best_peer_gpu::Fake::host_cpu("cpu-0", 64))),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec![], vec![])),
+        )
+        .await;
+        let held = key_held(&bed.app, Some("deploy"), Some(8 * GB), true).await;
+        assert!(devices_shown(&bed.app, "", &held).await.is_empty());
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &held,
+            "t0",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "a:7b", "engine": "ollama", "memory_bytes": GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "ACCELERATORS_ONLY");
+        assert_eq!(b["error"]["details"]["devices"], json!([]));
+        let message = b["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("no device here is an accelerator"), "{message}");
+        assert!(message.contains("not held to the accelerators"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_credential_held_to_the_accelerators_uses_a_cloud_s_alone() {
+        let (a, _) = two_members().await;
+        let host = bed(
+            Arc::new(best_peer_gpu::Fake::new().with_device(best_peer_gpu::Fake::host_cpu("cpu-0", 64))),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec![], vec![])),
+        )
+        .await;
+        const C: &str = "https://c.test";
+        let (key_a, key_c) = (a.key.clone(), host.key.clone());
+        let site = site(vec![(A, a), (C, host)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("c", C, &key_c)])
+            .await;
+        let bob = key_held(&site.app, Some("deploy,jobs"), Some(4 * GB), true).await;
+        let (_, w) = get_as(&site.app, "", &bob, "/queries/get-workspaces").await;
+        let bob_id = w["identity"].as_str().unwrap().to_string();
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &site.key,
+            "i0",
+            "InviteMember",
+            "invite-member",
+            json!({ "workspace": ws, "identity": bob_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &site.key, "i0", "MemberInvitedV1").await;
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &bob,
+            "a0",
+            "AcceptInvitation",
+            "accept-invitation",
+            json!({ "workspace": ws }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &bob, "a0", "MemberJoinedV1").await;
+        let prefix = format!("/workspaces/{ws}");
+        assert_eq!(devices_shown(&site.app, &prefix, &bob).await, vec!["lab/a/gpu-0"]);
+        assert_eq!(devices_shown(&site.app, &prefix, &site.key).await.len(), 2);
+        for (id, r#type, schema, data) in [
+            (
+                "bd0",
+                "DeployModel",
+                "deploy-model",
+                json!({ "model": "m", "engine": "ollama", "memory_bytes": GB, "device": "lab/c/cpu-0" }),
+            ),
+            (
+                "bj0",
+                "RunJob",
+                "run-job",
+                json!({ "image": "busybox", "memory_bytes": GB, "device": "lab/c/cpu-0" }),
+            ),
+        ] {
+            let (s, e) = send_as(&site.app, &prefix, &bob, id, r#type, schema, data).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+            assert_eq!(e["error"]["code"], "ACCELERATORS_ONLY");
+            assert!(e["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("name one of lab/a/gpu-0"));
+        }
+        let (s, b) = send_as(
+            &site.app,
+            &prefix,
+            &bob,
+            "bd1",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "m", "engine": "ollama", "memory_bytes": GB, "cloud": "lab" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
     }
 
     /// What the log said while `f` ran, as plain lines.

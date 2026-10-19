@@ -103,6 +103,7 @@ ends without anyone remembering to take it back. To take a key back sooner, at y
 
 with the name it was approved under: every request carrying it is refused from then on, and an event stream it holds
 open ends within seconds. The agent can also give its key back itself, with the `revoke-agent` command.
+`--accelerators-only` holds a key to the accelerators, never the host's CPU.
 
 A code waits ten minutes for you; the door holds at most five waiting from one client, sixteen from one address and 64 in all, and past that
 answers 503 with how long until the oldest expires. An IPv6 address is counted by its /64, which one client holds
@@ -420,6 +421,12 @@ workload claims in `memory_bytes` is its client's own word, so the share bounds 
 many, while neither bounds what a workload uses on a card that cannot be partitioned. A key approved without them is
 not counted. On a member the cloud's own credential is one holder, so a member's owner who approved the cloud with a
 count counts every tenant of the cloud together, and a deploy the cloud accepted can then be refused by the member,
-told on the workspace's stream as `DeploymentFailed` with the member's reason. Another sign-in is another holder, as the spec has it: what a key that expired or was
+told on the workspace's stream as `DeploymentFailed` with the member's reason. A key approved with `--accelerators-only`
+sees and uses the accelerators alone, so the host's CPU and memory stay the operator's: `get-hardware-state` shows it
+only those, and a device that offers the CPU alone, or a host with no accelerator, is refused with
+`ACCELERATORS_ONLY` and what it may name instead. A share does not imply it: a key approved with `--memory` alone may
+still be placed on the CPU device, within its share. In a workspace the rule holds for the cloud's devices, and a
+member's owner who approved the cloud with `--accelerators-only` holds every tenant of the cloud to that member's
+accelerators. Another sign-in is another holder, as the spec has it: what a key that expired or was
 replaced left running is the owner's to end with a key approved for all. The spec has no per-command scope field
 yet, so the requirement is in the description text; that is an entry on the spec follow-ups.
