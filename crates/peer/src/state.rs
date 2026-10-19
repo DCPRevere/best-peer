@@ -95,6 +95,8 @@ pub struct Order {
     pub deadline_seconds: Option<u64>,
     /// Whether its credential runs on the accelerators alone.
     pub accelerators_only: bool,
+    /// The isolation it asked for: it is placed only on a device that offers at least that.
+    pub isolation: Option<best_peer_runtime::Isolation>,
     /// 1, then 2 once a lost member's order was queued again.
     pub attempt: u32,
     /// When it was queued, this attempt, as `JobQueued` told it.
@@ -317,6 +319,7 @@ impl State {
                         queue_seconds: data["queue_seconds"].as_u64(),
                         deadline_seconds: data["deadline_seconds"].as_u64(),
                         accelerators_only: data["accelerators_only"].as_bool().unwrap_or(false),
+                        isolation: serde_json::from_value(data["isolation"].clone()).ok(),
                         attempt,
                         queued_at,
                         arrival,
@@ -447,7 +450,11 @@ mod tests {
         s.apply(&ev(
             "JobQueued",
             "c1",
-            queued("job-1", 1, json!({ "queue_seconds": 60 })),
+            queued(
+                "job-1",
+                1,
+                json!({ "queue_seconds": 60, "isolation": "user-namespace" }),
+            ),
         ));
         s.apply(&ev("JobQueued", "c2", queued("job-2", 1, json!({}))));
         assert_eq!(
@@ -457,6 +464,12 @@ mod tests {
         );
         assert_eq!(s.orders["job-1"].args, ["a"]);
         assert_eq!(s.orders["job-1"].queue_seconds, Some(60));
+        assert_eq!(
+            s.orders["job-1"].isolation,
+            Some(best_peer_runtime::Isolation::UserNamespace),
+            "the ask is folded, so it holds after a restart"
+        );
+        assert_eq!(s.orders["job-2"].isolation, None);
         s.apply(&ev(
             "JobPlaced",
             "c1",
