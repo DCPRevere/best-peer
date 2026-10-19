@@ -500,7 +500,12 @@ async fn peer_app(
             "this door hosts workspaces: their clouds follow their members"
         );
     }
-    best_peer_door::router(door).merge(workspaces.router())
+    logged(best_peer_door::router(door).merge(workspaces.router()))
+}
+
+/// Every request to the door, the workspaces' included, is one line in the log, as it arrived.
+fn logged(app: axum::Router) -> axum::Router {
+    app.layer(axum::middleware::from_fn(best_peer_door::router::access_log))
 }
 
 /// Serves `app` on `listener`, over TLS when a configuration is given, until `handle` says to stop.
@@ -3553,6 +3558,157 @@ mod tests {
         assert_eq!(parse_memory("1073741824").unwrap(), 1 << 30);
         assert!(parse_memory("lots").unwrap_err().contains("40G"));
         assert!(parse_memory("4X").unwrap_err().contains("unit"));
+    }
+
+    /// What the log said while `f` ran, as plain lines.
+    async fn logged_lines<F: std::future::Future<Output = ()>>(f: F) -> Vec<String> {
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        f.await;
+        let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        text.lines()
+            .filter(|l| l.contains(" request "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_request_the_client_gave_up_on_is_still_a_line() {
+        let bed = fresh().await;
+        let holder = bed.door.auth.authenticate(&bed.key).unwrap().holder();
+        let app = logged(bed.app.clone());
+        let lines = logged_lines(async {
+            let never_ends = Request::post("/commands")
+                .header("X-Api-Key", &bed.key)
+                .header(header::CONTENT_TYPE, "application/cloudevents+json")
+                .body(Body::from_stream(futures::stream::pending::<
+                    Result<Vec<u8>, std::io::Error>,
+                >()))
+                .unwrap();
+            let gave_up = tokio::time::timeout(Duration::from_millis(50), app.clone().oneshot(never_ends)).await;
+            assert!(gave_up.is_err(), "the body never came, so no answer did");
+        })
+        .await;
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        for p in [
+            "request abandoned",
+            "method=POST",
+            "path=/commands",
+            "status=-",
+            &format!("holder={holder}"),
+        ] {
+            assert!(lines[0].contains(p), "{p} in {}", lines[0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_request_is_one_line_with_where_it_came_from_and_whose_it_was_never_the_key() {
+        let bed = fresh().await;
+        let team = key_with(&bed.app, Some("deploy"), None).await;
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &bed.key,
+            "w1",
+            "CreateWorkspace",
+            "create-workspace",
+            json!({ "name": "Team" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let ws = bed.events_of("w1", "WorkspaceCreatedV1").await[0].data["workspace"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let owner = bed.door.auth.authenticate(&bed.key).unwrap().holder();
+        let holder = bed.door.auth.authenticate(&team).unwrap().holder();
+        let app = logged(bed.app.clone()).layer(axum::extract::connect_info::MockConnectInfo(
+            "203.0.113.9:40000".parse::<SocketAddr>().unwrap(),
+        ));
+        let (keys, ws_path) = ([bed.key.clone(), team.clone()], format!("/workspaces/{ws}/commands"));
+        let lines = logged_lines(async {
+            assert_eq!(get_as(&app, "", &team, "/commands").await.0, StatusCode::OK);
+            assert_eq!(
+                get_as(&app, &format!("/workspaces/{ws}"), &bed.key, "/commands")
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+            assert_eq!(
+                get_as(&app, &format!("/workspaces/{ws}"), &team, "/commands").await.0,
+                StatusCode::NOT_FOUND
+            );
+            let big = Request::post("/commands")
+                .header("X-Api-Key", &team)
+                .header(header::CONTENT_TYPE, "application/cloudevents+json")
+                .body(Body::from(vec![b' '; 2 << 20]))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(big).await.unwrap().status(),
+                StatusCode::PAYLOAD_TOO_LARGE
+            );
+            assert_eq!(
+                get_as(&app, "", "nope", "/commands?x=1").await.0,
+                StatusCode::UNAUTHORIZED
+            );
+        })
+        .await;
+        assert_eq!(lines.len(), 5, "{lines:#?}");
+        let has = |i: usize, parts: &[&str]| {
+            for p in parts {
+                assert!(lines[i].contains(p), "{p} in {}", lines[i]);
+            }
+        };
+        has(
+            0,
+            &[
+                "from=203.0.113.9:40000",
+                "method=GET",
+                "path=/commands",
+                "status=200",
+                &format!("holder={holder}"),
+            ],
+        );
+        has(
+            1,
+            &[&format!("path={ws_path}"), "status=200", &format!("holder={owner}")],
+        );
+        has(
+            2,
+            &[&format!("path={ws_path}"), "status=404", &format!("holder={holder}")],
+        );
+        has(
+            3,
+            &[
+                "method=POST",
+                "path=/commands",
+                "status=413",
+                &format!("holder={holder}"),
+            ],
+        );
+        has(4, &["path=/commands ", "status=401", "holder=-"]);
+        for line in &lines {
+            assert!(
+                !keys.iter().any(|k| line.contains(k.as_str())) && !line.contains("x=1"),
+                "{line}"
+            );
+        }
     }
 
     #[test]
