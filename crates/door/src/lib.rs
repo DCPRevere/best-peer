@@ -23,6 +23,7 @@ pub mod log;
 pub mod manifest;
 pub mod pace;
 pub mod router;
+pub mod streams;
 
 pub use auth::{Approver, Auth, FakeApprover, LocalApprover};
 pub use catalogue::{AdmitHook, Catalogue, CommandDef, Emitter, EventDef, QueryDef};
@@ -31,6 +32,7 @@ pub use error::BestError;
 pub use limits::Limits;
 pub use log::{Accept, EventLog, Filter, Stored, Unfinished};
 pub use pace::Pace;
+pub use streams::Streams;
 
 /// What a credential may read of an event, beyond the door's own rule: `Some(visible)` decides, `None` leaves it to
 /// the rule (a credential that acts for every holder reads everything; another reads the events under its own

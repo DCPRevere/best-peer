@@ -691,6 +691,8 @@ const CREDENTIAL_RECHECK: Duration = Duration::from_secs(5);
 /// run out ends the stream with it, within seconds whether or not events flow: its end is looked at on every event
 /// and every few seconds between, and the credential itself whenever one was taken back since. A credential taken
 /// back still reads its own AgentRevokedV1, the outcome of the revoke-agent it sent, and the stream ends after it.
+/// A credential with a share holds so many streams open across the door; one more ends its oldest, which
+/// reconnects with its last id if it is still there.
 async fn stream_events(
     State(door): State<Shared>,
     Extension(sender): Extension<Credential>,
@@ -698,6 +700,14 @@ async fn stream_events(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, BestError> {
     let filter = filter_from(&q)?;
+    // A credential with a share holds so many streams at once; past that its oldest gives way to this one.
+    let (slot, gave_way) = match sender.grant.memory_bytes {
+        Some(_) => {
+            let (slot, ends) = door.limits.streams.take(&sender.hash);
+            (Some(slot), ends.map(|_| ()).boxed())
+        }
+        None => (None, futures::future::pending().boxed()),
+    };
     let last = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -762,7 +772,9 @@ async fn stream_events(
         .chain(live)
         .scan((), move |_, item| step(item))
         .filter_map(futures::future::ready)
-        .map(|s| {
+        .take_until(gave_way)
+        .map(move |s| {
+            let _held = &slot;
             Ok(SseEvent::default()
                 .id(s.envelope.id.clone())
                 .data(serde_json::to_string(&s.envelope).unwrap_or_default()))
@@ -887,11 +899,11 @@ mod tests {
 
     /// A door over `log` with the credentials of a previous door, when it is that door restarted.
     fn door_over_with(log: Arc<EventLog>, auth: Option<Arc<Auth>>) -> Shared {
-        door_built(log, auth, crate::Pace::default())
+        door_built(log, auth, crate::Limits::default())
     }
 
-    /// The same, taking commands at `pace`.
-    fn door_built(log: Arc<EventLog>, auth: Option<Arc<Auth>>, pace: crate::Pace) -> Shared {
+    /// The same, holding credentials with a share to `limits`.
+    fn door_built(log: Arc<EventLog>, auth: Option<Arc<Auth>>, limits: crate::Limits) -> Shared {
         let catalogue = Catalogue::new()
             .command(CommandDef {
                 schema: "pull-image".into(),
@@ -951,10 +963,7 @@ mod tests {
         let auth = auth.unwrap_or_else(|| {
             Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() })).with_scopes(&["deploy"]))
         });
-        Arc::new(
-            Door::new(EP, "io.best.agents", "A test peer.", catalogue, log, auth)
-                .with_limits(Arc::new(crate::Limits::new(pace))),
-        )
+        Arc::new(Door::new(EP, "io.best.agents", "A test peer.", catalogue, log, auth).with_limits(Arc::new(limits)))
     }
 
     async fn call(app: &Router, req: Request) -> (StatusCode, HeaderMap, Value) {
@@ -1161,7 +1170,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_credential_sends_so_many_new_commands_a_minute_and_is_told_when_to_send_again() {
-        let d = door_built(Arc::new(EventLog::ephemeral()), None, crate::Pace::per_minute(3));
+        let d = door_built(
+            Arc::new(EventLog::ephemeral()),
+            None,
+            crate::Limits::new(crate::Pace::per_minute(3), crate::Streams::default()),
+        );
         let app = router(d.clone());
         let key = sign_in_holding(&app, "test", "my-peer", None, Some("1024")).await;
         let other = sign_in_holding(&app, "other", "other-peer", None, Some("1024")).await;
@@ -1197,6 +1210,67 @@ mod tests {
             let (s, _, b) = send(&owner, command(&format!("w{i}"), json!("ollama/ollama:0.6"))).await;
             assert_eq!(s, StatusCode::CREATED, "a credential without a share is not paced: {b}");
         }
+    }
+
+    #[tokio::test]
+    async fn past_its_streams_a_credential_with_a_share_ends_its_oldest_and_a_dropped_client_gives_its_place_back() {
+        let d = door_built(
+            Arc::new(EventLog::ephemeral()),
+            None,
+            crate::Limits::new(crate::Pace::default(), crate::Streams::per_credential(2)),
+        );
+        let app = router(d.clone());
+        let key = sign_in_holding(&app, "test", "my-peer", None, Some("1024")).await;
+        let other = sign_in_holding(&app, "other", "other-peer", None, Some("1024")).await;
+        let owner = sign_in(&app, "owner", "owner-peer").await;
+        let hash = |k: &str| d.auth.authenticate(k).unwrap().hash;
+        let open = |key: String| {
+            let app = app.clone();
+            async move {
+                let res = app
+                    .oneshot(
+                        Request::get("/events/stream")
+                            .header(AUTH_HEADER, &key)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+                res.into_body().into_data_stream()
+            }
+        };
+        let mut oldest = open(key.clone()).await;
+        let second = open(key.clone()).await;
+        assert_eq!(d.limits.streams.held(&hash(&key)), 2);
+        let third = open(key.clone()).await;
+        assert_eq!(d.limits.streams.held(&hash(&key)), 2, "never more than the figure");
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(frame) = oldest.next().await {
+                frame.unwrap();
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the oldest gave way to the newest");
+        let _theirs = open(other.clone()).await;
+        assert_eq!(
+            d.limits.streams.held(&hash(&other)),
+            1,
+            "another credential's streams are its own"
+        );
+        let mut owners = Vec::new();
+        for _ in 0..3 {
+            owners.push(open(owner.clone()).await);
+        }
+        assert_eq!(
+            d.limits.streams.held(&hash(&owner)),
+            0,
+            "a credential without a share is not counted"
+        );
+        // A client that goes away gives its place back once its stream is dropped.
+        drop(second);
+        drop(third);
+        assert_eq!(d.limits.streams.held(&hash(&key)), 0);
     }
 
     #[tokio::test]

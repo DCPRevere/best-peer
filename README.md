@@ -247,8 +247,9 @@ on another host sits on a network you trust. The peer alone reaches them: a prom
 the peer carries it to the engine. Prompts are answered sixteen at a time per peer; the rest wait their turn,
 accepted, in order. How many deployments and jobs a key runs at once is set when it is approved
 (`--deployments`, `--jobs`); a peer started with the old `BEST_PEER_DEPLOYMENTS_PER_HOLDER` or
-`BEST_PEER_JOBS_PER_HOLDER` refuses to start and says so. `BEST_PEER_COMMANDS_PER_MINUTE` (default 60) is how many new commands one
-credential with a share may send in any sixty seconds across the door; a number below 1 is refused at start.
+`BEST_PEER_JOBS_PER_HOLDER` refuses to start and says so. `BEST_PEER_COMMANDS_PER_MINUTE` (default 60) is how many
+new commands one credential with a share may send in any sixty seconds across the door, and
+`BEST_PEER_STREAMS_PER_CREDENTIAL` (default 4) how many event streams it may hold open; a number below 1 is refused at start.
 
 A container runs confined: no capabilities, no new privileges, a ceiling on tasks (every thread counts as one), and
 a small init as its first process, which reaps what the image leaves behind and passes a stop on to it. The job of a
@@ -333,6 +334,14 @@ Every command of this peer follows one pattern, and nothing else is needed to dr
 4. A consumer that was not listening catches up with `GET /events?correlationId=...`, following `nextCursor` to
    the end, and follows from there with `GET /events/stream` and `Last-Event-ID`. There is no other channel for
    progress or outcome, and nothing to poll.
+
+A credential with a share holds 4 event streams open at once at most, counted across the door and every workspace
+on it (`BEST_PEER_STREAMS_PER_CREDENTIAL`); opening a fifth ends its oldest, which reads to its client as a stream
+that closed, so it reconnects with `Last-Event-ID` and misses nothing. Nothing is refused: a client whose connection
+died without a close (a dropped Wi-Fi, a laptop asleep) still holds its stream until the door's writes to it fail,
+which can take minutes, and its reconnect takes the ghost's place instead of meeting it. Reconnecting costs the
+replay since its last id. One stream without `correlationId` follows everything the credential may read. A cloud
+holds one stream on each member. A credential without a share, the owner's, is not counted.
 
 A credential approved with a share (`--memory`), the tenant's kind, sends 60 new commands in any sixty seconds at
 most, counted across the door and every workspace on it (`BEST_PEER_COMMANDS_PER_MINUTE`): the one past that is

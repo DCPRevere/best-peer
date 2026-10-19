@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use best_peer_door::{Auth, Door, EventLog, Limits, LocalApprover, Pace};
+use best_peer_door::{Auth, Door, EventLog, Limits, LocalApprover, Pace, Streams};
 use best_peer_engine::Engine;
 use best_peer_gpu::Gpu;
 use best_peer_runtime::{Confinement, Runtime};
@@ -213,7 +213,8 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
 /// What the workspaces of this door are built with: the root's endpoint and credentials, the data directory, the
 /// transport their clouds reach members through (HTTP with the trust `BEST_PEER_TRUST` adds, the PEM files of
 /// members' own certificates, and cleartext only where the peer's own rule allows it), the holdings every surface
-/// counts a share against, and the pace every surface counts commands against (`BEST_PEER_COMMANDS_PER_MINUTE`).
+/// counts a share against, and the limits every surface holds a credential with a share to
+/// (`BEST_PEER_COMMANDS_PER_MINUTE`, `BEST_PEER_STREAMS_PER_CREDENTIAL`).
 fn context(
     endpoint: &str,
     dir: &std::path::Path,
@@ -222,6 +223,8 @@ fn context(
     cleartext: Cleartext,
 ) -> workspace::Context {
     let per_minute = commands_per_minute(std::env::var("BEST_PEER_COMMANDS_PER_MINUTE").ok().as_deref())
+        .unwrap_or_else(|why| fail(&why));
+    let streams = streams_per_credential(std::env::var("BEST_PEER_STREAMS_PER_CREDENTIAL").ok().as_deref())
         .unwrap_or_else(|why| fail(&why));
     let trust: Vec<PathBuf> = std::env::var("BEST_PEER_TRUST")
         .ok()
@@ -241,7 +244,10 @@ fn context(
         transport: Arc::new(transport::Http::new(&trust, cleartext).unwrap_or_else(|why| fail(&why))),
         holdings,
         cleartext,
-        limits: Arc::new(Limits::new(Pace::per_minute(per_minute))),
+        limits: Arc::new(Limits::new(
+            Pace::per_minute(per_minute),
+            Streams::per_credential(streams),
+        )),
     }
 }
 
@@ -267,6 +273,20 @@ pub fn commands_per_minute(text: Option<&str>) -> Result<u32, String> {
             Ok(n) if n > 0 => Ok(n),
             _ => Err(format!(
                 "BEST_PEER_COMMANDS_PER_MINUTE is {t}: say how many commands a credential may send a minute, 1 or more"
+            )),
+        },
+    }
+}
+
+/// How many event streams a credential with a share may hold open at once, from `BEST_PEER_STREAMS_PER_CREDENTIAL`:
+/// the door's default unless the operator says more or less; a stream needs one at least.
+pub fn streams_per_credential(text: Option<&str>) -> Result<usize, String> {
+    match text.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok(best_peer_door::streams::STREAMS_PER_CREDENTIAL),
+        Some(t) => match t.parse::<usize>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!(
+                "BEST_PEER_STREAMS_PER_CREDENTIAL is {t}: say how many event streams a credential with a share may hold open at once, 1 or more"
             )),
         },
     }
@@ -1218,7 +1238,7 @@ mod tests {
             Arc::new(tempfile::tempdir().unwrap()),
             Arc::new(EventLog::ephemeral()),
             None,
-            Arc::new(Limits::new(pace)),
+            Arc::new(Limits::new(pace, Streams::default())),
         )
         .await
     }
@@ -4295,6 +4315,67 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "it names no one else: {b}");
+    }
+
+    #[tokio::test]
+    async fn a_credential_with_a_share_holds_its_event_streams_across_the_root_and_every_workspace_together() {
+        let site = site(Vec::new()).await;
+        let bob = key_with(&site.app, None, Some(GB)).await;
+        let (s, b) = send_as(
+            &site.app,
+            "",
+            &bob,
+            "w1",
+            "CreateWorkspace",
+            "create-workspace",
+            json!({ "name": "Bob's" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let ws = events_as(&site.app, "", &bob, "w1", "WorkspaceCreatedV1").await[0]["data"]["workspace"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let open = |prefix: String| {
+            let (app, bob) = (site.app.clone(), bob.clone());
+            async move {
+                let res = app
+                    .oneshot(
+                        Request::get(format!("{prefix}/events/stream"))
+                            .header("X-Api-Key", &bob)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+                res.into_body().into_data_stream()
+            }
+        };
+        let mut held = Vec::new();
+        for n in 0..best_peer_door::streams::STREAMS_PER_CREDENTIAL {
+            held.push(
+                open(if n % 2 == 0 {
+                    String::new()
+                } else {
+                    format!("/workspaces/{ws}")
+                })
+                .await,
+            );
+        }
+        let _newest = open(format!("/workspaces/{ws}")).await;
+        let oldest = &mut held[0];
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(frame) = oldest.next().await {
+                frame.unwrap();
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the root's oldest gave way to the workspace's newest");
+        assert_eq!(streams_per_credential(None).unwrap(), 4);
+        assert_eq!(streams_per_credential(Some(" 8 ")).unwrap(), 8);
+        assert!(streams_per_credential(Some("0")).unwrap_err().contains("1 or more"));
+        assert!(streams_per_credential(Some("many")).unwrap_err().contains("many"));
     }
 
     #[tokio::test]
