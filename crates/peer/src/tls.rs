@@ -74,7 +74,7 @@ impl Record {
     }
 
     pub fn read(dir: &Path) -> std::io::Result<Self> {
-        let text = std::fs::read_to_string(dir.join(Self::FILE))?;
+        let text = crate::owned::read(dir, Self::FILE)?;
         serde_json::from_str(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 

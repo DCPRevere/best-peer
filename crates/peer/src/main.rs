@@ -15,6 +15,7 @@ mod domain;
 mod holdings;
 mod lifecycle;
 mod member;
+mod owned;
 mod state;
 mod tls;
 mod transport;
@@ -647,7 +648,7 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
 /// its status, since a refusal says why in its body.
 fn as_the_authority(path: &str, mut form: Vec<(&str, String)>) -> (u16, serde_json::Value) {
     let dir = data_dir();
-    let token = std::fs::read_to_string(dir.join("admin-token"))
+    let token = owned::read(&dir, "admin-token")
         .map(|t| t.trim().to_string())
         .unwrap_or_else(|e| {
             fail(&format!(

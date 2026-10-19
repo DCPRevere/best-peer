@@ -436,7 +436,10 @@ best-peer approve ABCD-EFGH
 ```
 
 That presents the machine's admin token, which only its owner can read, and the agent's next poll gets its credential:
-a key shown once, kept hashed, bound to the connection name the person gave. The token is checked before anything
+a key shown once, kept hashed, bound to the connection name the person gave. Where the peer runs as a user of its own
+and `approve` or `revoke` run as root, they read the admin token and the record of the door only as plain files of
+that user's, 64 KiB at most, never through a link or from a pipe, so a peer that was taken over cannot have root read
+another file and send it as the token; run as the peer's own user, they read the folder as it is, links included. The token is checked before anything
 else, so without it an approval learns neither whether a code is pending nor which scopes the door has. An operator
 who wants an identity provider instead plugs one in behind the `Approver` trait, which says whether a proof is the
 authority's (`attest`, asked first, and for a revoke) and admits a registration (`admit`); the door never knows which
