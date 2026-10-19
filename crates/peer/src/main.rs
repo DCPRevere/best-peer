@@ -27,8 +27,8 @@ use std::time::Duration;
 use best_peer_door::{Auth, Door, EventLog, LocalApprover};
 use best_peer_engine::Engine;
 use best_peer_gpu::Gpu;
-use best_peer_runtime::Runtime;
-use lifecycle::{Images, Patience, Peer};
+use best_peer_runtime::{Confinement, Runtime};
+use lifecycle::{Confine, Images, Patience, Peer};
 use tls::Tls;
 use transport::{is_loopback, Cleartext};
 
@@ -89,6 +89,57 @@ pub fn config(
     Ok((listen, endpoint, tls))
 }
 
+/// The least host memory a container starts with: the container engine refuses less.
+const MIN_CONTAINER_MEMORY: u64 = 6 << 20;
+
+/// How the containers are confined, from `BEST_PEER_JOB_MEMORY` (default `4G`) and `BEST_PEER_JOB_PIDS` (default
+/// 4096) for a job, `BEST_PEER_ENGINE_MEMORY` (default none) and `BEST_PEER_ENGINE_PIDS` (default 4096) for an
+/// engine; `none` for a ceiling is no ceiling. These are ceilings and nothing else: a job never has a network, and
+/// capabilities, privileges and a job's filesystem are never opened by a variable.
+pub fn confine(
+    job_memory: Option<&str>,
+    job_pids: Option<&str>,
+    engine_memory: Option<&str>,
+    engine_pids: Option<&str>,
+) -> Result<Confine, String> {
+    let memory = |name: &str, text: Option<&str>, default: Option<u64>| -> Result<Option<u64>, String> {
+        match text.map(str::trim) {
+            None => Ok(default),
+            Some("none") => Ok(None),
+            Some(t) => match parse_memory(t) {
+                Ok(m) if m < MIN_CONTAINER_MEMORY => Err(format!(
+                    "{name}: {t:?} is less than the 6M a container starts with: write 4G, 512M or a number of bytes \
+                     from 6M up, or none for no ceiling"
+                )),
+                Ok(m) if m > i64::MAX as u64 => Err(format!("{name}: {t:?} is more memory than exists, or none")),
+                Ok(m) => Ok(Some(m)),
+                Err(why) => Err(format!("{name}: {why}, or none")),
+            },
+        }
+    };
+    let pids = |name: &str, text: Option<&str>, default: u64| -> Result<Option<u64>, String> {
+        match text.map(str::trim) {
+            None => Ok(Some(default)),
+            Some("none") => Ok(None),
+            Some(t) => match t.parse::<u64>() {
+                Ok(n) if n > 0 => Ok(Some(n)),
+                _ => Err(format!(
+                    "{name} must be a number of tasks above zero (every thread counts as one), or none, not {t:?}"
+                )),
+            },
+        }
+    };
+    let mut job = Confinement::default();
+    job.memory_bytes = memory("BEST_PEER_JOB_MEMORY", job_memory, job.memory_bytes)?;
+    job.pids = pids("BEST_PEER_JOB_PIDS", job_pids, 4096)?;
+    let mut engine = Confinement::serving();
+    engine.memory_bytes = memory("BEST_PEER_ENGINE_MEMORY", engine_memory, None)?;
+    engine.pids = pids("BEST_PEER_ENGINE_PIDS", engine_pids, 4096)?;
+    let mut open_job = Confinement::serving();
+    open_job.pids = job.pids;
+    Ok(Confine { job, open_job, engine })
+}
+
 /// The peer's data directory: `BEST_PEER_DATA`, else `.best-peer` in the home directory. Never a relative path:
 /// the server and the operator's shell must resolve the same directory, or `best-peer approve` finds no token.
 fn data_dir() -> PathBuf {
@@ -117,6 +168,7 @@ pub async fn peer(
     images: Images,
     patience: Patience,
     holdings: Arc<holdings::Holdings>,
+    confine: Confine,
 ) -> Arc<Peer> {
     // Subscribed before the rebuild, so an exit told while the state is being rebuilt is not lost.
     let events = runtime.events();
@@ -131,6 +183,7 @@ pub async fn peer(
             log,
             images,
             patience,
+            confine,
         )
         .with_holdings(holdings),
     );
@@ -394,6 +447,13 @@ async fn peer_app(
         }
     }
     let holdings = Arc::new(holdings::Holdings::default());
+    let confine = confine(
+        std::env::var("BEST_PEER_JOB_MEMORY").ok().as_deref(),
+        std::env::var("BEST_PEER_JOB_PIDS").ok().as_deref(),
+        std::env::var("BEST_PEER_ENGINE_MEMORY").ok().as_deref(),
+        std::env::var("BEST_PEER_ENGINE_PIDS").ok().as_deref(),
+    )
+    .unwrap_or_else(|why| fail(&why));
     let peer = peer(
         endpoint,
         &engine_host,
@@ -404,6 +464,7 @@ async fn peer_app(
         images,
         patience,
         holdings.clone(),
+        confine,
     )
     .await;
     let ctx = Arc::new(context(endpoint, dir, auth.clone(), holdings, cleartext));
@@ -473,9 +534,9 @@ fn parse_memory(text: &str) -> Result<u64, String> {
 /// person was shown. The token goes to the listen address only, never to the public endpoint, and over TLS to the
 /// certificate the peer serves and no other, when it serves one.
 fn approve(args: &[String]) {
-    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt | all] [--memory 40G] [--deployments N] [--jobs N]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said); how many deployments and jobs it may run at once across the door (no count when not said)";
+    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt | all] [--memory 40G] [--deployments N] [--jobs N] [--open-jobs]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said); how many deployments and jobs it may run at once across the door (no count when not said); with a share, whether its jobs leave the closed box (no network, a ceiling on host memory) a tenant's job gets";
     let Some(code) = args.first() else { fail(USAGE) };
-    let (mut may, mut memory) = (None::<String>, None::<u64>);
+    let (mut may, mut memory, mut open_jobs) = (None::<String>, None::<u64>, false);
     let (mut deployments, mut jobs) = (None::<u32>, None::<u32>);
     let count = |flag: &str, text: Option<&String>| -> u32 {
         match text.map(|t| t.trim().parse::<u32>()) {
@@ -499,6 +560,7 @@ fn approve(args: &[String]) {
                     .unwrap_or_else(|| fail("--memory needs an amount, such as 40G, 512M or a number of bytes"));
                 memory = Some(parse_memory(amount).unwrap_or_else(|why| fail(&why)));
             }
+            "--open-jobs" => open_jobs = true,
             "--deployments" => deployments = Some(count("--deployments", rest.next())),
             "--jobs" => jobs = Some(count("--jobs", rest.next())),
             other => fail(&format!("unknown argument {other:?}. {USAGE}")),
@@ -527,6 +589,12 @@ fn approve(args: &[String]) {
     }
     if let Some(b) = memory {
         form.push(("memory_bytes", b.to_string()));
+    }
+    if open_jobs {
+        if memory.is_none() {
+            fail("--open-jobs opens the jobs of a credential with a share, and this one has none: a credential without --memory runs its jobs open already");
+        }
+        form.push(("open_jobs", "true".into()));
     }
     if let Some(n) = deployments {
         form.push(("deployments", n.to_string()));
@@ -570,9 +638,13 @@ fn approve(args: &[String]) {
         Some(s) => s.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","),
         None => "all".into(),
     };
-    let mut share = match a["grant"]["memory_bytes"].as_u64() {
-        Some(b) => format!("{b} bytes of device memory at most"),
-        None => "no share set".into(),
+    let mut share = match (
+        a["grant"]["memory_bytes"].as_u64(),
+        a["grant"]["open_jobs"].as_bool() == Some(true),
+    ) {
+        (Some(b), false) => format!("{b} bytes of device memory at most, its jobs in the closed box"),
+        (Some(b), true) => format!("{b} bytes of device memory at most, its jobs open"),
+        (None, _) => "no share set".into(),
     };
     for kind in ["deployments", "jobs"] {
         if let Some(n) = a["grant"][kind].as_u64() {
@@ -597,7 +669,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{header, Request, StatusCode};
     use best_peer_door::{Envelope, FakeApprover, Filter};
-    use best_peer_runtime::ContainerId;
+    use best_peer_runtime::{ContainerId, Network};
     use futures::StreamExt;
     use http_body_util::BodyExt;
 
@@ -723,6 +795,7 @@ mod tests {
                 prompt: Duration::from_secs(1),
             },
             holdings.clone(),
+            Confine::default(),
         )
         .await;
         let auth = auth.unwrap_or_else(|| {
@@ -776,7 +849,12 @@ mod tests {
 
     /// A credential approved with `may` and `memory`, as `best-peer approve --may --memory` would.
     async fn key_with(app: &axum::Router, may: Option<&str>, memory: Option<u64>) -> String {
-        key_counted(app, may, memory, None, None).await
+        key_full(app, may, memory, None, None, false).await
+    }
+
+    /// The same, its jobs opened by the approver when `open_jobs`, as `best-peer approve --open-jobs` would.
+    async fn key_opened(app: &axum::Router, may: Option<&str>, memory: Option<u64>, open_jobs: bool) -> String {
+        key_full(app, may, memory, None, None, open_jobs).await
     }
 
     /// The same, allowed so many deployments and jobs at once when given, as `approve --deployments --jobs` would.
@@ -786,6 +864,18 @@ mod tests {
         memory: Option<u64>,
         deployments: Option<u32>,
         jobs: Option<u32>,
+    ) -> String {
+        key_full(app, may, memory, deployments, jobs, false).await
+    }
+
+    /// A credential approved with all of `best-peer approve`'s words: `may`, `memory`, the counts and `open_jobs`.
+    async fn key_full(
+        app: &axum::Router,
+        may: Option<&str>,
+        memory: Option<u64>,
+        deployments: Option<u32>,
+        jobs: Option<u32>,
+        open_jobs: bool,
     ) -> String {
         let form = |f: &[(&str, &str)]| {
             Request::post("/auth/device")
@@ -801,6 +891,9 @@ mod tests {
         }
         if let Some(m) = &memory {
             fields.push(("memory_bytes", m));
+        }
+        if open_jobs {
+            fields.push(("open_jobs", "true"));
         }
         let (deployments, jobs) = (deployments.map(|n| n.to_string()), jobs.map(|n| n.to_string()));
         if let Some(n) = &deployments {
@@ -1035,6 +1128,7 @@ mod tests {
             Images::default(),
             Patience::default(),
             holdings.clone(),
+            Confine::default(),
         )
         .await;
         let auth = auth.unwrap_or_else(|| {
@@ -2889,6 +2983,7 @@ mod tests {
             Images::default(),
             Patience::default(),
             holdings.clone(),
+            Confine::default(),
         )
         .await;
         let auth = Arc::new(Auth::ephemeral(
@@ -3036,6 +3131,13 @@ mod tests {
         assert_eq!(spec.image.0, "ollama/ollama");
         assert_eq!(spec.devices, vec!["gpu-0".into()]);
         assert_eq!(spec.ports, vec![11434]);
+        assert_eq!(
+            spec.confinement,
+            Confinement::serving(),
+            "an engine keeps its network and a writable root, with no capabilities and no new privileges"
+        );
+        assert_eq!(spec.confinement.network, Network::Default);
+        assert!(spec.confinement.drop_capabilities && !spec.confinement.read_only_root);
         assert_eq!(
             bed.engine.loaded_at("http://engines.local:41434"),
             vec!["llama3.2:3b"],
@@ -3326,6 +3428,50 @@ mod tests {
         assert_eq!(parse_memory("1073741824").unwrap(), 1 << 30);
         assert!(parse_memory("lots").unwrap_err().contains("40G"));
         assert!(parse_memory("4X").unwrap_err().contains("unit"));
+    }
+
+    #[test]
+    fn the_confinement_is_closed_and_the_operator_sets_only_its_ceilings() {
+        let c = confine(None, None, None, None).unwrap();
+        assert_eq!(c.job, Confinement::default());
+        assert_eq!(c.engine, Confinement::serving());
+        assert_eq!(c.job.network, Network::None);
+        assert_eq!(c.job.memory_bytes, Some(4 << 30));
+        assert_eq!(c.job.pids, Some(4096), "a training job's threads fit under the default");
+        assert_eq!(c.engine.memory_bytes, None);
+        assert_eq!(c.engine.pids, Some(4096));
+        let c = confine(Some("8G"), Some("none"), Some("16G"), Some("100")).unwrap();
+        assert_eq!(c.job.memory_bytes, Some(8 << 30));
+        assert_eq!(c.job.pids, None);
+        assert_eq!(c.engine.memory_bytes, Some(16 << 30));
+        assert_eq!(c.engine.pids, Some(100));
+        assert!(
+            c.job.drop_capabilities
+                && c.job.no_new_privileges
+                && c.job.read_only_root
+                && c.job.network == Network::None,
+            "what is not a ceiling stays closed"
+        );
+        let c = confine(Some("none"), None, None, None).unwrap();
+        assert_eq!(c.job.memory_bytes, None, "none is the one way to no ceiling");
+        assert_eq!(
+            confine(Some("6M"), None, None, None).unwrap().job.memory_bytes,
+            Some(6 << 20)
+        );
+        for (why, args) in [
+            ("BEST_PEER_JOB_MEMORY", (Some("lots"), None, None, None)),
+            ("BEST_PEER_JOB_MEMORY", (Some("0"), None, None, None)),
+            ("BEST_PEER_JOB_MEMORY", (Some("5M"), None, None, None)),
+            ("BEST_PEER_JOB_MEMORY", (Some("9000000T"), None, None, None)),
+            ("BEST_PEER_JOB_PIDS", (None, Some("0"), None, None)),
+            ("BEST_PEER_ENGINE_MEMORY", (None, None, Some("4X"), None)),
+            ("BEST_PEER_ENGINE_MEMORY", (None, None, Some("0"), None)),
+            ("BEST_PEER_ENGINE_PIDS", (None, None, None, Some("many"))),
+        ] {
+            let err = confine(args.0, args.1, args.2, args.3).unwrap_err();
+            assert!(err.contains(why), "{err}");
+            assert!(err.contains("none"), "the refusal names the way to no ceiling: {err}");
+        }
     }
 
     /// The strings and arrays in `schema` with no bound on their length, by path.
@@ -4170,8 +4316,77 @@ mod tests {
         let job = started["job"].as_str().unwrap().to_string();
         assert!(job.starts_with("job-"));
         let container = ContainerId(started["container"].as_str().unwrap().into());
-        assert_eq!(bed.runtime.spec_of(&container).unwrap().args, vec!["echo", "hi"]);
+        let spec = bed.runtime.spec_of(&container).unwrap();
+        assert_eq!(spec.args, vec!["echo", "hi"]);
+        // The owner's job, from a credential with no share, keeps the network, a writable filesystem and the host's
+        // memory, as on 0.0.11, under the capability, privilege and task rules every container gets.
+        assert_eq!(spec.confinement.network, Network::Default);
+        assert!(
+            spec.confinement.drop_capabilities
+                && spec.confinement.no_new_privileges
+                && !spec.confinement.read_only_root
+                && spec.confinement.pids.is_some()
+                && spec.confinement.memory_bytes.is_none()
+        );
+        assert_eq!(started["boxed"], false);
         assert_eq!(bed.query("get-workloads").await["jobs"][0]["phase"], "running");
+        // A tenant's job, from a credential with a share, runs in the closed box, whatever the operator set.
+        let tenant = key_with(&bed.app, Some("jobs"), Some(8 * GB)).await;
+        let opened = key_opened(&bed.app, Some("jobs"), Some(8 * GB), true).await;
+        let started_by = |key: String, id: &'static str| {
+            let bed = &bed;
+            async move {
+                let (s, b) = send_as(
+                    &bed.app,
+                    "",
+                    &key,
+                    id,
+                    "RunJob",
+                    "run-job",
+                    json!({ "image": "busybox", "memory_bytes": GB }),
+                )
+                .await;
+                assert_eq!(s, StatusCode::CREATED, "{b}");
+                bed.events_of(id, "JobStarted").await.last().unwrap().data.clone()
+            }
+        };
+        let boxed = started_by(tenant.clone(), "b3").await;
+        assert_eq!(boxed["boxed"], true);
+        assert_eq!(boxed["host_memory_bytes"], 4u64 << 30);
+        let spec = bed
+            .runtime
+            .spec_of(&ContainerId(boxed["container"].as_str().unwrap().into()))
+            .unwrap();
+        assert_eq!(spec.confinement, Confinement::default());
+        assert_eq!(spec.confinement.network, Network::None);
+        assert!(spec.confinement.read_only_root && spec.confinement.memory_bytes.is_some());
+        // One approved with --open-jobs runs open: the approver's word, never the credential's.
+        let open = started_by(opened, "b4").await;
+        assert_eq!(open["boxed"], false);
+        let spec = bed
+            .runtime
+            .spec_of(&ContainerId(open["container"].as_str().unwrap().into()))
+            .unwrap();
+        assert_eq!(spec.confinement.network, Network::Default);
+        assert!(!spec.confinement.read_only_root && spec.confinement.memory_bytes.is_none());
+        // The boxed job's host memory runs out: the fix is the host's ceiling, not the device memory it asked for.
+        bed.runtime
+            .out_of_memory(&ContainerId(boxed["container"].as_str().unwrap().into()))
+            .unwrap();
+        let events = bed.events_of("b3", "JobFailed").await;
+        let failed = &events.last().unwrap().data;
+        assert_eq!(failed["host_memory_bytes"], 4u64 << 30);
+        assert!(failed["reason"].as_str().unwrap().contains("host memory"), "{failed}");
+        assert!(failed["fix"].as_str().unwrap().contains("ceiling"), "{failed}");
+        assert!(!failed["fix"].as_str().unwrap().contains("memory_bytes"), "{failed}");
+        // An open job's runs out with the host's own memory, and no ceiling is named.
+        bed.runtime
+            .out_of_memory(&ContainerId(open["container"].as_str().unwrap().into()))
+            .unwrap();
+        let events = bed.events_of("b4", "JobFailed").await;
+        let failed = &events.last().unwrap().data;
+        assert!(failed["host_memory_bytes"].is_null(), "{failed}");
+        assert!(!failed["fix"].as_str().unwrap().contains("ceiling"), "{failed}");
         // The engine ends it: the exit is told, and the memory is free.
         bed.runtime.stop(&container).await.unwrap();
         let events = bed.events_of("j1", "JobFinished").await;

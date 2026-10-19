@@ -121,6 +121,10 @@ pub struct Grant {
     /// The most jobs the credential may run at once across the door; absent means no count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jobs: Option<u32>,
+    /// Whether the jobs of a credential with a share leave the closed box a tenant's job gets: the network and the
+    /// host's memory, as the owner's own jobs have. The approver's word alone; a credential cannot ask for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub open_jobs: bool,
 }
 
 impl Grant {

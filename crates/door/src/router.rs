@@ -228,6 +228,8 @@ struct ApproveForm {
     deployments: Option<u32>,
     /// The most jobs the credential may run at once; absent for no count.
     jobs: Option<u32>,
+    /// Whether a credential with a share runs its jobs outside the closed box; absent for no.
+    open_jobs: Option<bool>,
 }
 
 async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
@@ -242,6 +244,7 @@ async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) ->
         memory_bytes: f.memory_bytes,
         deployments: f.deployments,
         jobs: f.jobs,
+        open_jobs: f.open_jobs.unwrap_or(false),
     };
     let admitted = door.auth.approve(f.user_code.trim(), f.proof.trim(), grant).await?;
     Ok(Json(json!({ "approved": true, "admitted": admitted })).into_response())
