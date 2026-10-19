@@ -98,13 +98,20 @@ impl DockerRuntime {
 }
 
 /// `name:tag` as the engine wants them apart; a reference without a tag means `latest`. A port in the registry's
-/// host is not a tag.
-fn name_and_tag(image: &ImageRef) -> (String, String) {
+/// host is not a tag. A reference pinned by digest (`name:tag@sha256:...`) is handed over whole, with no tag: the
+/// digest is the name.
+fn name_and_tag(image: &ImageRef) -> (String, Option<String>) {
     let r = &image.0;
+    if r.contains('@') {
+        return (r.clone(), None);
+    }
     let after_slash = r.rfind('/').map(|i| i + 1).unwrap_or(0);
     match r[after_slash..].rfind(':') {
-        Some(i) => (r[..after_slash + i].to_string(), r[after_slash + i + 1..].to_string()),
-        None => (r.clone(), "latest".into()),
+        Some(i) => (
+            r[..after_slash + i].to_string(),
+            Some(r[after_slash + i + 1..].to_string()),
+        ),
+        None => (r.clone(), Some("latest".into())),
     }
 }
 
@@ -121,8 +128,11 @@ fn image_error(image: &ImageRef, message: &str) -> RuntimeError {
 impl Runtime for DockerRuntime {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
         let (name, tag) = name_and_tag(image);
-        let options = CreateImageOptionsBuilder::new().from_image(&name).tag(&tag).build();
-        let mut stream = self.docker.create_image(Some(options), None, None);
+        let mut options = CreateImageOptionsBuilder::new().from_image(&name);
+        if let Some(tag) = &tag {
+            options = options.tag(tag);
+        }
+        let mut stream = self.docker.create_image(Some(options.build()), None, None);
         // Progress across every layer, not per layer: the engine reports each layer's own bytes.
         let mut layers: HashMap<String, (i64, i64)> = HashMap::new();
         let mut last: Option<u8> = None;
@@ -148,6 +158,17 @@ impl Runtime for DockerRuntime {
             }
         }
         Ok(())
+    }
+
+    async fn holds(&self, image: &ImageRef) -> Result<bool, RuntimeError> {
+        match self.docker.inspect_image(&image.0).await {
+            Ok(_) => Ok(true),
+            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(false),
+            Err(e) => Err(RuntimeError::Engine(format!(
+                "the container engine cannot say whether it holds {}: {e}",
+                image.0
+            ))),
+        }
     }
 
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {

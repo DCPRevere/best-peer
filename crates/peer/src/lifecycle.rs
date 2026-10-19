@@ -24,11 +24,22 @@ use crate::domain::Service;
 use crate::holdings::Holdings;
 use crate::state::{JobPhase, Owner, Phase, Reservation, State};
 
-/// The operator's overrides for the engines' images (a pinned tag, a mirror); none means the engine's default.
+/// The operator's overrides for the engines' images (a pinned tag, a mirror); none means the engine's default. And
+/// when a deploy or a job pulls its image.
 #[derive(Clone, Debug, Default)]
 pub struct Images {
     pub ollama: Option<String>,
     pub vllm: Option<String>,
+    pub pull: Pull,
+}
+
+/// When a deploy or a job pulls its image: `Tags`, a reference by tag each time, since a tag may have moved, and one
+/// pinned by digest only when it is not held; `Missing`, any image only when it is not held.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pull {
+    #[default]
+    Tags,
+    Missing,
 }
 
 impl Images {
@@ -472,7 +483,7 @@ impl Peer {
         let image = best_peer_runtime::ImageRef(cmd.data["image"].as_str().unwrap_or_default().to_string());
         match self.pull(&em, &image).await {
             Ok(()) => {
-                self.tell(&em, "ImagePulled", json!({ "image": image.0 }));
+                self.tell(&em, "ImagePulled", json!({ "image": image.0, "held": false }));
             }
             Err(e) => {
                 self.tell(
@@ -544,19 +555,22 @@ impl Peer {
             .engine
             .recipe(&data.model, &compute, self.images.for_engine(data.engine));
         let image = recipe.image.clone();
-        if let Err(e) = self.pull(&em, &image).await {
-            self.fail_deployment(
-                &em,
-                &id,
-                &data.model,
-                &e.to_string(),
-                fix_for_runtime(&e),
-                Stage::BeforeStart(None),
-            )
-            .await;
-            return;
-        }
-        self.tell(&em, "ImagePulled", json!({ "image": image.0 }));
+        let held = match self.ensure(&em, &image).await {
+            Ok(held) => held,
+            Err(e) => {
+                self.fail_deployment(
+                    &em,
+                    &id,
+                    &data.model,
+                    &e.to_string(),
+                    fix_for_runtime(&e),
+                    Stage::BeforeStart(None),
+                )
+                .await;
+                return;
+            }
+        };
+        self.tell(&em, "ImagePulled", json!({ "image": image.0, "held": held }));
         let spec = Spec {
             image,
             args: recipe.args,
@@ -670,7 +684,21 @@ impl Peer {
         }
     }
 
-    /// Pulls an image, telling its progress; a pull that completed is 100, whether or not the engine said so.
+    /// Makes an image present for a deploy or a job. A reference by tag is pulled each time unless the operator said
+    /// `missing`, since a tag may have moved; one pinned by digest, or any under `missing`, is not pulled when the
+    /// engine holds it, so a host with no way to a registry runs what it holds, told at 100 at once. Says whether it
+    /// was held.
+    async fn ensure(self: &Arc<Self>, em: &Emitter, image: &best_peer_runtime::ImageRef) -> Result<bool, RuntimeError> {
+        let pinned = image.0.contains('@');
+        if (pinned || self.images.pull == Pull::Missing) && self.runtime.holds(image).await? {
+            self.pulling(em, image)(Some(100));
+            return Ok(true);
+        }
+        self.pull(em, image).await.map(|()| false)
+    }
+
+    /// Pulls an image from the registry, held or not, telling its progress; a pull that completed is 100, whether or
+    /// not the engine said so. What pull-image does, so that is how a held image is refreshed.
     async fn pull(self: &Arc<Self>, em: &Emitter, image: &best_peer_runtime::ImageRef) -> Result<(), RuntimeError> {
         let progress = self.pulling(em, image);
         self.runtime.pull(image, progress.clone()).await?;
@@ -889,11 +917,14 @@ impl Peer {
                 json!({ "job": id, "image": data.image, "reason": reason, "fix": fix }),
             );
         };
-        if let Err(e) = self.pull(&em, &image).await {
-            fail(e.to_string(), fix_for_runtime(&e));
-            return;
-        }
-        self.tell(&em, "ImagePulled", json!({ "image": image.0 }));
+        let held = match self.ensure(&em, &image).await {
+            Ok(held) => held,
+            Err(e) => {
+                fail(e.to_string(), fix_for_runtime(&e));
+                return;
+            }
+        };
+        self.tell(&em, "ImagePulled", json!({ "image": image.0, "held": held }));
         let devices = match (&reservation.device, &reservation.compute) {
             (Some(d), Some(c)) if *c != Compute::Cpu => vec![d.clone()],
             _ => vec![],
