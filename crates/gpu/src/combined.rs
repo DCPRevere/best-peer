@@ -54,6 +54,7 @@ mod tests {
             temperature_c: None,
             power_w: None,
             utilisation_pct: Some(3),
+            energy_j: None,
             slicing: crate::Slicing::None,
         }
     }

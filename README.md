@@ -348,26 +348,31 @@ is in it, only counts. A workspace's door serves none: it fronts other machines.
 A key reads there what it reads elsewhere: every card's series, unless it is held to the accelerators, when it sees
 no CPU; its own deployments and jobs, unless it was approved for all. A key approved `--may metrics` is what a
 collector holds: it reads every holder's workloads, with their holder ids, and the door's own counts, and may do
-nothing else, not deploy, not prompt, not read anyone's events. The series, every one named `best_peer_…` in base
-units:
+nothing else: every command it sends is refused, and it reads no one's events, so a key that leaks from a
+collector's configuration opens nothing. The door's counts leave out what no key reads at the root, who made a
+workspace and who joined one. The series, every one named `best_peer_…` in base units:
 
 | Series | Labels | What |
 |---|---|---|
-| `best_peer_info`, `best_peer_hardware_readable` | `version`, `driver` | The peer, and whether the driver answered this scrape (0: the device series are absent) |
+| `best_peer_info` | `version`, `driver` | The peer |
+| `best_peer_hardware_readable` | | Whether the driver answered this scrape (0: the device series are absent) |
 | `best_peer_device_info` | `device`, `vendor`, `api`, `name`, `apis`, `slicing` | What each device is |
 | `best_peer_device_memory_total_bytes`, `…_free_bytes` | `device`, `vendor`, `api` | Device memory, free as the driver reports it |
 | `best_peer_device_memory_promised_bytes` | `device`, `vendor`, `api` | Memory promised to every holder's workloads there (all or metrics keys) |
 | `best_peer_device_utilisation_ratio`, `…_temperature_celsius`, `…_power_watts` | `device`, `vendor`, `api` | Where the driver reports them; a MIG instance has none of its own |
+| `best_peer_device_energy_joules_total` | `device`, `vendor`, `api` | Energy used since the driver loaded, where it says: what a stretch used is the difference, which sampled power misses |
 | `best_peer_disk_free_bytes`, `…_total_bytes` | | The room for jobs' disks, where the peer makes them |
-| `best_peer_deployment_phase`, `best_peer_job_phase` | the workload, `device`, `holder`, `phase` (and `model`, `engine`) | 1 for each workload's phase now; gone when it ends |
+| `best_peer_deployment_info`, `best_peer_job_info` | the workload, `device`, `holder` (and `model`, `engine`) | What each workload is, while it lives |
+| `best_peer_deployment_phase`, `best_peer_job_phase` | the workload, `phase` | Each workload's phases as a set, 1 for the one it is in and 0 for the others; gone when it ends |
 | `best_peer_deployment_memory_promised_bytes`, `best_peer_job_memory_promised_bytes` | the workload, `device`, `holder` | Device memory promised to it |
-| `best_peer_prompts_total`, `best_peer_prompt_tokens_total` | `deployment`, `outcome` or `kind` | A deployment's prompts answered and failed, and the tokens the engine counted, while it lives |
-| `best_peer_orders_waiting`, `best_peer_credential_held_bytes`, `…_share_bytes` | | The queue's waiting orders; what the scraping key holds, against its share |
+| `best_peer_prompts_total`, `best_peer_prompt_tokens_total` | `deployment`, `outcome` or `kind` | A deployment's prompts answered and failed, and the tokens the engine counted, while it lives; a prompt that found its deployment gone is a `PromptFailed` in `best_peer_events_total`, not here |
+| `best_peer_orders_waiting` | | The queue's waiting orders, as the scraping key reads them |
 | `best_peer_commands_accepted_total`, `best_peer_commands_refused_total` | `command` (and `code`) | Commands accepted and refused at the door since it started (all or metrics keys) |
 | `best_peer_events_total`, `best_peer_event_streams` | `event` | Facts told since the log began, by type, placements and failures among them; streams open now (all or metrics keys) |
 
-Where the peer sits, its workspace and its cloud, is not a label here, since one machine may serve the clouds of
-several workspaces: the collector adds what it knows of the target. A Prometheus job for a peer, with the key in a
+The host's CPU is a device too (`api="cpu"`): `sum(best_peer_device_memory_total_bytes{api!="cpu"})` is the
+accelerators' memory. Where the peer sits, its workspace and its cloud, is not a label here, since one machine may
+serve the clouds of several workspaces: the collector adds what it knows of the target. A Prometheus job for a peer, with the key in a
 file only the collector reads and the certificate the peer made named for it:
 
 ```yaml

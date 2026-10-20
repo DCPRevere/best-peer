@@ -162,8 +162,13 @@ async fn require_key(State(door): State<Shared>, req: Request, next: Next) -> Re
 async fn require_key_or_bearer(State(door): State<Shared>, req: Request, next: Next) -> Response {
     let key = header_value(&req, AUTH_HEADER)
         .or_else(|| {
-            header_value(&req, header::AUTHORIZATION.as_str())
-                .and_then(|v| v.strip_prefix("Bearer ").map(str::trim).map(str::to_string))
+            header_value(&req, header::AUTHORIZATION.as_str()).and_then(|v| {
+                // The scheme is case-insensitive (RFC 9110); the credential after it is not.
+                let (scheme, credential) = v.split_once(' ')?;
+                scheme
+                    .eq_ignore_ascii_case("bearer")
+                    .then(|| credential.trim().to_string())
+            })
         })
         .unwrap_or_default();
     admit(&door, key, req, next).await
@@ -199,10 +204,13 @@ async fn metrics(State(door): State<Shared>, Extension(who): Extension<Credentia
     };
     if who.grant.allows(METRICS_SCOPE) {
         let accepted = door.accepted.lock().unwrap().clone();
+        let events = door
+            .log
+            .counts_by_type(|s| door.counts(&s.envelope.r#type, &s.envelope.data));
         families.extend(door_families(
             &accepted,
             &door.refusals,
-            &door.log.counts_by_type(),
+            &events,
             door.open_streams.now(),
         ));
     }
@@ -445,7 +453,13 @@ async fn ingest(
     body: Bytes,
 ) -> Result<Response, BestError> {
     let answer = take_command(&door, sender, headers, &body).await;
-    if let Err(refusal) = &answer {
+    // A refusal is an error, or the pace's 429, which carries its Retry-After and so is answered as it is.
+    let code = match &answer {
+        Err(refusal) => Some(refusal.code),
+        Ok(res) if res.status() == StatusCode::TOO_MANY_REQUESTS => Some("TOO_MANY_COMMANDS"),
+        Ok(_) => None,
+    };
+    if let Some(code) = code {
         // The type as the catalogue knows it, so what a sender writes cannot grow the series without bound.
         let named = serde_json::from_slice::<Value>(&body)
             .ok()
@@ -453,7 +467,9 @@ async fn ingest(
         let command = named
             .filter(|t| door.catalogue.command_by_type(t).is_some())
             .unwrap_or_else(|| "unknown".into());
-        door.refusals.count(&command, refusal.code);
+        if door.counts(&command, &Value::Null) {
+            door.refusals.count(&command, code);
+        }
     }
     answer
 }
@@ -464,6 +480,13 @@ async fn take_command(
     headers: HeaderMap,
     body: &Bytes,
 ) -> Result<Response, BestError> {
+    // A collector's key reads and sends nothing: should it leak from where it is kept, it can do nothing with it.
+    if crate::metrics::reads_only(&sender.grant) {
+        return Err(BestError::bad_request(
+            "FORBIDDEN",
+            "this credential was approved to read metrics and nothing else: it sends no command. Ask whoever controls the machine for a credential that may (best-peer approve <code> --may deploy, for one)",
+        ));
+    }
     let ct = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -599,12 +622,14 @@ async fn take_command(
         Accept::Conflict => return Err(conflict()),
         Accept::Duplicate { correlation: original } => original,
         Accept::New => {
-            *door
-                .accepted
-                .lock()
-                .unwrap()
-                .entry(recorded.r#type.clone())
-                .or_default() += 1;
+            if door.counts(&recorded.r#type, &Value::Null) {
+                *door
+                    .accepted
+                    .lock()
+                    .unwrap()
+                    .entry(recorded.r#type.clone())
+                    .or_default() += 1;
+            }
             run(door, def, &sender.hash, recorded);
             correlation
         }
@@ -1301,6 +1326,14 @@ mod tests {
         let wait = b["error"]["details"]["retry_after_seconds"].as_u64().unwrap();
         assert!((1..=60).contains(&wait), "{b}");
         assert_eq!(h[header::RETRY_AFTER].to_str().unwrap(), wait.to_string());
+        // The refusal is counted for /metrics, the two that were not whole beside it.
+        let refused = d.refusals.snapshot();
+        assert_eq!(
+            refused.get(&("PullImage".to_string(), "TOO_MANY_COMMANDS")),
+            Some(&1),
+            "{refused:?}"
+        );
+        assert_eq!(refused.values().sum::<u64>(), 3, "{refused:?}");
         let message = b["error"]["message"].as_str().unwrap();
         assert!(
             message.contains("was not accepted") && message.contains(&format!("again in {wait} s")),

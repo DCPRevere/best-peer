@@ -99,6 +99,12 @@ async fn families(peer: &Peer, who: &Credential) -> Vec<Family> {
         "The power a device draws now, where the driver reports it.",
     )
     .unit("watts");
+    let mut energy = Family::new(
+        "best_peer_device_energy_joules",
+        Kind::Counter,
+        "The energy a device has used since its driver loaded, where the driver reports it: what a stretch used is the difference, which sampled power misses.",
+    )
+    .unit("joules");
     let mut disk_free = Family::new(
         "best_peer_disk_free_bytes",
         Kind::Gauge,
@@ -163,7 +169,11 @@ async fn families(peer: &Peer, who: &Credential) -> Vec<Family> {
                     temp.sample(&labels, v);
                 }
                 if let Some(v) = d["power_w"].as_f64() {
-                    power.sample(&labels, v);
+                    // To the milliwatt the driver reads, not the float's last digits.
+                    power.sample(&labels, (v * 1000.0).round() / 1000.0);
+                }
+                if let Some(v) = d["energy_j"].as_f64() {
+                    energy.sample(&labels, v);
                 }
             }
             if let Some(v) = h["disk"]["free_bytes"].as_f64() {
@@ -180,10 +190,15 @@ async fn families(peer: &Peer, who: &Credential) -> Vec<Family> {
         }
     }
 
+    let mut dep_info = Family::new(
+        "best_peer_deployment",
+        Kind::Info,
+        "What a deployment is: its model, engine, device and holder, while it lives.",
+    );
     let mut dep_phase = Family::new(
         "best_peer_deployment_phase",
         Kind::Gauge,
-        "1 for a deployment's phase now (starting, ready, ending), with its model and engine; absent once it ended.",
+        "A deployment's phase as a set: 1 for the phase it is in, 0 for the others; gone once it ended.",
     );
     let mut dep_memory = Family::new(
         "best_peer_deployment_memory_promised_bytes",
@@ -201,10 +216,15 @@ async fn families(peer: &Peer, who: &Credential) -> Vec<Family> {
         Kind::Counter,
         "The tokens the engine counted for a deployment's answered prompts, by kind (prompt, completion).",
     );
+    let mut job_info = Family::new(
+        "best_peer_job",
+        Kind::Info,
+        "What a job is: its device and holder, while it runs.",
+    );
     let mut job_phase = Family::new(
         "best_peer_job_phase",
         Kind::Gauge,
-        "1 for a job's phase now (running, stopping, storing); absent once it ended.",
+        "A job's phase as a set: 1 for the phase it is in, 0 for the others; gone once it ended.",
     );
     let mut job_memory = Family::new(
         "best_peer_job_memory_promised_bytes",
@@ -215,36 +235,32 @@ async fn families(peer: &Peer, who: &Credential) -> Vec<Family> {
     let mut queued = Family::new(
         "best_peer_orders_waiting",
         Kind::Gauge,
-        "The orders of this peer's queue that wait for a device with their room.",
+        "The orders of this peer's queue that wait for a device with their room, as the scraping credential reads them.",
     );
-    let mut held = Family::new(
-        "best_peer_credential_held_bytes",
-        Kind::Gauge,
-        "The device memory the scraping credential's workloads hold on this door, admitted ones included.",
-    )
-    .unit("bytes");
-    let mut share = Family::new(
-        "best_peer_credential_share_bytes",
-        Kind::Gauge,
-        "The most device memory the scraping credential may hold; absent when no share was set.",
-    )
-    .unit("bytes");
     if let Ok(w) = peer.workloads(who) {
         for d in w["deployments"].as_array().into_iter().flatten() {
             let id = d["deployment"].as_str().unwrap_or_default();
             let device = d["device"].as_str().unwrap_or_default();
             let holder = d["holder"].as_str().unwrap_or_default();
-            dep_phase.sample(
+            dep_info.sample(
                 &[
                     ("deployment", id),
                     ("device", device),
                     ("holder", holder),
                     ("model", d["model"].as_str().unwrap_or_default()),
                     ("engine", d["engine"].as_str().unwrap_or_default()),
-                    ("phase", d["phase"].as_str().unwrap_or_default()),
                 ],
                 1.0,
             );
+            // Every phase, each 1 or 0, so a phase change moves a value rather than ending one series and starting
+            // another.
+            let now = d["phase"].as_str().unwrap_or_default();
+            for phase in ["starting", "ready", "ending"] {
+                dep_phase.sample(
+                    &[("deployment", id), ("phase", phase)],
+                    f64::from(u8::from(phase == now)),
+                );
+            }
             if let Some(v) = d["memory_bytes"].as_f64() {
                 dep_memory.sample(&[("deployment", id), ("device", device), ("holder", holder)], v);
             }
@@ -263,26 +279,16 @@ async fn families(peer: &Peer, who: &Credential) -> Vec<Family> {
             let id = j["job"].as_str().unwrap_or_default();
             let device = j["device"].as_str().unwrap_or_default();
             let holder = j["holder"].as_str().unwrap_or_default();
-            job_phase.sample(
-                &[
-                    ("job", id),
-                    ("device", device),
-                    ("holder", holder),
-                    ("phase", j["phase"].as_str().unwrap_or_default()),
-                ],
-                1.0,
-            );
+            job_info.sample(&[("job", id), ("device", device), ("holder", holder)], 1.0);
+            let now = j["phase"].as_str().unwrap_or_default();
+            for phase in ["running", "stopping", "storing"] {
+                job_phase.sample(&[("job", id), ("phase", phase)], f64::from(u8::from(phase == now)));
+            }
             if let (true, Some(v)) = (j["device"].is_string(), j["memory_bytes"].as_f64()) {
                 job_memory.sample(&[("job", id), ("device", device), ("holder", holder)], v);
             }
         }
         queued.sample(&[], w["queued"].as_array().map_or(0, Vec::len) as f64);
-        if let Some(v) = w["held_bytes"].as_f64() {
-            held.sample(&[], v);
-        }
-        if let Some(v) = w["share_bytes"].as_f64() {
-            share.sample(&[], v);
-        }
     }
 
     let mut out = vec![info, readable, d_info, total, free];
@@ -290,8 +296,8 @@ async fn families(peer: &Peer, who: &Credential) -> Vec<Family> {
         out.push(promised);
     }
     out.extend([
-        util, temp, power, disk_free, disk_total, dep_phase, dep_memory, prompts, tokens, job_phase, job_memory,
-        queued, held, share,
+        util, temp, power, energy, disk_free, disk_total, dep_info, dep_phase, dep_memory, prompts, tokens, job_info,
+        job_phase, job_memory, queued,
     ]);
     out
 }

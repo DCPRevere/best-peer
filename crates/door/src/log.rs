@@ -709,21 +709,30 @@ impl EventLog {
         }
     }
 
-    /// The live feed, with the position of the last event already in the log, so a subscriber that also replays can
-    /// skip what it has seen: subscribe first, then read, and the two never overlap or miss.
-    /// How many events of each type the log holds, from its first line: a count that survives a restart, since
-    /// the log does. Each call counts only what was appended since the last; the log never loses an event.
-    pub fn counts_by_type(&self) -> BTreeMap<String, u64> {
-        let events = self.events.lock().unwrap();
+    /// How many events of each type the log holds that `counted` keeps, from its first line: a count that survives
+    /// a restart, since the log does. Each call counts only what was appended since the last, a few thousand events
+    /// at a time so a large log never holds its lock long; the log never loses an event. `counted` is the same on
+    /// every call: the counts kept are what it kept.
+    pub fn counts_by_type(&self, counted: impl Fn(&Stored) -> bool) -> BTreeMap<String, u64> {
+        const CHUNK: usize = 4096;
         let mut counts = self.type_counts.lock().unwrap();
-        let (seen, by_type) = &mut *counts;
-        for s in &events[(*seen).min(events.len())..] {
-            *by_type.entry(s.envelope.r#type.clone()).or_default() += 1;
+        loop {
+            let events = self.events.lock().unwrap();
+            let (seen, by_type) = &mut *counts;
+            let from = (*seen).min(events.len());
+            let to = (from + CHUNK).min(events.len());
+            for s in events[from..to].iter().filter(|s| counted(s)) {
+                *by_type.entry(s.envelope.r#type.clone()).or_default() += 1;
+            }
+            *seen = to;
+            if to == events.len() {
+                return by_type.clone();
+            }
         }
-        *seen = events.len();
-        by_type.clone()
     }
 
+    /// The live feed, with the position of the last event already in the log, so a subscriber that also replays can
+    /// skip what it has seen: subscribe first, then read, and the two never overlap or miss.
     pub fn subscribe(&self) -> (broadcast::Receiver<Stored>, u64) {
         let events = self.events.lock().unwrap();
         (self.tx.subscribe(), events.last().map(|s| s.seq).unwrap_or(0))
@@ -1286,5 +1295,34 @@ mod tests {
         let got = rx.recv().await.unwrap();
         assert_eq!(got.envelope.r#type, "After");
         assert_eq!(got.seq, 2);
+    }
+
+    #[test]
+    fn counts_by_type_count_each_event_once_keep_what_the_filter_keeps_and_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::open(dir.path()).unwrap();
+        let tell = |log: &EventLog, t: &str| {
+            log.append(Envelope::event("io.best.agents", t, json!({}), Some("c".into()), None));
+        };
+        for t in ["A", "B", "A", "Private"] {
+            tell(&log, t);
+        }
+        let kept = |s: &Stored| s.envelope.r#type != "Private";
+        assert_eq!(
+            log.counts_by_type(kept),
+            BTreeMap::from([("A".into(), 2), ("B".into(), 1)])
+        );
+        tell(&log, "B");
+        assert_eq!(
+            log.counts_by_type(kept)["B"],
+            2,
+            "only what came since is counted again"
+        );
+        drop(log);
+        let again = EventLog::open(dir.path()).unwrap();
+        assert_eq!(
+            again.counts_by_type(kept),
+            BTreeMap::from([("A".into(), 2), ("B".into(), 2)])
+        );
     }
 }

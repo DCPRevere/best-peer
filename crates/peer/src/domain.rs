@@ -259,7 +259,7 @@ pub const NAME_SHAPE: &str =
 
 fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
     let description = match at {
-        Where::Root => "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power and utilisation, the isolation a workload on it gets, and the driver. Read it before deploying: a model needs an API the device offers and memory it has free; get-workloads says what already holds memory.",
+        Where::Root => "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power, utilisation and the energy it has used, the isolation a workload on it gets, and the driver. Read it before deploying: a model needs an API the device offers and memory it has free; get-workloads says what already holds memory.",
         Where::Workspace => "The accelerators of this workspace's clouds right now: every device of every peer that answers in a cloud that is not archived, named cloud/peer/device, with the cloud and the peer on each, its compute APIs with their versions, its memory total and free (less what the peer has promised), temperature, power and utilisation, and the isolation a workload on it gets as its peer says (process for a peer that says nothing); and peers, every member of every cloud with whether it answers (up), has not admitted the cloud yet (joining) or does not answer (unreachable). Read it before deploying: a model needs an API a device offers and memory it has free; get-workloads says what already holds memory.",
     };
     let mut device_properties = json!({
@@ -271,6 +271,7 @@ fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
         "temperature_c": { "type": ["number", "null"] },
         "power_w": { "type": ["number", "null"] },
         "utilisation_pct": { "type": ["integer", "null"] },
+        "energy_j": { "type": ["number", "null"], "description": "Joules the device has used since its driver loaded, where it says; what a workload used is the difference between two readings" },
         "slicing": { "type": "string", "enum": ["none", "mig"], "description": "What the device is of its card: none, a whole card; mig, one instance of a card MIG splits in hardware, with its own memory, compute and cache, listed in place of the card. Either way it runs one workload of a size at a time" },
         "isolation": { "type": "string", "enum": ["process", "container", "user-namespace", "vm"], "description": "What stands between a workload on this device and the host and the other workloads, weakest first: process (an engine installed on the host), container (no capability, no new privilege, a ceiling on tasks, a tenant's job in a closed box), user-namespace (the same in a rootless or user-remapped container engine, so root in the container is nobody on the host), vm (a virtual machine; no peer offers it yet). deploy-model and run-job may ask for at least one of these" }
     });
@@ -331,7 +332,15 @@ fn workloads_query(peer: Arc<dyn Service>, at: Where) -> QueryDef {
         "job": { "type": "string" }, "image": { "type": "string" }, "device": { "type": ["string", "null"] },
         "memory_bytes": { "type": "integer" }, "holder": { "type": "string" }, "phase": { "type": "string", "enum": ["running", "stopping", "storing"] }
     });
-    let mut required_deployment = vec!["deployment", "model", "engine", "device", "memory_bytes", "phase"];
+    let mut required_deployment = vec![
+        "deployment",
+        "model",
+        "engine",
+        "device",
+        "memory_bytes",
+        "phase",
+        "prompts",
+    ];
     let mut required_job = vec!["job", "image", "phase"];
     if at == Where::Workspace {
         for row in [&mut deployment, &mut job] {
@@ -1542,6 +1551,7 @@ pub fn host_state(host: &Host) -> Value {
                 "temperature_c": d.temperature_c,
                 "power_w": d.power_w,
                 "utilisation_pct": d.utilisation_pct,
+                "energy_j": d.energy_j,
                 "slicing": d.slicing
             })
         })

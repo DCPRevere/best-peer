@@ -617,4 +617,44 @@ mod tests {
         assert!(s.reserved.is_empty());
         assert_eq!(s.reserved_on(&"gpu-0".into()), 8);
     }
+
+    #[test]
+    fn a_deployments_prompts_are_the_fold_of_its_answers_and_failures() {
+        let mut s = State::default();
+        s.apply(&ev(
+            "DeploymentStarted",
+            "c1",
+            json!({ "deployment": "dep-1", "model": "m", "engine": "ollama", "device": "gpu-0", "memory_bytes": 8, "container": "k-1", "port": 41434 }),
+        ));
+        s.apply(&ev(
+            "PromptAnswered",
+            "p1",
+            json!({ "deployment": "dep-1", "prompt_tokens": 7, "completion_tokens": 30 }),
+        ));
+        s.apply(&ev(
+            "PromptAnswered",
+            "p2",
+            json!({ "deployment": "dep-1", "prompt_tokens": 3, "completion_tokens": 5 }),
+        ));
+        s.apply(&ev(
+            "PromptFailed",
+            "p3",
+            json!({ "deployment": "dep-1", "reason": "x" }),
+        ));
+        // A failure for a deployment that is gone changes nothing here.
+        s.apply(&ev(
+            "PromptFailed",
+            "p4",
+            json!({ "deployment": "dep-gone", "reason": "x" }),
+        ));
+        assert_eq!(
+            s.deployments["dep-1"].prompts,
+            Prompts {
+                answered: 2,
+                failed: 1,
+                prompt_tokens: 10,
+                completion_tokens: 35
+            }
+        );
+    }
 }

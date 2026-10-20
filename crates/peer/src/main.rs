@@ -219,6 +219,12 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
     .with_partition(workspace::Workspaces::root_partition(peer.log.clone()))
     .with_limits(ctx.limits.clone())
     .with_metrics(metrics::source(peer))
+    // The membership facts are their identities' alone (the root's partition): no count of them tells anyone more.
+    .with_uncounted(Arc::new(|r#type: &str, data: &serde_json::Value| {
+        domain::MEMBERSHIP_EVENTS.contains(&r#type)
+            || domain::MEMBERSHIP_COMMANDS.contains(&r#type)
+            || (r#type == "CommandFailed" && domain::MEMBERSHIP_COMMANDS.contains(&data["type"].as_str().unwrap_or_default()))
+    }))
 }
 
 /// What the workspaces of this door are built with: the root's endpoint and credentials, the data directory, the
@@ -731,7 +737,7 @@ fn revoke(args: &[String]) {
 /// person was shown. The token goes to the listen address only, never to the public endpoint, and over TLS to the
 /// certificate the peer serves and no other, when it serves one.
 fn approve(args: &[String]) {
-    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt | all] [--memory 40G] [--deployments N] [--jobs N] [--open-jobs] [--expires 8h] [--accelerators-only]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said); how many deployments and jobs it may run at once across the door (no count when not said); with a share, whether its jobs leave the closed box (no network, a ceiling on host memory) a tenant's job gets; how long the credential lasts, 366d at most, and 8h at most for a session credential (the agent's choice when not said); whether it sees and uses the accelerators alone, never the host's CPU";
+    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt,metrics | all] [--memory 40G] [--deployments N] [--jobs N] [--open-jobs] [--expires 8h] [--accelerators-only]: the code the agent showed the person; what the credential may do (all when not said; metrics alone reads the door's /metrics and sends nothing, for a collector); the most device memory its workloads may hold together (no share when not said); how many deployments and jobs it may run at once across the door (no count when not said); with a share, whether its jobs leave the closed box (no network, a ceiling on host memory) a tenant's job gets; how long the credential lasts, 366d at most, and 8h at most for a session credential (the agent's choice when not said); whether it sees and uses the accelerators alone, never the host's CPU";
     let Some(code) = args.first() else { fail(USAGE) };
     let (mut may, mut memory, mut open_jobs) = (None::<String>, None::<u64>, false);
     let mut expires = None::<Duration>;
@@ -9615,10 +9621,32 @@ mod tests {
         assert_eq!(
             sample(
                 &m,
-                "best_peer_deployment_phase",
-                &[("deployment", &dep), ("phase", "ready"), ("model", "llama3.2:3b")]
+                "best_peer_deployment_info",
+                &[("deployment", &dep), ("model", "llama3.2:3b"), ("engine", "ollama")]
             ),
             Some(1.0)
+        );
+        assert_eq!(
+            sample(
+                &m,
+                "best_peer_deployment_phase",
+                &[("deployment", &dep), ("phase", "ready")]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(
+                &m,
+                "best_peer_deployment_phase",
+                &[("deployment", &dep), ("phase", "starting")]
+            ),
+            Some(0.0),
+            "every phase is in the set"
+        );
+        assert_eq!(
+            sample(&m, "best_peer_device_energy_joules_total", &gpu),
+            Some(1000.0),
+            "{text}"
         );
         assert_eq!(
             sample(
@@ -9849,19 +9877,49 @@ mod tests {
             json!({ "deployment": dep }),
         )
         .await;
-        assert_ne!(s, StatusCode::CREATED, "{b}");
-
-        // A refusal is counted by its command and code, a type the door does not know under one name.
-        let (s, _) = send_as(
+        assert_eq!(
+            (s, b["error"]["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("FORBIDDEN")),
+            "{b}"
+        );
+        // Nor any command that needs no scope: a leaked collector's key makes no workspace, joins none, revokes nothing.
+        let (s, b) = send_as(
             &bed.app,
             "",
             &collector,
-            "x3",
-            "NoSuchThing",
-            "no-such-thing",
-            json!({}),
+            "x4",
+            "CreateWorkspace",
+            "create-workspace",
+            json!({ "name": "mine" }),
         )
         .await;
+        assert_eq!(
+            (s, b["error"]["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("FORBIDDEN")),
+            "{b}"
+        );
+        assert!(
+            b["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("metrics and nothing else"),
+            "{b}"
+        );
+
+        // What no credential reads of the root (who made a workspace, who joined it) is not counted either.
+        let (s, b) = bed
+            .send("w1", "CreateWorkspace", "create-workspace", json!({ "name": "lab" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        events_as(&bed.app, "", &bed.key, "w1", "WorkspaceCreatedV1").await;
+        let text = scrape(&bed.app, Some(&collector), false, None).await.2;
+        assert!(
+            !text.contains("WorkspaceCreated") && !text.contains("CreateWorkspace"),
+            "{text}"
+        );
+
+        // A refusal is counted by its command and code, a type the door does not know under one name.
+        let (s, _) = send_as(&bed.app, "", &bed.key, "x3", "NoSuchThing", "no-such-thing", json!({})).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         let m = parsed(&scrape(&bed.app, Some(&collector), false, None).await.2);
         assert_eq!(

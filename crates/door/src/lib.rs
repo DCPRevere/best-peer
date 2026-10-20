@@ -90,7 +90,13 @@ pub struct Door {
     pub refusals: metrics::Refusals,
     /// The event streams open now.
     pub open_streams: metrics::OpenStreams,
+    /// What the door's counts leave out: a fact (or a command, with its data null) that no credential reads here,
+    /// whatever its grant, so a count of it would tell what nothing else does.
+    pub uncounted: Option<Uncounted>,
 }
+
+/// Whether a fact or a command of this type and data is left out of the door's counts.
+pub type Uncounted = Arc<dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync>;
 
 impl Door {
     pub fn new(
@@ -122,7 +128,19 @@ impl Door {
             accepted: Default::default(),
             refusals: Default::default(),
             open_streams: Default::default(),
+            uncounted: None,
         }
+    }
+
+    /// The same door, leaving out of its counts what `uncounted` says no credential reads.
+    pub fn with_uncounted(mut self, uncounted: Uncounted) -> Self {
+        self.uncounted = Some(uncounted);
+        self
+    }
+
+    /// Whether the door counts a fact or a command of this type and data.
+    pub fn counts(&self, r#type: &str, data: &serde_json::Value) -> bool {
+        self.uncounted.as_ref().is_none_or(|u| !u(r#type, data))
     }
 
     /// The same door, serving `/metrics`: the door's own series and the service's, from `source`.

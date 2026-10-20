@@ -25,6 +25,14 @@ use crate::auth::Credential;
 /// (`best-peer approve <code> --may metrics`), so it holds no right to deploy, run or prompt.
 pub const METRICS_SCOPE: &str = "metrics";
 
+/// Whether a credential was approved to read metrics and nothing else: it sends no command.
+pub fn reads_only(grant: &crate::auth::Grant) -> bool {
+    grant
+        .scopes
+        .as_ref()
+        .is_some_and(|s| !s.is_empty() && s.iter().all(|x| x == METRICS_SCOPE))
+}
+
 /// The content type of the Prometheus text format.
 pub const PROMETHEUS_TEXT: &str = "text/plain; version=0.0.4; charset=utf-8";
 /// The content type of OpenMetrics text.
@@ -128,7 +136,7 @@ impl Format {
 }
 
 /// A label value or help text with what the format escapes escaped: the backslash and the newline everywhere, and
-/// the double quote in a label value.
+/// the double quote in a label value, and in OpenMetrics in help text too (the Prometheus text leaves it there).
 fn escape(s: &str, quote: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -182,7 +190,11 @@ pub fn render(families: &[Family], format: Format) -> String {
             (Kind::Info, Format::OpenMetrics) => "info",
             (Kind::Info, Format::Prometheus) => "gauge",
         };
-        let _ = writeln!(out, "# HELP {family_name} {}", escape(&f.help, false));
+        let _ = writeln!(
+            out,
+            "# HELP {family_name} {}",
+            escape(&f.help, format == Format::OpenMetrics)
+        );
         let _ = writeln!(out, "# TYPE {family_name} {kind}");
         if let (Some(unit), Format::OpenMetrics) = (f.unit, format) {
             let _ = writeln!(out, "# UNIT {family_name} {unit}");
@@ -218,7 +230,7 @@ impl Refusals {
         *self.0.lock().unwrap().entry((command.to_string(), code)).or_default() += 1;
     }
 
-    fn snapshot(&self) -> BTreeMap<(String, &'static str), u64> {
+    pub fn snapshot(&self) -> BTreeMap<(String, &'static str), u64> {
         self.0.lock().unwrap().clone()
     }
 }
@@ -247,10 +259,9 @@ impl Drop for Held {
     }
 }
 
-/// The series of the whole door: commands accepted (from the log, so they count from its first line, across
-/// restarts) and refused (since the door started), the events it told by type (from the log), and the event
-/// streams open now. `commands` is every command type the catalogue accepts, so a refusal of a type it does not
-/// know is counted under `unknown` and the label stays bounded.
+/// The series of the whole door: commands accepted and refused since the door started (a finished command's line
+/// in the log keeps no type to count again from), the events it told by type since its log began, and the event
+/// streams open now.
 pub fn door_families(
     accepted: &BTreeMap<String, u64>,
     refused: &Refusals,
@@ -260,7 +271,7 @@ pub fn door_families(
     let mut a = Family::new(
         "best_peer_commands_accepted",
         Kind::Counter,
-        "Commands the door accepted, by type, since its log began.",
+        "Commands the door accepted, by type, since it started.",
     );
     for (command, n) in accepted {
         a.sample(&[("command", command)], *n as f64);
@@ -398,5 +409,12 @@ mod tests {
         assert_eq!(open.now(), 1);
         drop(b);
         assert_eq!(open.now(), 0);
+    }
+
+    #[test]
+    fn a_quote_in_help_is_escaped_for_openmetrics_and_left_for_the_prometheus_text() {
+        let f = Family::new("best_peer_q", Kind::Gauge, "Say \"why\".");
+        assert!(render(std::slice::from_ref(&f), Format::OpenMetrics).contains("# HELP best_peer_q Say \\\"why\\\".\n"));
+        assert!(render(&[f], Format::Prometheus).contains("# HELP best_peer_q Say \"why\".\n"));
     }
 }
