@@ -240,6 +240,11 @@ pub trait Runtime: Send + Sync {
     async fn isolation(&self) -> Isolation {
         Isolation::Process
     }
+    /// The host's ids of the processes this engine runs for the peer, so the peer tells its own use of a device from
+    /// its owner's. An engine that cannot tell says `None`.
+    async fn processes(&self) -> Option<Vec<u32>> {
+        None
+    }
 }
 
 /// An in-memory [`Runtime`] for tests: images the engine already holds, images a registry would serve, containers
@@ -269,6 +274,9 @@ pub struct Fake {
     refusal: Mutex<Option<String>>,
     /// What it says stands between its containers and the host: a container, unless a test says otherwise.
     isolation: Isolation,
+    /// The host's ids of the processes its containers run, as a test sets them; `None` for an engine that cannot
+    /// tell.
+    processes: Mutex<Option<Vec<u32>>>,
 }
 
 impl Fake {
@@ -290,7 +298,13 @@ impl Fake {
             gate: Mutex::new(None),
             refusal: Mutex::new(None),
             isolation: Isolation::Container,
+            processes: Mutex::new(Some(Vec::new())),
         }
+    }
+
+    /// Sets the host's ids of the processes its containers run, or `None` for an engine that cannot tell.
+    pub fn set_processes(&self, pids: Option<Vec<u32>>) {
+        *self.processes.lock().unwrap() = pids;
     }
 
     /// An engine that offers `isolation`, as a rootless one offers a user namespace.
@@ -489,6 +503,10 @@ impl Runtime for Fake {
 
     async fn isolation(&self) -> Isolation {
         self.isolation
+    }
+
+    async fn processes(&self) -> Option<Vec<u32>> {
+        self.processes.lock().unwrap().clone()
     }
 }
 

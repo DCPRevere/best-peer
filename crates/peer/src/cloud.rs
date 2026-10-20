@@ -1170,7 +1170,28 @@ impl Cloud {
                         data[k] = v.clone();
                     }
                 }
-                self.tell(&em, &r#type, data);
+                // The member's owner took the device back from under a job of an order: the order waits again, as
+                // for a member lost, so the client's job runs elsewhere or later with nothing asked of it.
+                let held_back = match &ordered {
+                    Some((o, Some((_, true))))
+                        if r#type == "JobStopped" && data["reason"] == crate::availability::HELD_REASON =>
+                    {
+                        self.state.lock().unwrap().orders.get(o).cloned()
+                    }
+                    _ => None,
+                };
+                if let Some(o) = held_back {
+                    if let Some(mc) = e.correlationid.as_deref() {
+                        self.issued
+                            .lock()
+                            .unwrap()
+                            .remove(&(member.name.clone(), mc.to_string()));
+                    }
+                    let why = format!("the owner of peer {} took its device back", member.name);
+                    self.queue_again(&o, data["job"].as_str(), &member.name, &why);
+                } else {
+                    self.tell(&em, &r#type, data);
+                }
                 if TERMINAL.contains(&r#type.as_str()) {
                     if let Some(mc) = e.correlationid.as_deref() {
                         self.issued
@@ -1860,7 +1881,9 @@ impl Cloud {
         let unreachable = matches!(e, Refusal::Unreachable(_));
         let room = match &e {
             Refusal::Unreachable(_) => true,
-            Refusal::Refused { body, .. } => body["error"]["code"] == "INSUFFICIENT_MEMORY",
+            Refusal::Refused { body, .. } => {
+                crate::queue::waits_for(body["error"]["code"].as_str().unwrap_or_default())
+            }
         };
         let refused = e.relayed(&member.name);
         // An order by size is told in its size's terms; the member's own words, which may name the device and its
@@ -2331,7 +2354,7 @@ impl Service for Cloud {
                 ) {
                     Ok(_) => None,
                     Err(e)
-                        if e.code == "INSUFFICIENT_MEMORY" && could_ever_hold(&all, needed, data.device.as_deref()) =>
+                        if crate::queue::waits_for(e.code) && could_ever_hold(&all, needed, data.device.as_deref()) =>
                     {
                         None
                     }

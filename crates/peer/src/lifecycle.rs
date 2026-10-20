@@ -20,6 +20,7 @@ use best_peer_runtime::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, Semaphore};
 
@@ -153,6 +154,8 @@ pub struct Peer {
     keys: Mutex<HashMap<String, String>>,
     /// The commands admitted from a credential held to the accelerators, until the order is told.
     held_to_accelerators: Mutex<std::collections::HashSet<String>>,
+    /// The owner's use of each card, when the operator left it on.
+    watch: Option<Arc<crate::availability::Watch>>,
 }
 
 #[derive(Deserialize)]
@@ -261,6 +264,58 @@ impl Peer {
             stopping: Mutex::new(std::collections::HashSet::new()),
             keys: Mutex::new(HashMap::new()),
             held_to_accelerators: Mutex::new(std::collections::HashSet::new()),
+            watch: None,
+        }
+    }
+
+    /// Finds when the owner uses a card, with these thresholds.
+    pub fn with_owner_use(mut self, thresholds: crate::availability::Thresholds) -> Self {
+        self.watch = Some(Arc::new(crate::availability::Watch::new(thresholds)));
+        self
+    }
+
+    /// Reads the owner's use of each card every few seconds, while the peer runs. Nothing when it is off.
+    pub fn watch_owner(self: &Arc<Self>) {
+        if self.watch.is_none() {
+            return;
+        }
+        let me = self.clone();
+        let sampling = tokio::spawn(async move {
+            loop {
+                me.sample().await;
+                tokio::time::sleep(crate::availability::SAMPLE_EVERY).await;
+            }
+        });
+        self.tasks.lock().unwrap().push(sampling);
+    }
+
+    /// One reading of the owner's use: the processes on each card that are not this peer's workloads. A card that
+    /// turned free may let an order in. A driver that cannot say leaves the last reading as it was.
+    pub async fn sample(&self) {
+        let Some(watch) = self.watch.clone() else {
+            return;
+        };
+        let gpu = self.gpu.clone();
+        let usage = match tokio::task::spawn_blocking(move || gpu.usage()).await {
+            Ok(Ok(u)) => u,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "the accelerator library did not say who uses the cards");
+                return;
+            }
+            Err(_) => return,
+        };
+        let peers = self.runtime.processes().await;
+        let holds: std::collections::HashSet<DeviceId> = {
+            let s = self.state.lock().unwrap();
+            s.deployments
+                .values()
+                .map(|d| d.device.clone())
+                .chain(s.jobs.values().filter_map(|j| j.device.clone()))
+                .collect()
+        };
+        let readings = crate::availability::readings(&usage, peers.as_deref(), &holds);
+        if watch.observe(std::time::Instant::now(), &readings) {
+            self.kick();
         }
     }
 
@@ -618,12 +673,191 @@ impl Peer {
         }
     }
 
+    /// The hardware now, each device with whether it takes new work: busy while its owner uses it or holds it.
     pub async fn hardware(&self) -> Result<Host, BestError> {
         let gpu = self.gpu.clone();
-        tokio::task::spawn_blocking(move || gpu.snapshot())
+        let mut host = tokio::task::spawn_blocking(move || gpu.snapshot())
             .await
             .map_err(|e| BestError::internal(format!("the hardware query did not complete: {e}")))?
-            .map_err(|e| BestError::internal(format!("the accelerator library failed: {e}")))
+            .map_err(|e| BestError::internal(format!("the accelerator library failed: {e}")))?;
+        let holds = self.state.lock().unwrap().holds.clone();
+        crate::availability::annotate(&mut host, &holds, self.watch.as_deref(), OffsetDateTime::now_utc());
+        Ok(host)
+    }
+
+    // ----- the owner's hold -----------------------------------------------------------------------------------------
+
+    /// The owner, at the machine, holds `devices` (every device the peer lists when none is named) until `until` or
+    /// a release: they take no new work. With `now`, what runs on them ends as well, each told under its own
+    /// correlation with the hold as the reason, so the card is the owner's at once. Told as `DeviceHeldV1`, under a
+    /// correlation of its own that no credential owns, so only a credential approved for all reads it on the stream;
+    /// every approved credential reads its effect in `get-hardware-state`.
+    pub async fn hold(
+        &self,
+        devices: Option<Vec<String>>,
+        until: Option<String>,
+        reason: Option<String>,
+        now: bool,
+    ) -> Result<Value, BestError> {
+        let host = self.hardware().await?;
+        let ids: Vec<String> = host.devices.iter().map(|d| d.id.0.clone()).collect();
+        let held = match devices {
+            None => ids.clone(),
+            Some(named) => {
+                if let Some(unknown) = named.iter().find(|n| !ids.contains(n)) {
+                    return Err(BestError::bad_request(
+                        "NO_SUCH_DEVICE",
+                        format!(
+                            "device {unknown} is not on this host: the devices are {}",
+                            list(ids.iter())
+                        ),
+                    )
+                    .with_details(json!({ "device": unknown, "devices": ids })));
+                }
+                named
+            }
+        };
+        if let Some(u) = &until {
+            match OffsetDateTime::parse(u, &Rfc3339) {
+                Ok(t) if t > OffsetDateTime::now_utc() => {}
+                _ => {
+                    return Err(BestError::bad_request(
+                        "INVALID_PARAMETER",
+                        format!("until is {u:?}: an RFC 3339 time still to come, such as 2026-10-20T22:00:00Z"),
+                    )
+                    .with_details(json!({ "field": "until" })))
+                }
+            }
+        }
+        let reason = reason
+            .map(|r| crate::availability::reason(&r))
+            .transpose()
+            .map_err(|why| {
+                BestError::bad_request("INVALID_PARAMETER", why).with_details(json!({ "field": "reason" }))
+            })?;
+        let mut fact = json!({ "devices": held });
+        if let Some(u) = &until {
+            fact["until"] = json!(u);
+        }
+        if let Some(r) = &reason {
+            fact["reason"] = json!(r);
+        }
+        self.tell(&self.emitter(&new_id("hold")), "DeviceHeldV1", fact);
+        let ended = match now {
+            true => self.end_on(&held).await,
+            false => Vec::new(),
+        };
+        Ok(json!({ "held": held, "until": until, "reason": reason, "ended": ended }))
+    }
+
+    /// The owner releases `devices` (every one held when none is named): they take work again, and an order waiting
+    /// for one may start. Told as `DeviceReleasedV1`. A device that is not held is refused by name.
+    pub fn release(&self, devices: Option<Vec<String>>) -> Result<Value, BestError> {
+        let held: Vec<String> = {
+            let s = self.state.lock().unwrap();
+            let mut h: Vec<String> = s.holds.keys().cloned().collect();
+            h.sort();
+            h
+        };
+        let released = match devices {
+            None if held.is_empty() => {
+                return Err(BestError::bad_request("NOT_HELD", "no device of this peer is held"));
+            }
+            None => held.clone(),
+            Some(named) => {
+                if let Some(free) = named.iter().find(|n| !held.contains(n)) {
+                    return Err(BestError::bad_request(
+                        "NOT_HELD",
+                        format!("device {free} is not held: the held ones are {}", list(held.iter())),
+                    )
+                    .with_details(json!({ "device": free, "held": held })));
+                }
+                named
+            }
+        };
+        self.tell(
+            &self.emitter(&new_id("hold")),
+            "DeviceReleasedV1",
+            json!({ "devices": released }),
+        );
+        self.kick();
+        Ok(json!({ "released": released }))
+    }
+
+    /// Ends every job and deployment on `devices` for a hold: each told under its own correlation, with the hold as
+    /// the reason. Answers what ended, or could not be ended.
+    async fn end_on(&self, devices: &[String]) -> Vec<Value> {
+        let on = |d: Option<&DeviceId>| d.is_some_and(|d| devices.contains(&d.0));
+        let (jobs, deployments) = {
+            let mut s = self.state.lock().unwrap();
+            let mut jobs = Vec::new();
+            for j in s.jobs.values_mut() {
+                if on(j.device.as_ref()) && j.phase == JobPhase::Running {
+                    j.phase = JobPhase::Stopping;
+                    jobs.push(j.clone());
+                }
+            }
+            let mut deployments = Vec::new();
+            for d in s.deployments.values_mut() {
+                if on(Some(&d.device)) && d.phase != Phase::Ending {
+                    d.phase = Phase::Ending;
+                    deployments.push(d.clone());
+                }
+            }
+            (jobs, deployments)
+        };
+        let mut ended = Vec::new();
+        for j in jobs {
+            let em = match self.state.lock().unwrap().order_of_job(&j.id) {
+                Some(o) => self.order_emitter(&o),
+                None => self.emitter(&j.correlation),
+            };
+            match self.runtime.stop(&j.container).await {
+                Ok(()) | Err(RuntimeError::NoSuchContainer(_)) => {
+                    self.tell(
+                        &em,
+                        "JobStopped",
+                        json!({ "job": j.id, "reason": crate::availability::HELD_REASON }),
+                    );
+                    ended.push(json!({ "job": j.id }));
+                }
+                Err(e) => {
+                    if let Some(x) = self.state.lock().unwrap().jobs.get_mut(&j.id) {
+                        x.phase = JobPhase::Running;
+                    }
+                    ended.push(json!({ "job": j.id, "error": e.to_string() }));
+                }
+            }
+        }
+        for d in deployments {
+            if d.ready {
+                let unloaded = tokio::time::timeout(
+                    self.patience.unload,
+                    self.engine.unload(d.engine, &self.engine_base(d.port), &d.model),
+                )
+                .await;
+                if !matches!(unloaded, Ok(Ok(()))) {
+                    tracing::warn!(deployment = %d.id, "the engine did not unload the model for the hold; its container is stopped next");
+                }
+            }
+            match self.runtime.stop(&d.container).await {
+                Ok(()) | Err(RuntimeError::NoSuchContainer(_)) => {
+                    self.tell(
+                        &self.emitter(&d.correlation),
+                        "DeploymentEnded",
+                        json!({ "deployment": d.id, "model": d.model, "reason": crate::availability::HELD_REASON }),
+                    );
+                    ended.push(json!({ "deployment": d.id }));
+                }
+                Err(e) => {
+                    if let Some(x) = self.state.lock().unwrap().deployments.get_mut(&d.id) {
+                        x.phase = if x.ready { Phase::Ready } else { Phase::Starting };
+                    }
+                    ended.push(json!({ "deployment": d.id, "error": e.to_string() }));
+                }
+            }
+        }
+        ended
     }
 
     /// Where `model` comes from for `kind`: the operator's store when the engine reads one and the model is in it,
@@ -1144,7 +1378,7 @@ impl Peer {
                 // Asked to wait, and room can come free: taken, it waits its turn.
                 Err(e)
                     if data.queue_seconds.is_some()
-                        && e.code == "INSUFFICIENT_MEMORY"
+                        && crate::queue::waits_for(e.code)
                         && crate::queue::could_ever_hold(host, needed, data.device.as_deref()) =>
                 {
                     None
@@ -1999,10 +2233,21 @@ pub(crate) fn place(
     let rank = |c: &Compute| apis.iter().position(|w| w == c).unwrap_or(apis.len());
     let best = offering
         .iter()
-        .filter(|(d, _)| room(d) >= memory_bytes)
+        .filter(|(d, _)| d.availability.is_free() && room(d) >= memory_bytes)
         .min_by_key(|(d, c)| (rank(c), std::cmp::Reverse(room(d))));
     if let Some((d, c)) = best {
         return Ok((d.id.clone(), c.clone()));
+    }
+    // A busy device would hold it once its owner is done: what its owner holds of its memory is theirs for now.
+    let waits: Vec<&best_peer_gpu::Device> = offering
+        .iter()
+        .filter(|(d, _)| {
+            !d.availability.is_free() && d.memory.total_bytes.saturating_sub(state.reserved_on(&d.id)) >= memory_bytes
+        })
+        .map(|(d, _)| *d)
+        .collect();
+    if !waits.is_empty() {
+        return Err(device_busy(&waits, what));
     }
     let devices: Vec<Value> = offering
         .iter()
@@ -2034,6 +2279,41 @@ pub(crate) fn place(
         ),
     )
     .with_details(json!({ "memory_bytes": memory_bytes, "devices": devices })))
+}
+
+/// The refusal of a workload that a busy device would hold: which, until when where the peer knows, and the owner's
+/// reason where they gave one.
+fn device_busy(busy: &[&best_peer_gpu::Device], what: &str) -> BestError {
+    let mut told = Vec::new();
+    let mut details = Vec::new();
+    for d in busy {
+        let (until, reason) = match &d.availability {
+            best_peer_gpu::Availability::Busy { until, reason } => (until.clone(), reason.clone()),
+            best_peer_gpu::Availability::Free => (None, None),
+        };
+        let mut t = format!("{} ({})", d.id.0, d.name);
+        if let Some(u) = &until {
+            t.push_str(&format!(" until {u}"));
+        }
+        if let Some(r) = &reason {
+            t.push_str(&format!(": {r}"));
+        }
+        told.push(t);
+        details.push(json!({ "id": d.id.0, "until": until, "reason": reason }));
+    }
+    let what = if what.is_empty() {
+        "it".to_string()
+    } else {
+        what.to_string()
+    };
+    BestError::bad_request(
+        "DEVICE_BUSY",
+        format!(
+            "{what} would fit on {}, which its owner is using: a run-job with queue_seconds waits for it; otherwise send it again once get-hardware-state shows it free, or name another device",
+            told.join("; ")
+        ),
+    )
+    .with_details(json!({ "devices": details }))
 }
 
 fn api_name(c: &Compute) -> String {

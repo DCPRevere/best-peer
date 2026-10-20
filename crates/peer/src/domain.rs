@@ -100,6 +100,7 @@ pub fn catalogue(svc: Arc<dyn Service>, membership: Arc<dyn Membership>, auth: A
         .into_iter()
         .chain(membership_event_defs())
         .chain(credential_event_defs())
+        .chain(owner_event_defs())
     {
         c = c.event(e);
     }
@@ -186,6 +187,7 @@ pub fn event_dataschemas(endpoint: &str) -> HashMap<String, String> {
         .into_iter()
         .chain(membership_event_defs())
         .chain(credential_event_defs())
+        .chain(owner_event_defs())
     {
         c = c.event(e);
     }
@@ -251,8 +253,8 @@ pub const NAME_SHAPE: &str =
 
 fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
     let description = match at {
-        Where::Root => "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power and utilisation, the isolation a workload on it gets, and the driver. Read it before deploying: a model needs an API the device offers and memory it has free; get-workloads says what already holds memory.",
-        Where::Workspace => "The accelerators of this workspace's clouds right now: every device of every peer that answers in a cloud that is not archived, named cloud/peer/device, with the cloud and the peer on each, its compute APIs with their versions, its memory total and free (less what the peer has promised), temperature, power and utilisation, and the isolation a workload on it gets as its peer says (process for a peer that says nothing); and peers, every member of every cloud with whether it answers (up), has not admitted the cloud yet (joining) or does not answer (unreachable). Read it before deploying: a model needs an API a device offers and memory it has free; get-workloads says what already holds memory.",
+        Where::Root => "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power and utilisation, the isolation a workload on it gets, its availability (busy while its owner is using it or holds it), and the driver. Read it before deploying: a model needs an API the device offers, memory it has free and the device free; get-workloads says what already holds memory.",
+        Where::Workspace => "The accelerators of this workspace's clouds right now: every device of every peer that answers in a cloud that is not archived, named cloud/peer/device, with the cloud and the peer on each, its compute APIs with their versions, its memory total and free (less what the peer has promised), temperature, power and utilisation, the isolation a workload on it gets as its peer says (process for a peer that says nothing), and its availability as its peer says (busy while the peer's owner is using it or holds it); and peers, every member of every cloud with whether it answers (up), has not admitted the cloud yet (joining) or does not answer (unreachable). Read it before deploying: a model needs an API a device offers, memory it has free and the device free; get-workloads says what already holds memory.",
     };
     let mut device_properties = json!({
         "id": { "type": "string", "description": "Stable device id, the value a command names a device by" },
@@ -264,6 +266,7 @@ fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
         "power_w": { "type": ["number", "null"] },
         "utilisation_pct": { "type": ["integer", "null"] },
         "slicing": { "type": "string", "enum": ["none", "mig"], "description": "What the device is of its card: none, a whole card; mig, one instance of a card MIG splits in hardware, with its own memory, compute and cache, listed in place of the card. Either way it runs one workload of a size at a time" },
+        "availability": { "type": "object", "required": ["state"], "description": "Whether the device takes new work now: free; or busy, while its owner is using it or holds it, with until, when it frees, where the peer knows (a hold's end; never while the owner is using it), and reason, where the owner gave one. A busy device takes no new work: deploy-model and run-job are refused there with DEVICE_BUSY, and a run-job with queue_seconds waits for it; what already runs on it runs on", "properties": { "state": { "type": "string", "enum": ["free", "busy"] }, "until": { "type": "string", "format": "date-time" }, "reason": { "type": "string" } } },
         "isolation": { "type": "string", "enum": ["process", "container", "user-namespace", "vm"], "description": "What stands between a workload on this device and the host and the other workloads, weakest first: process (an engine installed on the host), container (no capability, no new privilege, a ceiling on tasks, a tenant's job in a closed box), user-namespace (the same in a rootless or user-remapped container engine, so root in the container is nobody on the host), vm (a virtual machine; no peer offers it yet). deploy-model and run-job may ask for at least one of these" }
     });
     let mut properties = json!({
@@ -1075,6 +1078,30 @@ pub fn credential_event_defs() -> Vec<EventDef> {
     )]
 }
 
+/// What the door tells about its owner's holds, which only a credential approved for all reads on the stream. The
+/// owner's own use of a card is never told: it is read live (`get-hardware-state`), so the log keeps no record of
+/// when the owner uses their machine.
+pub fn owner_event_defs() -> Vec<EventDef> {
+    let s = |d: &str| json!({ "type": "string", "description": d });
+    let devices = json!({ "type": "array", "items": { "type": "string" }, "description": "The devices, as get-hardware-state names them" });
+    vec![
+        event(
+            "device-held",
+            "DeviceHeldV1",
+            "The owner, at the machine, holds these devices: they take no new work until until, or a release. Work that runs on them runs on, unless the owner ended it with the hold, each told under its own correlation.",
+            &["devices"],
+            json!({ "devices": devices, "until": s("When the hold ends, RFC 3339; absent for a hold until a release"), "reason": s("What the owner said, when they said anything") }),
+        ),
+        event(
+            "device-released",
+            "DeviceReleasedV1",
+            "The owner released these devices: they take work again.",
+            &["devices"],
+            json!({ "devices": devices }),
+        ),
+    ]
+}
+
 // ----- the clouds, in a workspace ------------------------------------------------------------------------------------
 
 fn configure_cloud(ws: Arc<dyn Clouds>) -> CommandDef {
@@ -1438,7 +1465,8 @@ pub fn host_state(host: &Host) -> Value {
                 "temperature_c": d.temperature_c,
                 "power_w": d.power_w,
                 "utilisation_pct": d.utilisation_pct,
-                "slicing": d.slicing
+                "slicing": d.slicing,
+                "availability": d.availability
             })
         })
         .collect();
