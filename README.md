@@ -344,7 +344,7 @@ The facts follow on the event stream under the command's correlation id, in orde
 `DeploymentStarted`, `WeightsLoading`, then `DeploymentReady`, or `DeploymentFailed`. While an image is pulled,
 `ImagePulling` says 99 at most and may fall back, since the engine learns of more to fetch as it goes; 100 comes with
 the pull's end, just before `ImagePulled`. What the engine does on its own
-later (`OutOfMemory`, `DeploymentEnded`) is told under the same correlation id. An engine whose container exits before
+later (`OutOfMemory`, `DeploymentEnded`), and its end when you take its key back, is told under the same correlation id. An engine whose container exits before
 its model is ready fails the deploy: `DeploymentFailed` carries its exit code and the last lines it wrote. `prompt` names a ready deployment and
 the conversation so far, and `PromptAnswered` follows under its own correlation id with the answer whole, or
 `PromptFailed` with the reason and the fix. `run-job` runs an image once, a tenant's in a closed box, and tells
@@ -357,7 +357,7 @@ the cloud places orders first come, first served, as soon as a member has the me
 fit yet holds back none that does. `JobPlaced` names the member it was sent to, then the member's facts follow, and
 `JobStarted` names the order. `queue_seconds` bounds the wait, a day when the order names none (past it, `JobFailed`
 says it was never placed), and `deadline_seconds` the run from `JobStarted` (past it, the job is stopped and
-`JobStopped` says why); both are counted from the facts' own times, so a restart neither resets nor extends them. `stop-job` names a waiting order by its id,
+`JobStopped` says why, as it does for a job or an order whose key you took back); both are counted from the facts' own times, so a restart neither resets nor extends them. `stop-job` names a waiting order by its id,
 and it ends in `JobStopped` before it started. A member lost under an order queues it again once, `JobQueued`
 telling `attempt: 2`, and fails it the second time. `get-workloads` lists the orders not started yet as `queued`,
 oldest first. An order that waits counts against its credential's share and its count of jobs, as an admitted one
@@ -528,8 +528,8 @@ Every command of this peer follows one pattern, and nothing else is needed to dr
 2. Everything that happens is an event carrying that correlation id, in the order it happened. The command's
    schema document lists what it `produces` and, among those, what `completes` it: the events after which the
    command's outcome is known (`DeploymentReady` for a deploy, or `DeploymentFailed`, `DeploymentEnded` or
-   `OutOfMemory` when it ended before it was ready; `JobStarted` or `JobFailed` for a job, and on a workspace's door
-   also `JobStopped`, for an order stopped before it started), so a consumer stops
+   `OutOfMemory` when it ended before it was ready; `JobStarted` or `JobFailed` for a job, and also
+   `JobStopped`, for an order stopped before it started), so a consumer stops
    waiting for the command and a restart does not run it again; the others are
    progress on the way (`ImagePulling`, `WeightsLoading`, with `progress_pct` where the engine says).
    `CommandFailed` completes any command.
@@ -599,8 +599,10 @@ and the same admin token; an agent takes back its own with the `revoke-agent` co
 key opens nothing from then on, on this door and every workspace door here, and an event stream open under it ends
 within seconds, as one does when a key runs out. A key you take back takes its work on this peer's own door with it:
 its orders that wait end before they start, its jobs are stopped and its deployments ended, each told with the reason
-that its credential was taken back, and a job that was starting is stopped as soon as it is told started;
-`best-peer revoke <name> --keep-running` leaves them as they are. A key that runs out, or one the agent gave back
+that its credential was taken back, and one that was starting or queuing meanwhile is ended as soon as it is told.
+One the container engine does not stop is named in what `revoke` prints and tried again until it stops. Orders on a
+workspace's cloud are the cloud's and are not ended by it. `best-peer revoke <name> --keep-running` leaves the work as
+it is. A key that runs out, or one the agent gave back
 itself, leaves its work running, as an agent that ends its session after ordering a long run expects; what it left is
 the owner's to end. A revoke the
 disk did not keep says so: the key is closed until the peer restarts, and running the revoke again writes it. Every command document says which

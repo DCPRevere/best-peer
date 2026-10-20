@@ -684,6 +684,10 @@ impl Peer {
     /// a device of this peer with its room, an order that does not fit holding back none after it.
     pub async fn step(self: &Arc<Self>, now: OffsetDateTime) {
         let _one = self.steps.lock().await;
+        let taken_back: Vec<String> = self.taken_back.lock().unwrap().iter().cloned().collect();
+        if !taken_back.is_empty() {
+            self.end_work_of(&taken_back).await;
+        }
         // An order that is starting is no longer waiting for room, and one being stopped is the stop's to tell.
         // Read with the state's lock held, as the lock order asks.
         let held = || {
@@ -1062,6 +1066,10 @@ impl Peer {
         );
         em.bind_workload(&id);
         self.replay_unowned(&started.id).await;
+        if self.taken_back.lock().unwrap().contains(&holder) {
+            self.end_work_of(std::slice::from_ref(&holder)).await;
+            return;
+        }
         let base = self.engine_base(port);
         let loading: best_peer_engine::Progress = {
             let (me, em, id, model, pace) = (
@@ -1778,8 +1786,10 @@ impl Peer {
 
     /// Ends the work of `holders`, whose credentials whoever runs this peer took back: their orders that wait end
     /// before they start, their jobs are stopped and their deployments ended, each told under its own correlation
-    /// with [`TAKEN_BACK`] as the reason. One that cannot be stopped now is left as it was and logged.
-    pub async fn end_work_of(&self, holders: &[String]) {
+    /// with [`TAKEN_BACK`] as the reason. One the engine cannot stop now is left as it was, logged and answered, and
+    /// every step of the queue tries again, as it does for what started or queued after the take-back.
+    pub async fn end_work_of(&self, holders: &[String]) -> Vec<String> {
+        let mut left = Vec::new();
         self.taken_back.lock().unwrap().extend(holders.iter().cloned());
         let theirs = |h: &str| holders.iter().any(|x| x == h);
         let (orders, jobs, deployments) = {
@@ -1823,7 +1833,8 @@ impl Peer {
                     self.tell(&em, "JobStopped", json!({ "job": j.id, "reason": TAKEN_BACK }));
                 }
                 Err(e) => {
-                    tracing::warn!(job = %j.id, why = %e, "a job of a credential taken back could not be stopped");
+                    tracing::warn!(job = %j.id, why = %e, "a job of a credential taken back could not be stopped; trying again at the next step");
+                    left.push(j.id.clone());
                     if let Some(x) = self.state.lock().unwrap().jobs.get_mut(&j.id) {
                         x.phase = JobPhase::Running;
                     }
@@ -1850,13 +1861,15 @@ impl Peer {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(deployment = %d.id, why = %e, "a deployment of a credential taken back could not be ended");
+                    tracing::warn!(deployment = %d.id, why = %e, "a deployment of a credential taken back could not be ended; trying again at the next step");
+                    left.push(d.id.clone());
                     if let Some(x) = self.state.lock().unwrap().deployments.get_mut(&d.id) {
                         x.phase = if x.ready { Phase::Ready } else { Phase::Starting };
                     }
                 }
             }
         }
+        left
     }
 
     // ----- stop-job -------------------------------------------------------------------------------------------------

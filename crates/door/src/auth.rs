@@ -403,8 +403,8 @@ pub struct Auth {
     ends_work: Mutex<Option<EndsWork>>,
 }
 
-/// Ends the work of the holders named, once their credentials are taken back.
-pub type EndsWork = Arc<dyn Fn(Vec<String>) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+/// Ends the work of the holders named, once their credentials are taken back, and answers what it could not end yet.
+pub type EndsWork = Arc<dyn Fn(Vec<String>) -> futures::future::BoxFuture<'static, Vec<String>> + Send + Sync>;
 
 /// Where a registration from `from` is counted: an IPv4 address alone, an IPv6 address by its /64 (one client holds
 /// a whole /64), every registration whose address the transport did not name in one place together, and loopback,
@@ -440,11 +440,13 @@ impl Auth {
         *self.ends_work.lock().unwrap() = Some(ends);
     }
 
-    /// Ends the work of the credentials `taken`, as the service said with [`Auth::when_taken_back`].
-    pub async fn end_work(&self, taken: &[Credential]) {
+    /// Ends the work of the credentials `taken`, as the service said with [`Auth::when_taken_back`], and answers what
+    /// it could not end yet.
+    pub async fn end_work(&self, taken: &[Credential]) -> Vec<String> {
         let ends = self.ends_work.lock().unwrap().clone();
-        if let Some(ends) = ends {
-            ends(taken.iter().map(Credential::holder).collect()).await;
+        match ends {
+            Some(ends) => ends(taken.iter().map(Credential::holder).collect()).await,
+            None => Vec::new(),
         }
     }
 

@@ -732,9 +732,13 @@ fn revoke(args: &[String]) {
             c["name"].as_str().unwrap_or("?"),
             c["holder"].as_str().unwrap_or("?"),
             c["issued_at"].as_str().unwrap_or("?"),
-            match answer["work_ended"].as_bool() {
-                Some(false) => "what it runs or has waiting is left as it is",
-                _ => "what it ran or had waiting is ended",
+            match (answer["work_ended"].as_bool(), answer["not_ended_yet"].as_array()) {
+                (Some(false), Some(left)) if !left.is_empty() => format!(
+                    "what it ran or had waiting is ended but for {}, which the container engine did not stop yet: the peer tries again until it does",
+                    left.iter().filter_map(|l| l.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+                (Some(false), _) => "what it runs or has waiting is left as it is".to_string(),
+                _ => "what it ran or had waiting is ended".to_string(),
             }
         );
     }
@@ -1456,6 +1460,132 @@ mod tests {
             );
         }
         assert_eq!(bed.query("get-workloads").await["jobs"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_credential_taken_back_ends_its_deployments_ready_or_starting_and_leaves_another_s() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let deploy = json!({ "model": "qwen3:0.6b", "engine": "ollama", "memory_bytes": 2 * GB });
+        let taken = key_with(&bed.app, Some("deploy"), None).await;
+        let other = key_with(&bed.app, Some("deploy"), None).await;
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &taken,
+            "d1",
+            "DeployModel",
+            "deploy-model",
+            deploy.clone(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let d1 = bed.events_of("d1", "DeploymentReady").await.last().unwrap().data["deployment"].clone();
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &other,
+            "o1",
+            "DeployModel",
+            "deploy-model",
+            deploy.clone(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        bed.events_of("o1", "DeploymentReady").await;
+        let gate = bed.runtime.hold_pulls();
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &taken,
+            "d2",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "qwen3:1.7b", "engine": "ollama", "memory_bytes": 2 * GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+
+        assert_eq!(revoke_by_operator(&bed, &taken, false).await["work_ended"], true);
+        let ended = bed
+            .events_of("d1", "DeploymentEnded")
+            .await
+            .last()
+            .unwrap()
+            .data
+            .clone();
+        assert_eq!(
+            (&ended["deployment"], ended["reason"].as_str()),
+            (&d1, Some(lifecycle::TAKEN_BACK))
+        );
+        gate.add_permits(100);
+        let starting = bed.events_of("d2", "DeploymentEnded").await;
+        assert!(
+            types(&starting).contains(&"DeploymentStarted".to_string()),
+            "{:?}",
+            types(&starting)
+        );
+        assert!(
+            !types(&starting).contains(&"DeploymentReady".to_string()),
+            "never served: {:?}",
+            types(&starting)
+        );
+        assert_eq!(starting.last().unwrap().data["reason"], lifecycle::TAKEN_BACK);
+        assert!(
+            types(&bed.log_of("o1")).iter().all(|t| t != "DeploymentEnded"),
+            "another key's deployment serves on"
+        );
+        assert_eq!(
+            bed.query("get-workloads").await["deployments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_the_engine_does_not_stop_when_its_credential_is_taken_back_is_named_and_stopped_at_a_later_step() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let taken = key_with(&bed.app, Some("jobs"), None).await;
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &taken,
+            "j1",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "memory_bytes": 2 * GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let job = bed.events_of("j1", "JobStarted").await.last().unwrap().data["job"].clone();
+        bed.runtime.refuse_stops(Some("the engine does not answer"));
+        let answer = revoke_by_operator(&bed, &taken, false).await;
+        assert_eq!(answer["work_ended"], false, "{answer}");
+        assert_eq!(answer["not_ended_yet"], json!([job]), "{answer}");
+        assert!(types(&bed.log_of("j1")).iter().all(|t| t != "JobStopped"));
+        assert_eq!(
+            bed.query("get-workloads").await["jobs"][0]["job"],
+            job,
+            "left as it was, running"
+        );
+        bed.runtime.refuse_stops(None);
+        bed.peer.step(time::OffsetDateTime::now_utc()).await;
+        let stopped = bed.events_of("j1", "JobStopped").await;
+        assert_eq!(
+            stopped.last().unwrap().data,
+            json!({ "job": job, "reason": lifecycle::TAKEN_BACK })
+        );
     }
 
     #[tokio::test]
