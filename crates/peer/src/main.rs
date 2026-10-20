@@ -17,6 +17,7 @@ mod holdings;
 mod lifecycle;
 mod member;
 mod menu;
+mod meter;
 mod state;
 mod tls;
 mod transport;
@@ -2019,6 +2020,388 @@ mod tests {
             .await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         assert_eq!(again.events(&ws, "w2", "JobQueued").await[0]["data"]["waiting"], true);
+    }
+
+    // ----- metering and the spending cap -----------------------------------------------------------------------------
+
+    /// A cloud `lab` of one member with one 24 GiB card, held whole, selling `small` at `price` a second in EUR.
+    async fn priced_site(price: f64) -> (Site, String) {
+        let a = member_with("Card A", 24, "12.4", best_peer_gpu::Slicing::None).await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let menu = json!({ "cloud": "lab", "currency": "EUR", "sizes": [
+            { "name": "small", "memory_bytes": 8 * GB, "compute": { "api": "cuda", "version": "12" }, "share": 0.5, "price_per_second": price }
+        ] });
+        let (s, b) = site.send(&ws, "m1", "SetMenu", "set-menu", menu).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "m1", "MenuSetV1").await;
+        (site, ws)
+    }
+
+    impl Site {
+        async fn usage(&self, ws: &str, params: &str) -> Value {
+            let (s, b) = get_as(
+                &self.app,
+                &format!("/workspaces/{ws}"),
+                &self.key,
+                &format!("/queries/get-usage{params}"),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+            b
+        }
+
+        /// Orders `small` with `more` merged in, answering the status and the body.
+        async fn order_small(&self, ws: &str, id: &str, more: Value) -> (StatusCode, Value) {
+            let mut data = json!({ "cloud": "lab", "image": "busybox", "size": "small" });
+            for (k, v) in more.as_object().into_iter().flatten() {
+                data[k] = v.clone();
+            }
+            self.send(ws, id, "RunJob", "run-job", data).await
+        }
+    }
+
+    #[tokio::test]
+    async fn get_usage_reads_each_job_by_size_from_its_start_to_its_end_at_the_receipts_price() {
+        let (site, ws) = priced_site(0.5).await;
+        let (s, b) = site.order_small(&ws, "j1", json!({ "deadline_seconds": 3600 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let started = site.events(&ws, "j1", "JobStarted").await;
+        let order = started.last().unwrap()["data"]["order"].as_str().unwrap().to_string();
+        let running = site.usage(&ws, "").await;
+        assert_eq!(running["jobs"][0]["running"], true, "{running}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (s, b) = site
+            .send(&ws, "s1", "StopJob", "stop-job", json!({ "job": order }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "s1", "JobStopped").await;
+
+        let u = site.usage(&ws, &format!("?job={order}")).await;
+        let j = &u["jobs"][0];
+        assert_eq!(u["jobs"].as_array().unwrap().len(), 1, "{u}");
+        assert_eq!(
+            (j["size"].clone(), j["currency"].clone(), j["running"].clone()),
+            (json!("small"), json!("EUR"), json!(false))
+        );
+        assert_eq!(
+            (j["gpu"].clone(), j["device"].clone()),
+            (json!("Card A"), json!("lab/a/gpu-0"))
+        );
+        assert_eq!(j["factor"], 1.0, "a device held whole is not contended");
+        let seconds = j["seconds"].as_f64().unwrap();
+        assert!(seconds >= 0.05, "{j}");
+        assert!((j["cost"].as_f64().unwrap() - seconds * 0.5).abs() < 1e-3, "{j}");
+        assert_eq!(j["intervals"][0]["price_per_second"], 0.5);
+        assert_eq!(u["totals"][0]["currency"], "EUR");
+        // Another cloud's, and a window before the job, list nothing.
+        assert_eq!(site.usage(&ws, "?cloud=other").await["jobs"], json!([]));
+        assert_eq!(site.usage(&ws, "?to=2020-01-01T00:00:00Z").await["jobs"], json!([]));
+        let (s, e) = get_as(
+            &site.app,
+            &format!("/workspaces/{ws}"),
+            &site.key,
+            "/queries/get-usage?from=yesterday",
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "INVALID_PARAMETER");
+        // A window that ends before it begins is refused, never answered with nothing.
+        let (s, e) = get_as(
+            &site.app,
+            &format!("/workspaces/{ws}"),
+            &site.key,
+            "/queries/get-usage?from=2026-10-20T10:00:00Z&to=2026-10-20T09:00:00Z",
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(
+            (e["error"]["code"].clone(), e["error"]["details"]["parameter"].clone()),
+            (json!("INVALID_PARAMETER"), json!("from"))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_by_size_that_would_pass_the_workspaces_spending_cap_is_refused_when_it_is_taken() {
+        let (site, ws) = priced_site(0.5).await;
+        let (s, b) = site
+            .send(
+                &ws,
+                "c1",
+                "SetSpendingCap",
+                "set-spending-cap",
+                json!({ "amount": 100, "currency": "EUR" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "c1", "SpendingCapSetV1").await;
+
+        // Under a cap an order bounds its cost.
+        let (s, e) = site.order_small(&ws, "j0", json!({})).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "DEADLINE_NEEDED");
+        // 75 held by the first, 50 more would pass 100.
+        let (s, b) = site.order_small(&ws, "j1", json!({ "deadline_seconds": 150 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "j1", "JobStarted").await;
+        let (s, e) = site.order_small(&ws, "j2", json!({ "deadline_seconds": 100 })).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "SPENDING_CAP");
+        let d = &e["error"]["details"];
+        assert_eq!(
+            (d["cap"].as_f64(), d["most"].as_f64()),
+            (Some(100.0), Some(50.0)),
+            "{e}"
+        );
+        let (spent, held) = (d["spent"].as_f64().unwrap(), d["held"].as_f64().unwrap());
+        assert!(
+            (spent + held - 75.0).abs() < 1.0,
+            "the first order's most, spent or held: {e}"
+        );
+        assert!(
+            e["error"]["message"].as_str().unwrap().contains("set-spending-cap"),
+            "{e}"
+        );
+        // One that fits is taken, and waits its turn for the card.
+        let (s, b) = site.order_small(&ws, "j3", json!({ "deadline_seconds": 40 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let u = site.usage(&ws, "").await;
+        assert_eq!(
+            (u["cap"]["amount"].as_f64(), u["cap"]["currency"].clone()),
+            (Some(100.0), json!("EUR")),
+            "{u}"
+        );
+        assert!(
+            (u["cap"]["spent"].as_f64().unwrap() + u["cap"]["held"].as_f64().unwrap() - 95.0).abs() < 1.0,
+            "{u}"
+        );
+
+        // A cap in another currency than the menu's holds nothing to it.
+        let (s, b) = site
+            .send(
+                &ws,
+                "c2",
+                "SetSpendingCap",
+                "set-spending-cap",
+                json!({ "amount": 1000, "currency": "USD" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "c2", "SpendingCapSetV1").await;
+        let (s, e) = site.order_small(&ws, "j4", json!({ "deadline_seconds": 1 })).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "SPENDING_CAP_CURRENCY");
+        // An amount needs its currency; no amount clears the cap.
+        let (s, e) = site
+            .send(&ws, "c3", "SetSpendingCap", "set-spending-cap", json!({ "amount": 5 }))
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "INVALID_CAP");
+        let (s, b) = site
+            .send(
+                &ws,
+                "c4",
+                "SetSpendingCap",
+                "set-spending-cap",
+                json!({ "amount": null }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "c4", "SpendingCapSetV1").await;
+        let (s, b) = site.order_small(&ws, "j5", json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert!(site.usage(&ws, "").await.get("cap").is_none());
+    }
+
+    /// A member of `ws` other than its owner, approved for jobs alone: answers its key.
+    async fn joined(site: &Site, ws: &str) -> String {
+        let bob = key_with(&site.app, Some("jobs"), None).await;
+        let (_, w) = get_as(&site.app, "", &bob, "/queries/get-workspaces").await;
+        let bob_id = w["identity"].as_str().unwrap().to_string();
+        let (s, b) = send_as(
+            &site.app,
+            "",
+            &site.key,
+            "i1",
+            "InviteMember",
+            "invite-member",
+            json!({ "workspace": ws, "identity": bob_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        events_as(&site.app, "", &site.key, "i1", "MemberInvitedV1").await;
+        let (s, b) = send_as(
+            &site.app,
+            "",
+            &bob,
+            "a1",
+            "AcceptInvitation",
+            "accept-invitation",
+            json!({ "workspace": ws }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        events_as(&site.app, "", &bob, "a1", "MemberJoinedV1").await;
+        bob
+    }
+
+    #[tokio::test]
+    async fn a_member_reads_the_usage_of_its_own_jobs_and_only_the_owner_sets_the_cap() {
+        let (site, ws) = priced_site(0.5).await;
+        let prefix = format!("/workspaces/{ws}");
+        let bob = joined(&site, &ws).await;
+        // The owner's job, then bob's, which waits for the card.
+        let (s, b) = site.order_small(&ws, "j1", json!({ "deadline_seconds": 60 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let owners = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"]["order"].clone();
+        let (s, b) = send_as(
+            &site.app,
+            &prefix,
+            &bob,
+            "b1",
+            "RunJob",
+            "run-job",
+            json!({ "cloud": "lab", "image": "busybox", "size": "small", "deadline_seconds": 60 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        events_as(&site.app, &prefix, &bob, "b1", "JobQueued").await;
+        let (s, b) = site
+            .send(&ws, "s1", "StopJob", "stop-job", json!({ "job": owners }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let bobs = events_as(&site.app, &prefix, &bob, "b1", "JobStarted")
+            .await
+            .last()
+            .unwrap()["data"]["order"]
+            .clone();
+
+        let (s, mine) = get_as(&site.app, &prefix, &bob, "/queries/get-usage").await;
+        assert_eq!(s, StatusCode::OK, "{mine}");
+        let orders: Vec<Value> = mine["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["order"].clone())
+            .collect();
+        assert_eq!(orders, vec![bobs.clone()], "a member reads its own jobs: {mine}");
+        let every = site.usage(&ws, "").await;
+        assert_eq!(
+            every["jobs"].as_array().unwrap().len(),
+            2,
+            "the owner reads every one: {every}"
+        );
+
+        let (s, e) = send_as(
+            &site.app,
+            &prefix,
+            &bob,
+            "c1",
+            "SetSpendingCap",
+            "set-spending-cap",
+            json!({ "amount": 1, "currency": "EUR" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "FORBIDDEN");
+    }
+
+    #[tokio::test]
+    async fn the_cap_and_the_orders_it_counts_are_held_across_a_restart() {
+        let a = member_with("Card A", 24, "12.4", best_peer_gpu::Slicing::None).await;
+        let key_a = a.key.clone();
+        let data = Arc::new(tempfile::tempdir().unwrap());
+        let log = Arc::new(EventLog::ephemeral());
+        let first = site_over(
+            vec![(A, a)],
+            data.clone(),
+            log.clone(),
+            None,
+            Arc::new(Limits::default()),
+        )
+        .await;
+        let ws = first.workspace("c1", "Research").await;
+        first.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let menu = json!({ "cloud": "lab", "currency": "EUR", "sizes": [
+            { "name": "small", "memory_bytes": 8 * GB, "compute": { "api": "cuda", "version": "12" }, "share": 0.5, "price_per_second": 0.5 }
+        ] });
+        let (s, b) = first.send(&ws, "m1", "SetMenu", "set-menu", menu).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        first.events(&ws, "m1", "MenuSetV1").await;
+        let (s, b) = first
+            .send(
+                &ws,
+                "c1",
+                "SetSpendingCap",
+                "set-spending-cap",
+                json!({ "amount": 100, "currency": "EUR" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        first.events(&ws, "c1", "SpendingCapSetV1").await;
+        let (s, b) = first.order_small(&ws, "j1", json!({ "deadline_seconds": 150 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        first.events(&ws, "j1", "JobStarted").await;
+        let owner = first.key.clone();
+        let (auth, members) = (first.auth.clone(), first.members);
+        first.workspaces.get(&ws).unwrap().cloud_for_test("lab").halt();
+        drop(first.app);
+        drop(first.workspaces);
+        drop(first.switchboard);
+
+        let again = site_over(Vec::new(), data.clone(), log, Some(auth), Arc::new(Limits::default())).await;
+        again.switchboard.connect(A, members[0].app.clone());
+        let again = Site { key: owner, ..again };
+        // The cap is the log's, and the running order still holds what it may spend: 50 more would pass 100.
+        let (s, e) = again.order_small(&ws, "j2", json!({ "deadline_seconds": 100 })).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "SPENDING_CAP");
+        assert_eq!(again.usage(&ws, "").await["cap"]["amount"].as_f64(), Some(100.0));
+    }
+
+    #[tokio::test]
+    async fn a_job_on_a_member_lost_is_billed_to_the_last_moment_the_member_was_heard() {
+        let (site, ws) = priced_site(0.5).await;
+        let (s, b) = site.order_small(&ws, "j1", json!({ "deadline_seconds": 3600 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let job = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"]["job"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // The member says something later: the facts of a pull, on its stream.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (s, b) = site
+            .send(
+                &ws,
+                "p1",
+                "PullImage",
+                "pull-image",
+                json!({ "cloud": "lab", "image": "busybox" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "p1", "ImagePulled").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        site.down[A].store(true, std::sync::atomic::Ordering::SeqCst);
+        site.live_cloud(&ws, "lab").reconcile().await;
+        let lost = site.events(&ws, "lab/a", "PeerLost").await;
+        let heard = lost[0]["data"]["last_heard"].as_str().unwrap().to_string();
+        let u = site.usage(&ws, &format!("?job={job}")).await;
+        let j = &u["jobs"][0];
+        assert_eq!(j["end_inferred"], true, "{u}");
+        let ended = meter::parse_time(j["ended"].as_str().unwrap()).unwrap();
+        assert!(
+            ended >= meter::parse_time(&heard).unwrap(),
+            "billed to the member's last word at least: {u}"
+        );
+        assert!(j["seconds"].as_f64().unwrap() >= 0.05, "{u}");
+        let at_loss = meter::parse_time(lost[0]["time"].as_str().unwrap()).unwrap();
+        assert!(
+            ended + time::Duration::milliseconds(40) < at_loss,
+            "never to the loss: {u}"
+        );
     }
 
     // ----- forget ----------------------------------------------------------------------------------------------------
