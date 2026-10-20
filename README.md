@@ -118,8 +118,9 @@ ends without anyone remembering to take it back. To take a key back sooner, at y
 best-peer revoke <name>
 ```
 
-with the name it was approved under: every request carrying it is refused from then on, and an event stream it holds
-open ends within seconds. The agent can also give its key back itself, with the `revoke-agent` command.
+with the name it was approved under: every request carrying it is refused from then on, an event stream it holds
+open ends within seconds, and what it ran or had waiting on this peer ends with it (`--keep-running` leaves that as it
+is). The agent can also give its key back itself, with the `revoke-agent` command, which leaves its work running.
 `--accelerators-only` holds a key to the accelerators, never the host's CPU.
 
 A code waits ten minutes for you; the door holds at most five waiting from one client, sixteen from one address and 64 in all, and past that
@@ -595,8 +596,13 @@ that long (`8h`, `30m`, `2d`, or seconds; 366 days at most, and 8 hours at most 
 agent asks for when it cannot keep a secret: more is refused, never cut). `best-peer revoke <name>` takes a key back
 at once, by the connection name the agent signed in under or the holder id the events show, with the peer running
 and the same admin token; an agent takes back its own with the `revoke-agent` command, sent under it. Either way the
-key opens nothing from then on, on this door and every workspace door here, an event stream open under it ends
-within seconds, as one does when a key runs out, and what the key left running is the owner's to end. A revoke the
+key opens nothing from then on, on this door and every workspace door here, and an event stream open under it ends
+within seconds, as one does when a key runs out. A key you take back takes its work on this peer's own door with it:
+its orders that wait end before they start, its jobs are stopped and its deployments ended, each told with the reason
+that its credential was taken back, and a job that was starting is stopped as soon as it is told started;
+`best-peer revoke <name> --keep-running` leaves them as they are. A key that runs out, or one the agent gave back
+itself, leaves its work running, as an agent that ends its session after ordering a long run expects; what it left is
+the owner's to end. A revoke the
 disk did not keep says so: the key is closed until the peer restarts, and running the revoke again writes it. Every command document says which
 scope it needs. A command the key may not send is refused at ingest with `FORBIDDEN` and what it was approved for;
 a deploy or a job past the share with `SHARE_EXCEEDED`, what is held and the room left; a workload another key

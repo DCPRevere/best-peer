@@ -10,7 +10,7 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -398,7 +398,13 @@ pub struct Auth {
     pending: Mutex<HashMap<String, Pending>>,
     /// The scopes this door has, named by the service: what an approval may grant.
     scopes: Vec<String>,
+    /// What ends the work of the holders whose credentials the person at the machine takes back, when the service
+    /// says.
+    ends_work: Mutex<Option<EndsWork>>,
 }
+
+/// Ends the work of the holders named, once their credentials are taken back.
+pub type EndsWork = Arc<dyn Fn(Vec<String>) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
 /// Where a registration from `from` is counted: an IPv4 address alone, an IPv6 address by its /64 (one client holds
 /// a whole /64), every registration whose address the transport did not name in one place together, and loopback,
@@ -424,6 +430,21 @@ impl Auth {
             revocations: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
             scopes: Vec::new(),
+            ends_work: Mutex::new(None),
+        }
+    }
+
+    /// What ends a holder's work when the person at the machine takes its credential back: the service's waiting
+    /// orders, jobs and deployments of that holder.
+    pub fn when_taken_back(&self, ends: EndsWork) {
+        *self.ends_work.lock().unwrap() = Some(ends);
+    }
+
+    /// Ends the work of the credentials `taken`, as the service said with [`Auth::when_taken_back`].
+    pub async fn end_work(&self, taken: &[Credential]) {
+        let ends = self.ends_work.lock().unwrap().clone();
+        if let Some(ends) = ends {
+            ends(taken.iter().map(Credential::holder).collect()).await;
         }
     }
 

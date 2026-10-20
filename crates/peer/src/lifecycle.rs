@@ -116,6 +116,9 @@ const PROMPTS_AT_ONCE: usize = 16;
 /// told, and its exit is replayed once it is.
 const MAX_UNOWNED: usize = 64;
 
+/// Why a workload ended when whoever runs this peer took its credential back.
+pub const TAKEN_BACK: &str = "its credential was taken back by whoever runs this peer";
+
 pub struct Peer {
     pub gpu: Arc<dyn Gpu>,
     pub runtime: Arc<dyn Runtime>,
@@ -151,6 +154,9 @@ pub struct Peer {
     stopping: Mutex<std::collections::HashSet<String>>,
     /// The command behind each order, by the order's id: what completes the command.
     keys: Mutex<HashMap<String, String>>,
+    /// The holders whose credentials whoever runs this peer took back, ending their work: a job of theirs that was
+    /// starting meanwhile is stopped as soon as it is told started.
+    taken_back: Mutex<std::collections::HashSet<String>>,
     /// The commands admitted from a credential held to the accelerators, until the order is told.
     held_to_accelerators: Mutex<std::collections::HashSet<String>>,
     /// A job's inputs, outputs and disk, by its command's key, from admission to its start.
@@ -382,6 +388,7 @@ impl Peer {
             steps: tokio::sync::Mutex::new(()),
             starting: Mutex::new(std::collections::HashSet::new()),
             stopping: Mutex::new(std::collections::HashSet::new()),
+            taken_back: Mutex::new(std::collections::HashSet::new()),
             keys: Mutex::new(HashMap::new()),
             held_to_accelerators: Mutex::new(std::collections::HashSet::new()),
             pending_io: Mutex::new(HashMap::new()),
@@ -1758,8 +1765,97 @@ impl Peer {
                 self.tell(&em, "JobStarted", fact);
                 em.bind_workload(&id);
                 self.replay_unowned(&started.id).await;
+                let holder = reservation.holder.clone();
+                if self.taken_back.lock().unwrap().contains(&holder) {
+                    self.end_work_of(&[holder]).await;
+                }
             }
             Err(e) => fail(e.to_string(), fix_for_runtime(&e)),
+        }
+    }
+
+    // ----- a credential taken back ------------------------------------------------------------------------------------
+
+    /// Ends the work of `holders`, whose credentials whoever runs this peer took back: their orders that wait end
+    /// before they start, their jobs are stopped and their deployments ended, each told under its own correlation
+    /// with [`TAKEN_BACK`] as the reason. One that cannot be stopped now is left as it was and logged.
+    pub async fn end_work_of(&self, holders: &[String]) {
+        self.taken_back.lock().unwrap().extend(holders.iter().cloned());
+        let theirs = |h: &str| holders.iter().any(|x| x == h);
+        let (orders, jobs, deployments) = {
+            let mut s = self.state.lock().unwrap();
+            let orders: Vec<crate::state::Order> = s
+                .waiting()
+                .into_iter()
+                .filter(|o| theirs(&o.holder) && self.claim_end(&o.id).is_ok())
+                .collect();
+            let mut jobs = Vec::new();
+            for j in s.jobs.values_mut() {
+                if theirs(&j.holder) && j.phase == JobPhase::Running {
+                    j.phase = JobPhase::Stopping;
+                    jobs.push(j.clone());
+                }
+            }
+            let mut deployments = Vec::new();
+            for d in s.deployments.values_mut() {
+                if theirs(&d.holder) && d.phase != Phase::Ending {
+                    d.phase = Phase::Ending;
+                    deployments.push(d.clone());
+                }
+            }
+            (orders, jobs, deployments)
+        };
+        for o in orders {
+            self.tell(
+                &self.order_emitter(&o),
+                "JobStopped",
+                json!({ "job": o.id, "reason": TAKEN_BACK }),
+            );
+            self.stopping.lock().unwrap().remove(&o.id);
+        }
+        for j in jobs {
+            let em = match self.state.lock().unwrap().order_of_job(&j.id) {
+                Some(o) => self.order_emitter(&o),
+                None => self.emitter(&j.correlation),
+            };
+            match self.runtime.stop(&j.container).await {
+                Ok(()) | Err(RuntimeError::NoSuchContainer(_)) => {
+                    self.tell(&em, "JobStopped", json!({ "job": j.id, "reason": TAKEN_BACK }));
+                }
+                Err(e) => {
+                    tracing::warn!(job = %j.id, why = %e, "a job of a credential taken back could not be stopped");
+                    if let Some(x) = self.state.lock().unwrap().jobs.get_mut(&j.id) {
+                        x.phase = JobPhase::Running;
+                    }
+                }
+            }
+        }
+        for d in deployments {
+            if d.ready {
+                let unloaded = tokio::time::timeout(
+                    self.patience.unload,
+                    self.engine.unload(d.engine, &self.engine_base(d.port), &d.model),
+                )
+                .await;
+                if !matches!(unloaded, Ok(Ok(()))) {
+                    tracing::warn!(deployment = %d.id, "the engine did not unload the model; its container is stopped next");
+                }
+            }
+            match self.runtime.stop(&d.container).await {
+                Ok(()) | Err(RuntimeError::NoSuchContainer(_)) => {
+                    self.tell(
+                        &self.emitter(&d.correlation),
+                        "DeploymentEnded",
+                        json!({ "deployment": d.id, "model": d.model, "reason": TAKEN_BACK }),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(deployment = %d.id, why = %e, "a deployment of a credential taken back could not be ended");
+                    if let Some(x) = self.state.lock().unwrap().deployments.get_mut(&d.id) {
+                        x.phase = if x.ready { Phase::Ready } else { Phase::Starting };
+                    }
+                }
+            }
         }
     }
 
