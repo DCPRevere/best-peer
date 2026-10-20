@@ -154,6 +154,17 @@ impl Drop for Line {
 
 async fn require_key(State(door): State<Shared>, req: Request, next: Next) -> Response {
     let key = header_value(&req, AUTH_HEADER).unwrap_or_default();
+    // A collector's key opens /metrics and nothing else: no command, no query, no stream. Should it leak from where
+    // a collector keeps it, it opens nothing more.
+    if let Some(c) = door.auth.authenticate(&key) {
+        if crate::metrics::reads_only(&c.grant) {
+            return BestError::bad_request(
+                "FORBIDDEN",
+                "this credential was approved to read /metrics and nothing else: it sends no command and reads no query or event. Ask whoever controls the machine for a credential that may (best-peer approve <code> --may deploy, for one)",
+            )
+            .into_response();
+        }
+    }
     admit(&door, key, req, next).await
 }
 
@@ -480,13 +491,6 @@ async fn take_command(
     headers: HeaderMap,
     body: &Bytes,
 ) -> Result<Response, BestError> {
-    // A collector's key reads and sends nothing: should it leak from where it is kept, it can do nothing with it.
-    if crate::metrics::reads_only(&sender.grant) {
-        return Err(BestError::bad_request(
-            "FORBIDDEN",
-            "this credential was approved to read metrics and nothing else: it sends no command. Ask whoever controls the machine for a credential that may (best-peer approve <code> --may deploy, for one)",
-        ));
-    }
     let ct = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())

@@ -255,7 +255,7 @@ async fn families(peer: &Peer, who: &Credential) -> Vec<Family> {
             // Every phase, each 1 or 0, so a phase change moves a value rather than ending one series and starting
             // another.
             let now = d["phase"].as_str().unwrap_or_default();
-            for phase in ["starting", "ready", "ending"] {
+            for phase in crate::state::Phase::ALL.map(crate::state::Phase::name) {
                 dep_phase.sample(
                     &[("deployment", id), ("phase", phase)],
                     f64::from(u8::from(phase == now)),
@@ -281,7 +281,7 @@ async fn families(peer: &Peer, who: &Credential) -> Vec<Family> {
             let holder = j["holder"].as_str().unwrap_or_default();
             job_info.sample(&[("job", id), ("device", device), ("holder", holder)], 1.0);
             let now = j["phase"].as_str().unwrap_or_default();
-            for phase in ["running", "stopping", "storing"] {
+            for phase in crate::state::JobPhase::ALL.map(crate::state::JobPhase::name) {
                 job_phase.sample(&[("job", id), ("phase", phase)], f64::from(u8::from(phase == now)));
             }
             if let (true, Some(v)) = (j["device"].is_string(), j["memory_bytes"].as_f64()) {

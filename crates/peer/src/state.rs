@@ -19,6 +19,19 @@ pub enum Phase {
     Ending,
 }
 
+impl Phase {
+    pub const ALL: [Phase; 3] = [Phase::Starting, Phase::Ready, Phase::Ending];
+
+    /// Its name, as `get-workloads` and `/metrics` say it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Phase::Starting => "starting",
+            Phase::Ready => "ready",
+            Phase::Ending => "ending",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Deployment {
     pub id: String,
@@ -57,6 +70,19 @@ pub enum JobPhase {
     Stopping,
     /// It exited, and what it left under /out is being stored: its end, JobFinished or JobFailed, follows.
     Storing,
+}
+
+impl JobPhase {
+    pub const ALL: [JobPhase; 3] = [JobPhase::Running, JobPhase::Stopping, JobPhase::Storing];
+
+    /// Its name, as `get-workloads` and `/metrics` say it.
+    pub fn name(self) -> &'static str {
+        match self {
+            JobPhase::Running => "running",
+            JobPhase::Stopping => "stopping",
+            JobPhase::Storing => "storing",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

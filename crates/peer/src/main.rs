@@ -219,11 +219,12 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
     .with_partition(workspace::Workspaces::root_partition(peer.log.clone()))
     .with_limits(ctx.limits.clone())
     .with_metrics(metrics::source(peer))
-    // The membership facts are their identities' alone (the root's partition): no count of them tells anyone more.
+    // What the root's partition shows no credential, whatever its grant (a workspace's membership, a membership
+    // command's failure), and the membership commands themselves: no count of them tells anyone more.
     .with_uncounted(Arc::new(|r#type: &str, data: &serde_json::Value| {
-        domain::MEMBERSHIP_EVENTS.contains(&r#type)
+        domain::is_membership_fact(r#type)
+            || domain::is_membership_failure(r#type, data)
             || domain::MEMBERSHIP_COMMANDS.contains(&r#type)
-            || (r#type == "CommandFailed" && domain::MEMBERSHIP_COMMANDS.contains(&data["type"].as_str().unwrap_or_default()))
     }))
 }
 
@@ -9861,12 +9862,15 @@ mod tests {
             (StatusCode::BAD_REQUEST, Some("FORBIDDEN")),
             "{b}"
         );
-        let (_, events) = get_as(&bed.app, "", &collector, "/events").await;
-        assert_eq!(
-            events["events"],
-            json!([]),
-            "the metrics scope reads no one's events: {events}"
-        );
+        // It opens /metrics alone: no events, no stream, no query, should it leak from the collector's configuration.
+        for path in ["/events", "/events/stream", "/queries/get-hardware-state"] {
+            let (s, b) = get_as(&bed.app, "", &collector, path).await;
+            assert_eq!(
+                (s, b["error"]["code"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("FORBIDDEN")),
+                "{path}: {b}"
+            );
+        }
         let (s, b) = send_as(
             &bed.app,
             "",
@@ -9918,7 +9922,11 @@ mod tests {
             "{text}"
         );
 
-        // A refusal is counted by its command and code, a type the door does not know under one name.
+        // A refusal is counted by its command and code, a type the door does not know under one name. (The
+        // collector's own were refused at the door, before its intake, as a missing key is: those are not counted.)
+        let deploy = json!({ "model": "m", "engine": "ollama", "memory_bytes": GB });
+        let (s, _) = send_as(&bed.app, "", &other, "x5", "DeployModel", "deploy-model", deploy).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
         let (s, _) = send_as(&bed.app, "", &bed.key, "x3", "NoSuchThing", "no-such-thing", json!({})).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         let m = parsed(&scrape(&bed.app, Some(&collector), false, None).await.2);

@@ -1324,5 +1324,10 @@ mod tests {
             again.counts_by_type(kept),
             BTreeMap::from([("A".into(), 2), ("B".into(), 2)])
         );
+        // A log longer than one hold of its lock counts is counted whole, each event once.
+        for _ in 0..5000 {
+            tell(&again, "A");
+        }
+        assert_eq!(again.counts_by_type(kept)["A"], 5002);
     }
 }

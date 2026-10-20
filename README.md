@@ -348,8 +348,8 @@ is in it, only counts. A workspace's door serves none: it fronts other machines.
 A key reads there what it reads elsewhere: every card's series, unless it is held to the accelerators, when it sees
 no CPU; its own deployments and jobs, unless it was approved for all. A key approved `--may metrics` is what a
 collector holds: it reads every holder's workloads, with their holder ids, and the door's own counts, and may do
-nothing else: every command it sends is refused, and it reads no one's events, so a key that leaks from a
-collector's configuration opens nothing. The door's counts leave out what no key reads at the root, who made a
+nothing else: every other path refuses it, commands, queries and events alike, so a key that leaks from a
+collector's configuration opens nothing more. The door's counts leave out what no key reads at the root, who made a
 workspace and who joined one. The series, every one named `best_peer_…` in base units:
 
 | Series | Labels | What |

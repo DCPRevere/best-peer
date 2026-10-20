@@ -224,6 +224,16 @@ pub const MEMBERSHIP_EVENTS: &[&str] = &[
 /// The commands that change a workspace's membership, whose failures are their sender's alone to read.
 pub const MEMBERSHIP_COMMANDS: &[&str] = &["CreateWorkspace", "InviteMember", "AcceptInvitation", "LeaveWorkspace"];
 
+/// A fact about a workspace's membership, which at the root only the identities it names read.
+pub fn is_membership_fact(r#type: &str) -> bool {
+    MEMBERSHIP_EVENTS.contains(&r#type)
+}
+
+/// The failure of a membership command, which at the root only its sender reads.
+pub fn is_membership_failure(r#type: &str, data: &serde_json::Value) -> bool {
+    r#type == "CommandFailed" && MEMBERSHIP_COMMANDS.contains(&data["type"].as_str().unwrap_or_default())
+}
+
 /// The facts that are a workspace's own, which every member of it reads whatever their grant: its membership, its
 /// clouds and its peers. What a workload's holder alone reads stays the lifecycle's rule.
 pub const WORKSPACE_EVENTS: &[&str] = &[
@@ -260,7 +270,7 @@ pub const NAME_SHAPE: &str =
 fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
     let description = match at {
         Where::Root => "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power, utilisation and the energy it has used, the isolation a workload on it gets, and the driver. Read it before deploying: a model needs an API the device offers and memory it has free; get-workloads says what already holds memory.",
-        Where::Workspace => "The accelerators of this workspace's clouds right now: every device of every peer that answers in a cloud that is not archived, named cloud/peer/device, with the cloud and the peer on each, its compute APIs with their versions, its memory total and free (less what the peer has promised), temperature, power and utilisation, and the isolation a workload on it gets as its peer says (process for a peer that says nothing); and peers, every member of every cloud with whether it answers (up), has not admitted the cloud yet (joining) or does not answer (unreachable). Read it before deploying: a model needs an API a device offers and memory it has free; get-workloads says what already holds memory.",
+        Where::Workspace => "The accelerators of this workspace's clouds right now: every device of every peer that answers in a cloud that is not archived, named cloud/peer/device, with the cloud and the peer on each, its compute APIs with their versions, its memory total and free (less what the peer has promised), temperature, power, utilisation and the energy it has used, and the isolation a workload on it gets as its peer says (process for a peer that says nothing); and peers, every member of every cloud with whether it answers (up), has not admitted the cloud yet (joining) or does not answer (unreachable). Read it before deploying: a model needs an API a device offers and memory it has free; get-workloads says what already holds memory.",
     };
     let mut device_properties = json!({
         "id": { "type": "string", "description": "Stable device id, the value a command names a device by" },
