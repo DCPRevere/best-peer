@@ -281,8 +281,13 @@ impl Layers {
 }
 
 impl DockerRuntime {
-    /// The same engine, making jobs' disks under `dir`.
+    /// The same engine, making jobs' disks under `dir`, when this peer can mount them: a peer that cannot makes none,
+    /// so a job asking for one is refused at admission and no room is ever reserved for a disk that cannot be made.
     pub fn with_disks(mut self, dir: std::path::PathBuf) -> Self {
+        if let Err(why) = can_mount() {
+            tracing::warn!(dir = %dir.display(), %why, "this peer makes no disk for a job");
+            return self;
+        }
         self.disks = Some(dir);
         self
     }
@@ -481,16 +486,7 @@ impl Runtime for DockerRuntime {
             .stdout
             .take()
             .map(|mut out| std::io::Read::read_to_string(&mut out, &mut text));
-        let mut numbers = text
-            .lines()
-            .nth(1)
-            .unwrap_or_default()
-            .split_whitespace()
-            .filter_map(|n| n.parse::<u64>().ok());
-        match (numbers.next(), numbers.next()) {
-            (Some(free), Some(total)) => Some((free, total)),
-            _ => failed(format!("df answered what does not read as room: {text:?}")),
-        }
+        room_in(&text).or_else(|| failed(format!("df answered what does not read as room: {text:?}")))
     }
 
     /// A container, or a user namespace when the engine runs rootless or remaps its users, as its own `info` says.
@@ -700,10 +696,93 @@ fn handed_over(id: &str) -> Result<DeviceRequest, RuntimeError> {
     })
 }
 
+/// The room for disks in what `df --output=avail,size` answered: what is free less what is kept free, and the size.
+fn room_in(df: &str) -> Option<(u64, u64)> {
+    let mut numbers = df
+        .lines()
+        .nth(1)
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|n| n.parse::<u64>().ok());
+    let (free, total) = (numbers.next()?, numbers.next()?);
+    Some((free.saturating_sub(kept_free(total)), total))
+}
+
+/// What a disk is never promised of the file system it is made on: 1 GiB, or a twentieth of it when that is more, so
+/// the peer's own log and the engine can always still write there.
+fn kept_free(total: u64) -> u64 {
+    (total / 20).max(1 << 30)
+}
+
+/// Whether this process can mount a disk: the capability to mount, and the loop devices to mount one on. Linux only.
+fn can_mount() -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        return Err("a job's disk is a file system on a loop device, which this peer makes on Linux only".into());
+    }
+    let status =
+        std::fs::read_to_string("/proc/self/status").map_err(|e| format!("cannot read its own status: {e}"))?;
+    if !may_mount(&status) {
+        return Err(
+            "it lacks the capability to mount (CAP_SYS_ADMIN), which a peer that is not run as root has not".into(),
+        );
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/loop-control")
+        .map(|_| ())
+        .map_err(|e| format!("it cannot reach the loop devices (/dev/loop-control: {e})"))
+}
+
+/// Whether the effective capabilities in a `/proc/<pid>/status` text hold CAP_SYS_ADMIN.
+fn may_mount(status: &str) -> bool {
+    const CAP_SYS_ADMIN: u32 = 21;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        .is_some_and(|caps| caps & (1 << CAP_SYS_ADMIN) != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_disk_is_never_promised_the_last_of_its_file_system() {
+        assert_eq!(kept_free(10 << 30), 1 << 30, "a small one keeps 1 GiB");
+        assert_eq!(
+            kept_free(60 << 30),
+            3 << 30,
+            "the host's 60 GiB volume keeps a twentieth"
+        );
+        assert_eq!(kept_free(0), 1 << 30);
+        let df = |free: u64, total: u64| format!("    Avail     1B-blocks\n{free:>9} {total:>13}\n");
+        assert_eq!(room_in(&df(50 << 30, 60 << 30)), Some((47 << 30, 60 << 30)));
+        assert_eq!(
+            room_in(&df(2 << 30, 60 << 30)),
+            Some((0, 60 << 30)),
+            "nothing past the kept room"
+        );
+        assert_eq!(room_in("Avail 1B-blocks\n"), None);
+    }
+
+    #[test]
+    fn a_peer_mounts_only_with_the_capability_to() {
+        let status = |caps: &str| {
+            format!("Name:\tbest-peer\nCapInh:\t0000000000000000\nCapEff:\t{caps}\nCapBnd:\t000001ffffffffff\n")
+        };
+        assert!(may_mount(&status("000001ffffffffff")), "root");
+        assert!(may_mount(&status("0000000000200000")), "CAP_SYS_ADMIN alone");
+        assert!(
+            !may_mount(&status("0000000000000000")),
+            "a user, or a unit with no capabilities"
+        );
+        assert!(!may_mount(&status("00000000001fffff")), "every capability below it");
+        assert!(!may_mount("Name:\tbest-peer\n"), "no line, no capability");
+        assert!(!may_mount(&status("not hex")));
+    }
 
     #[test]
     fn a_whole_card_and_a_mig_instance_are_handed_over_by_their_uuid_and_nothing_else_is() {

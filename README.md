@@ -263,7 +263,10 @@ outside any container (an installed Ollama; no jobs), `fake` serves the whole su
 (what CI runs).
 A job's disk, for its inputs and outputs, is a file system of its own on a loop device, capped at its size and
 allocated whole when it is made (16 MiB at least), under `disks/` in the data folder. The peer makes it where Docker
-runs on Linux, and needs root to mount it; anywhere else a job with inputs or outputs is refused (`NO_DISK`). At
+runs on Linux and it can mount one: run as root, or with the capability to mount and the loop devices. A peer that
+cannot says so at start and makes none, so anywhere else a job with inputs or outputs is refused (`NO_DISK`) before
+any room is reserved. A disk is never promised the last of its file system: 1 GiB, or a twentieth of it when that is
+more, stays free for the peer's own log and the engine, and the room `get-hardware-state` tells is what is left. At
 start the peer removes every disk there that no running job has, such as one whose job ended while it was down. Its inputs are fetched and its outputs sent over `https://`
 only; `BEST_PEER_STORE_CLEARTEXT=loopback` also allows a store on this machine's loopback over `http://`, for a test
 or a developer's own store, on the cloud's door and on its members alike.
