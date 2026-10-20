@@ -40,6 +40,8 @@ pub struct DockerRuntime {
     tx: broadcast::Sender<Event>,
     /// Where jobs' disks are made: each a file system of its own on a loop device, capped at the size asked for.
     disks: Option<std::path::PathBuf>,
+    /// Whether this peer can mount a disk there; one that cannot makes none, and still clears what is left there.
+    mounts: bool,
 }
 
 impl DockerRuntime {
@@ -58,6 +60,7 @@ impl DockerRuntime {
             bind_ip: bind_ip.into(),
             tx,
             disks: None,
+            mounts: false,
         };
         sweep(&me.docker, &me.exited).await;
         me.follow();
@@ -284,10 +287,13 @@ impl DockerRuntime {
     /// The same engine, making jobs' disks under `dir`, when this peer can mount them: a peer that cannot makes none,
     /// so a job asking for one is refused at admission and no room is ever reserved for a disk that cannot be made.
     pub fn with_disks(mut self, dir: std::path::PathBuf) -> Self {
-        if let Err(why) = can_mount() {
-            tracing::warn!(dir = %dir.display(), %why, "this peer makes no disk for a job");
-            return self;
-        }
+        self.mounts = match can_mount() {
+            Ok(()) => true,
+            Err(why) => {
+                tracing::warn!(dir = %dir.display(), %why, "this peer makes no disk for a job");
+                false
+            }
+        };
         self.disks = Some(dir);
         self
     }
@@ -345,13 +351,18 @@ impl Runtime for DockerRuntime {
     /// A file system of its own for the job `id`: an ext4 file of `bytes`, allocated whole so the room it takes is
     /// taken now, on a loop device mounted under the disks' directory. It has no journal, which a disk that lives as
     /// long as its job does not need, and keeps nothing for root, so the job has all of it. Linux only, and the peer
-    /// needs root to mount.
+    /// needs the capability to mount and the loop devices.
     async fn make_disk(&self, id: &str, bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
         let Some(dir) = self.disks.clone() else {
             return Err(RuntimeError::NoDisk(
                 "this peer makes no disk for a job: it was started without a place for them".into(),
             ));
         };
+        if !self.mounts {
+            return Err(RuntimeError::NoDisk(
+                "this peer makes no disk for a job: it cannot mount one, as its log said at start".into(),
+            ));
+        }
         if !cfg!(target_os = "linux") {
             return Err(RuntimeError::NoDisk(
                 "a job's disk is a file system on a loop device, which this peer makes on Linux only".into(),
@@ -372,7 +383,7 @@ impl Runtime for DockerRuntime {
             let (img, mnt) = (image.to_string_lossy().to_string(), mount.to_string_lossy().to_string());
             run("mkfs.ext4", &["-q", "-F", "-m", "0", "-O", "^has_journal", &img])?;
             run("mount", &["-o", "loop", &img, &mnt]).map_err(|e| {
-                RuntimeError::NoDisk(format!("{e}; a job's disk is mounted by the peer, which needs root"))
+                RuntimeError::NoDisk(format!("{e}; a job's disk is mounted by the peer, which needs the capability to mount (CAP_SYS_ADMIN) and the loop devices"))
             })?;
             // Whoever the job's image runs as writes there.
             run("chmod", &["0777", &mnt])?;
@@ -401,7 +412,7 @@ impl Runtime for DockerRuntime {
     }
 
     fn makes_disks(&self) -> bool {
-        self.disks.is_some() && cfg!(target_os = "linux")
+        self.disks.is_some() && self.mounts && cfg!(target_os = "linux")
     }
 
     fn disks(&self) -> Vec<String> {
@@ -436,7 +447,7 @@ impl Runtime for DockerRuntime {
     }
 
     fn disk_room(&self) -> Option<(u64, u64)> {
-        let dir = self.disks.clone()?;
+        let dir = self.disks.clone().filter(|_| self.mounts)?;
         if !cfg!(target_os = "linux") {
             return None;
         }
@@ -696,7 +707,8 @@ fn handed_over(id: &str) -> Result<DeviceRequest, RuntimeError> {
     })
 }
 
-/// The room for disks in what `df --output=avail,size` answered: what is free less what is kept free, and the size.
+/// The room for disks in what `df --output=avail,size` answered: what is free and the size, each less what is kept
+/// free, so the size is the largest disk that could ever be made there.
 fn room_in(df: &str) -> Option<(u64, u64)> {
     let mut numbers = df
         .lines()
@@ -705,7 +717,8 @@ fn room_in(df: &str) -> Option<(u64, u64)> {
         .split_whitespace()
         .filter_map(|n| n.parse::<u64>().ok());
     let (free, total) = (numbers.next()?, numbers.next()?);
-    Some((free.saturating_sub(kept_free(total)), total))
+    let kept = kept_free(total);
+    Some((free.saturating_sub(kept), total.saturating_sub(kept)))
 }
 
 /// What a disk is never promised of the file system it is made on: 1 GiB, or a twentieth of it when that is more, so
@@ -759,12 +772,13 @@ mod tests {
         );
         assert_eq!(kept_free(0), 1 << 30);
         let df = |free: u64, total: u64| format!("    Avail     1B-blocks\n{free:>9} {total:>13}\n");
-        assert_eq!(room_in(&df(50 << 30, 60 << 30)), Some((47 << 30, 60 << 30)));
+        assert_eq!(room_in(&df(50 << 30, 60 << 30)), Some((47 << 30, 57 << 30)));
         assert_eq!(
             room_in(&df(2 << 30, 60 << 30)),
-            Some((0, 60 << 30)),
+            Some((0, 57 << 30)),
             "nothing past the kept room"
         );
+        assert_eq!(room_in(&df(0, 0)), Some((0, 0)));
         assert_eq!(room_in("Avail 1B-blocks\n"), None);
     }
 
