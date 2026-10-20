@@ -2362,6 +2362,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forget_leaves_what_get_usage_reads_as_it_was() {
+        let (site, ws) = priced_site(0.5).await;
+        // A job by size runs and ends, then a model is deployed on the card and prompted.
+        let (s, b) = site.order_small(&ws, "j1", json!({ "deadline_seconds": 3600 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let order = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"]["order"].clone();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (s, b) = site
+            .send(&ws, "s1", "StopJob", "stop-job", json!({ "job": order }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "s1", "JobStopped").await;
+        let (s, b) = site.deploy(&ws, "d1", Some("lab"), 4, None).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let dep = site.events(&ws, "d1", "DeploymentReady").await.last().unwrap()["data"]["deployment"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let prefix = format!("/workspaces/{ws}");
+        prompt_under(&site.app, &prefix, &site.key, "p1", "chat", &dep, "a secret").await;
+        let answered = site.events(&ws, "chat", "PromptAnswered").await.last().unwrap()["data"].clone();
+
+        // One window, read before and after: the meter is the same, and what the prompt used stays on its event.
+        // Under a cap, so what was spent and what is held are read across the forget too.
+        let (s, b) = site
+            .send(
+                &ws,
+                "c1",
+                "SetSpendingCap",
+                "set-spending-cap",
+                json!({ "amount": 100, "currency": "EUR" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "c1", "SpendingCapSetV1").await;
+        // An order open across the forget, waiting for the card the deployment holds: it holds 50 of the cap.
+        let (s, b) = site.order_small(&ws, "j2", json!({ "deadline_seconds": 100 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(site.events(&ws, "j2", "JobQueued").await[0]["data"]["waiting"], true);
+        let window = format!("?to={}", meter::text(time::OffsetDateTime::now_utc()));
+        let before = site.usage(&ws, &window).await;
+        assert_eq!(before["jobs"].as_array().unwrap().len(), 1, "{before}");
+        assert!(before["cap"]["spent"].as_f64().unwrap() > 0.0, "{before}");
+        assert_eq!(before["cap"]["held"].as_f64(), Some(50.0), "{before}");
+        let (s, b) = site
+            .send(&ws, "f1", "Forget", "forget", json!({ "correlation": "chat" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "f1", "Forgotten").await;
+        assert_eq!(
+            site.usage(&ws, &window).await,
+            before,
+            "forget changes nothing get-usage reads"
+        );
+        let forgotten = site.events(&ws, "chat", "PromptAnswered").await.last().unwrap()["data"].clone();
+        assert_eq!(forgotten["forgotten"], true, "{forgotten}");
+        assert!(forgotten.get("content").is_none(), "{forgotten}");
+        for counted in ["prompt_tokens", "completion_tokens", "deployment", "model"] {
+            assert_eq!(forgotten[counted], answered[counted], "{counted} is kept");
+        }
+    }
+
+    #[tokio::test]
     async fn a_job_on_a_member_lost_is_billed_to_the_last_moment_the_member_was_heard() {
         let (site, ws) = priced_site(0.5).await;
         let (s, b) = site.order_small(&ws, "j1", json!({ "deadline_seconds": 3600 })).await;
