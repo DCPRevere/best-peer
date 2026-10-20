@@ -241,10 +241,11 @@ pub const WORKSPACE_EVENTS: &[&str] = &[
 ];
 
 /// What a credential may be approved for: `deploy` models (pull, deploy, undeploy), run `jobs` (run, stop), `prompt`
-/// a ready deployment; `all` is every scope and every holder's workloads, what a credential approved with nothing
-/// said is. Reading the hardware and its own workloads and events is every credential's, as is creating a workspace
-/// and acting in the ones it belongs to.
-pub const SCOPES: &[&str] = &["deploy", "jobs", "prompt"];
+/// a ready deployment, read the whole door's `metrics` (every holder's workloads among them, and the door's own
+/// counts) and do nothing else, which is what a collector is approved for; `all` is every scope and every holder's
+/// workloads, what a credential approved with nothing said is. Reading the hardware and its own workloads and
+/// events is every credential's, as is creating a workspace and acting in the ones it belongs to.
+pub const SCOPES: &[&str] = &["deploy", "jobs", "prompt", best_peer_door::metrics::METRICS_SCOPE];
 
 /// `^[a-z0-9][a-z0-9-]{0,63}$`: the shape of a cloud's name and a peer's name in a cloud, so that each composes
 /// into a device id (`cloud/peer/device`) and into the connection name a cloud signs in to its members under.
@@ -316,13 +317,15 @@ fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
 
 fn workloads_query(peer: Arc<dyn Service>, at: Where) -> QueryDef {
     let description = match at {
-        Where::Root => "What this peer runs for you now: each deployment with its model, engine, device, the memory promised to it, its phase (starting, ready, ending); each job with its image, device and phase (running, stopping, or storing: it exited and its outputs are being sent); queued, the orders of this peer's queue that wait for room, oldest first; and held_bytes, the device memory your workloads hold together on this door, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
-        Where::Workspace => "What this workspace runs for you now, across its clouds: each deployment with its cloud, the peer it is on, its model, engine, device (cloud/peer/device), the memory promised to it, its phase (starting, ready, ending); each job with its cloud, peer, image, device and phase (running, stopping, or storing: it exited and its outputs are being sent); queued, the orders not started yet, oldest first, each with its id (what stop-job names while it waits), its cloud, image and memory, whether it waits or the peer it was sent to, its attempt and when it was queued; and held_bytes, the device memory your workloads hold together on this door, every workspace counted, orders that wait included, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
+        Where::Root => "What this peer runs for you now: each deployment with its model, engine, device, the memory promised to it, its phase (starting, ready, ending) and its prompts so far (answered and failed, and the tokens the engine counted for the answered ones); each job with its image, device and phase (running, stopping, or storing: it exited and its outputs are being sent); queued, the orders of this peer's queue that wait for room, oldest first; and held_bytes, the device memory your workloads hold together on this door, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
+        Where::Workspace => "What this workspace runs for you now, across its clouds: each deployment with its cloud, the peer it is on, its model, engine, device (cloud/peer/device), the memory promised to it, its phase (starting, ready, ending) and its prompts so far (answered and failed, and the tokens the engine counted for the answered ones); each job with its cloud, peer, image, device and phase (running, stopping, or storing: it exited and its outputs are being sent); queued, the orders not started yet, oldest first, each with its id (what stop-job names while it waits), its cloud, image and memory, whether it waits or the peer it was sent to, its attempt and when it was queued; and held_bytes, the device memory your workloads hold together on this door, every workspace counted, orders that wait included, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
     };
     let mut deployment = json!({
         "deployment": { "type": "string" }, "model": { "type": "string" }, "engine": { "type": "string", "enum": ["ollama", "vllm"] },
         "device": { "type": "string" }, "memory_bytes": { "type": "integer" }, "holder": { "type": "string", "description": "The credential that deployed it, an opaque id" },
-        "phase": { "type": "string", "enum": ["starting", "ready", "ending"] }
+        "phase": { "type": "string", "enum": ["starting", "ready", "ending"] },
+        "prompts": { "type": "object", "description": "Its prompts so far: answered and failed, and the tokens the engine counted for the answered ones",
+            "properties": { "answered": { "type": "integer" }, "failed": { "type": "integer" }, "prompt_tokens": { "type": "integer" }, "completion_tokens": { "type": "integer" } } }
     });
     let mut job = json!({
         "job": { "type": "string" }, "image": { "type": "string" }, "device": { "type": ["string", "null"] },

@@ -18,6 +18,7 @@ mod lifecycle;
 mod member;
 mod menu;
 mod meter;
+mod metrics;
 mod queue;
 mod state;
 mod store;
@@ -217,6 +218,7 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
     .with_tenants(&ctx.manifest_template())
     .with_partition(workspace::Workspaces::root_partition(peer.log.clone()))
     .with_limits(ctx.limits.clone())
+    .with_metrics(metrics::source(peer))
 }
 
 /// What the workspaces of this door are built with: the root's endpoint and credentials, the data directory, the
@@ -6290,6 +6292,7 @@ mod tests {
                 correlation: "d-starting".into(),
                 phase: state::Phase::Starting,
                 peer: None,
+                prompts: Default::default(),
             },
         );
         let (s, b) = bed
@@ -7814,7 +7817,7 @@ mod tests {
         .await;
         assert_eq!(
             m["best"]["authentication"]["scopes"],
-            json!(["deploy", "jobs", "prompt"])
+            json!(["deploy", "jobs", "prompt", "metrics"])
         );
     }
 
@@ -9510,5 +9513,372 @@ mod tests {
         member.runtime.room_unread(false);
         site.live_cloud(&ws, "lab").step(later(0)).await;
         site.events(&ws, "j1", "JobStarted").await;
+    }
+
+    // ----- metrics (behavioralstate/spec#47) -------------------------------------------------------------------------
+
+    /// `/metrics` with `key` (as `X-Api-Key`, or as a bearer token when `bearer`), asking for `accept`: the status,
+    /// the content type and the text.
+    async fn scrape(
+        app: &axum::Router,
+        key: Option<&str>,
+        bearer: bool,
+        accept: Option<&str>,
+    ) -> (StatusCode, String, String) {
+        let mut req = Request::get("/metrics");
+        if let Some(k) = key {
+            req = if bearer {
+                req.header(header::AUTHORIZATION, format!("Bearer {k}"))
+            } else {
+                req.header("X-Api-Key", k)
+            };
+        }
+        if let Some(a) = accept {
+            req = req.header(header::ACCEPT, a);
+        }
+        let res = app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = res.status();
+        let ct = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let text = String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        (status, ct, text)
+    }
+
+    /// The text as a collector parses it, the samples by name.
+    fn parsed(text: &str) -> prometheus_parse::Scrape {
+        prometheus_parse::Scrape::parse(text.lines().map(|l| Ok(l.to_string()))).expect("the exposition parses")
+    }
+
+    /// The value of the sample named `name` whose labels include every one of `labels`; none when there is none.
+    fn sample(scrape: &prometheus_parse::Scrape, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        scrape
+            .samples
+            .iter()
+            .find(|s| s.metric == name && labels.iter().all(|(k, v)| s.labels.get(k) == Some(*v)))
+            .map(|s| match s.value {
+                prometheus_parse::Value::Counter(v)
+                | prometheus_parse::Value::Gauge(v)
+                | prometheus_parse::Value::Untyped(v) => v,
+                _ => f64::NAN,
+            })
+    }
+
+    #[tokio::test]
+    async fn metrics_say_how_the_machine_moves_in_the_text_a_collector_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]));
+        let bed = bed(card(), Arc::new(EventLog::open(dir.path()).unwrap()), runtime.clone()).await;
+
+        // Behind the door's credential, as every other path but sign-in.
+        assert_eq!(scrape(&bed.app, None, false, None).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            scrape(&bed.app, Some("not-a-key"), false, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
+        let ask = json!({ "deployment": dep, "messages": [{ "role": "user", "content": "hi there" }] });
+        let (s, b) = bed.send("p1", "Prompt", "prompt", ask).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        bed.events_of("p1", "PromptAnswered").await;
+
+        let (status, ct, text) = scrape(&bed.app, Some(&bed.key), false, None).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(ct, best_peer_door::metrics::PROMETHEUS_TEXT);
+        let m = parsed(&text);
+        let gpu = [("device", "gpu-0"), ("vendor", "nvidia"), ("api", "cuda")];
+        assert_eq!(
+            sample(&m, "best_peer_device_memory_total_bytes", &gpu),
+            Some((24 * GB) as f64),
+            "{text}"
+        );
+        assert_eq!(sample(&m, "best_peer_device_temperature_celsius", &gpu), Some(40.0));
+        assert_eq!(sample(&m, "best_peer_device_power_watts", &gpu), Some(30.0));
+        assert_eq!(sample(&m, "best_peer_device_utilisation_ratio", &gpu), Some(0.0));
+        assert_eq!(
+            sample(&m, "best_peer_device_memory_promised_bytes", &gpu),
+            Some((8 * GB) as f64)
+        );
+        assert_eq!(
+            sample(
+                &m,
+                "best_peer_device_info",
+                &[("device", "gpu-0"), ("apis", "cuda 12.4; vulkan")]
+            ),
+            Some(1.0),
+            "{text}"
+        );
+        assert_eq!(sample(&m, "best_peer_hardware_readable", &[]), Some(1.0));
+        assert_eq!(
+            sample(
+                &m,
+                "best_peer_deployment_phase",
+                &[("deployment", &dep), ("phase", "ready"), ("model", "llama3.2:3b")]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(
+                &m,
+                "best_peer_deployment_memory_promised_bytes",
+                &[("deployment", &dep)]
+            ),
+            Some((8 * GB) as f64)
+        );
+        assert_eq!(
+            sample(
+                &m,
+                "best_peer_prompts_total",
+                &[("deployment", &dep), ("outcome", "answered")]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(
+                &m,
+                "best_peer_prompts_total",
+                &[("deployment", &dep), ("outcome", "failed")]
+            ),
+            Some(0.0)
+        );
+        assert_eq!(
+            sample(
+                &m,
+                "best_peer_prompt_tokens_total",
+                &[("deployment", &dep), ("kind", "prompt")]
+            ),
+            Some(2.0)
+        );
+        assert_eq!(
+            sample(
+                &m,
+                "best_peer_prompt_tokens_total",
+                &[("deployment", &dep), ("kind", "completion")]
+            ),
+            Some(5.0)
+        );
+        assert_eq!(
+            sample(&m, "best_peer_commands_accepted_total", &[("command", "DeployModel")]),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(&m, "best_peer_commands_accepted_total", &[("command", "Prompt")]),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(&m, "best_peer_events_total", &[("event", "DeploymentStarted")]),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(&m, "best_peer_events_total", &[("event", "PromptAnswered")]),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(
+                &m,
+                "best_peer_info",
+                &[("version", env!("CARGO_PKG_VERSION")), ("driver", "fake 1.0")]
+            ),
+            Some(1.0)
+        );
+        // Nothing of the conversation is in it: telemetry counts, it does not tell.
+        assert!(!text.contains("hi there") && !text.contains("fake answer"), "{text}");
+
+        // An event stream open on the door is counted while it lives.
+        let open = bed
+            .app
+            .clone()
+            .oneshot(
+                Request::get("/events/stream")
+                    .header("X-Api-Key", &bed.key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(open.status(), StatusCode::OK);
+        let m = parsed(&scrape(&bed.app, Some(&bed.key), false, None).await.2);
+        assert_eq!(sample(&m, "best_peer_event_streams", &[]), Some(1.0));
+        drop(open);
+        let m = parsed(&scrape(&bed.app, Some(&bed.key), false, None).await.2);
+        assert_eq!(sample(&m, "best_peer_event_streams", &[]), Some(0.0));
+
+        // A collector that can only send a bearer token reads the same, and one that asks for OpenMetrics gets it.
+        let (s, _, bearer) = scrape(&bed.app, Some(&bed.key), true, None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(bearer.contains("best_peer_device_memory_total_bytes{"));
+        let (s, ct, om) = scrape(
+            &bed.app,
+            Some(&bed.key),
+            false,
+            Some("application/openmetrics-text; version=1.0.0"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(ct, best_peer_door::metrics::OPENMETRICS_TEXT);
+        assert!(
+            om.ends_with("# EOF\n")
+                && om.contains("# TYPE best_peer_prompts counter\n")
+                && om.contains("# UNIT best_peer_device_power_watts watts\n"),
+            "{om}"
+        );
+
+        // After a restart the counts the log holds are the same: a counter a collector reads does not fall back.
+        drop(bed);
+        let again = bed_with(
+            card(),
+            Arc::new(EventLog::open(dir.path()).unwrap()),
+            runtime,
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            None,
+        )
+        .await;
+        let m = parsed(&scrape(&again.app, Some(&again.key), false, None).await.2);
+        assert_eq!(
+            sample(&m, "best_peer_events_total", &[("event", "PromptAnswered")]),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(
+                &m,
+                "best_peer_prompts_total",
+                &[("deployment", &dep), ("outcome", "answered")]
+            ),
+            Some(1.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_reads_its_own_workloads_and_a_collector_reads_the_whole_door_and_may_do_nothing_else() {
+        let gpu = Arc::new(
+            best_peer_gpu::Fake::new()
+                .with_driver("fake 1.0")
+                .with_device(best_peer_gpu::Fake::cuda_card("gpu-0", "Card A", 24, "12.4"))
+                .with_device(best_peer_gpu::Fake::host_cpu("cpu-0", 64)),
+        );
+        let bed = bed(
+            gpu,
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
+
+        // Another credential sees the hardware, and nothing of the owner's deployment, nor the whole door's counts.
+        let other = key_with(&bed.app, Some("prompt"), None).await;
+        let (s, _, text) = scrape(&bed.app, Some(&other), false, None).await;
+        assert_eq!(s, StatusCode::OK);
+        let m = parsed(&text);
+        assert!(
+            sample(&m, "best_peer_device_memory_free_bytes", &[("device", "gpu-0")]).is_some(),
+            "{text}"
+        );
+        assert!(!text.contains(&dep), "another holder's deployment is not in it: {text}");
+        assert!(
+            !text.contains("best_peer_commands_accepted_total") && !text.contains("best_peer_events_total"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("best_peer_device_memory_promised_bytes{"),
+            "what every holder holds is not its to read: {text}"
+        );
+
+        // A key held to the accelerators sees no CPU here either.
+        let held = key_held(&bed.app, Some("prompt"), None, true).await;
+        let text = scrape(&bed.app, Some(&held), false, None).await.2;
+        assert!(
+            text.contains("device=\"gpu-0\"") && !text.contains("device=\"cpu-0\""),
+            "{text}"
+        );
+
+        // A collector approved for metrics alone reads every holder's workloads and the door's counts...
+        let collector = key_with(&bed.app, Some("metrics"), None).await;
+        let text = scrape(&bed.app, Some(&collector), false, None).await.2;
+        let m = parsed(&text);
+        assert_eq!(
+            sample(
+                &m,
+                "best_peer_deployment_phase",
+                &[("deployment", &dep), ("phase", "ready")]
+            ),
+            Some(1.0),
+            "{text}"
+        );
+        assert_eq!(
+            sample(&m, "best_peer_commands_accepted_total", &[("command", "DeployModel")]),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(&m, "best_peer_device_memory_promised_bytes", &[("device", "gpu-0")]),
+            Some((8 * GB) as f64)
+        );
+
+        // ...and may do nothing else: no deploy, no other holder's events, nothing to undeploy.
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &collector,
+            "x1",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "m", "engine": "ollama", "memory_bytes": GB }),
+        )
+        .await;
+        assert_eq!(
+            (s, b["error"]["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("FORBIDDEN")),
+            "{b}"
+        );
+        let (_, events) = get_as(&bed.app, "", &collector, "/events").await;
+        assert_eq!(
+            events["events"],
+            json!([]),
+            "the metrics scope reads no one's events: {events}"
+        );
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &collector,
+            "x2",
+            "UndeployModel",
+            "undeploy-model",
+            json!({ "deployment": dep }),
+        )
+        .await;
+        assert_ne!(s, StatusCode::CREATED, "{b}");
+
+        // A refusal is counted by its command and code, a type the door does not know under one name.
+        let (s, _) = send_as(
+            &bed.app,
+            "",
+            &collector,
+            "x3",
+            "NoSuchThing",
+            "no-such-thing",
+            json!({}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let m = parsed(&scrape(&bed.app, Some(&collector), false, None).await.2);
+        assert_eq!(
+            sample(
+                &m,
+                "best_peer_commands_refused_total",
+                &[("command", "DeployModel"), ("code", "FORBIDDEN")]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(
+                &m,
+                "best_peer_commands_refused_total",
+                &[("command", "unknown"), ("code", "UNKNOWN_TYPE")]
+            ),
+            Some(1.0)
+        );
     }
 }

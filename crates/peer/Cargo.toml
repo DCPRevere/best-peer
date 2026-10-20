@@ -50,4 +50,5 @@ tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+prometheus-parse = "0.2"
 tempfile = "3"

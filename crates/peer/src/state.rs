@@ -37,6 +37,17 @@ pub struct Deployment {
     pub phase: Phase,
     /// On a cloud, the member peer it was placed on, as `peer` in DeploymentStarted.
     pub peer: Option<String>,
+    /// What its prompts came to, as PromptAnswered and PromptFailed told it.
+    pub prompts: Prompts,
+}
+
+/// A deployment's prompts so far: answered, failed, and the tokens the engine reported for the answered ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Prompts {
+    pub answered: u64,
+    pub failed: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,6 +340,7 @@ impl State {
                         correlation,
                         phase: Phase::Starting,
                         peer: data["peer"].as_str().map(str::to_string),
+                        prompts: Prompts::default(),
                     },
                 );
             }
@@ -336,6 +348,18 @@ impl State {
                 if let Some(d) = self.deployments.get_mut(&text("deployment")) {
                     d.ready = true;
                     d.phase = Phase::Ready;
+                }
+            }
+            "PromptAnswered" => {
+                if let Some(d) = self.deployments.get_mut(&text("deployment")) {
+                    d.prompts.answered += 1;
+                    d.prompts.prompt_tokens += data["prompt_tokens"].as_u64().unwrap_or(0);
+                    d.prompts.completion_tokens += data["completion_tokens"].as_u64().unwrap_or(0);
+                }
+            }
+            "PromptFailed" => {
+                if let Some(d) = self.deployments.get_mut(&text("deployment")) {
+                    d.prompts.failed += 1;
                 }
             }
             "DeploymentFailed" | "DeploymentEnded" | "Undeployed" | "OutOfMemory" => {

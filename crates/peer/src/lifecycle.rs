@@ -2234,7 +2234,11 @@ pub(crate) fn workloads_view(s: &State, who: &Credential, cloud: Option<&str>) -
             with_cloud(json!({
                 "deployment": d.id, "model": d.model, "engine": d.engine, "device": d.device.0,
                 "memory_bytes": d.memory_bytes, "holder": d.holder, "peer": d.peer,
-                "phase": match d.phase { Phase::Starting => "starting", Phase::Ready => "ready", Phase::Ending => "ending" }
+                "phase": match d.phase { Phase::Starting => "starting", Phase::Ready => "ready", Phase::Ending => "ending" },
+                "prompts": {
+                    "answered": d.prompts.answered, "failed": d.prompts.failed,
+                    "prompt_tokens": d.prompts.prompt_tokens, "completion_tokens": d.prompts.completion_tokens
+                }
             }))
         })
         .collect();

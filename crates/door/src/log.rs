@@ -9,7 +9,7 @@
 //! files in name order, each line by line, are the log in its order. An `events.jsonl` left by an older peer is read
 //! before them and never written again.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -126,6 +126,8 @@ pub struct EventLog {
     /// Where the accepted commands are kept, for a log on disk: what a redaction rewrites.
     accepted_path: Mutex<Option<PathBuf>>,
     tx: broadcast::Sender<Stored>,
+    /// How many of the log's events were counted, and by type: what [`EventLog::counts_by_type`] adds to.
+    type_counts: Mutex<(usize, BTreeMap<String, u64>)>,
 }
 
 /// A command the log accepted, as `redact_commands` found it: its id, its correlation, and its data as it is now.
@@ -250,6 +252,7 @@ impl EventLog {
             accepted_file: Mutex::new(None),
             accepted_path: Mutex::new(None),
             tx,
+            type_counts: Mutex::new((0, BTreeMap::new())),
         }
     }
 
@@ -708,6 +711,19 @@ impl EventLog {
 
     /// The live feed, with the position of the last event already in the log, so a subscriber that also replays can
     /// skip what it has seen: subscribe first, then read, and the two never overlap or miss.
+    /// How many events of each type the log holds, from its first line: a count that survives a restart, since
+    /// the log does. Each call counts only what was appended since the last; the log never loses an event.
+    pub fn counts_by_type(&self) -> BTreeMap<String, u64> {
+        let events = self.events.lock().unwrap();
+        let mut counts = self.type_counts.lock().unwrap();
+        let (seen, by_type) = &mut *counts;
+        for s in &events[(*seen).min(events.len())..] {
+            *by_type.entry(s.envelope.r#type.clone()).or_default() += 1;
+        }
+        *seen = events.len();
+        by_type.clone()
+    }
+
     pub fn subscribe(&self) -> (broadcast::Receiver<Stored>, u64) {
         let events = self.events.lock().unwrap();
         (self.tx.subscribe(), events.last().map(|s| s.seq).unwrap_or(0))
