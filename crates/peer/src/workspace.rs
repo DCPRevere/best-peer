@@ -1292,6 +1292,56 @@ impl Service for Workspace {
         }
     }
 
+    fn admit_forget(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        crate::forget::admit(&self.log, &cmd, who).map(|_| ())
+    }
+
+    /// Forgets on this workspace's door, then asks the member peer that answered each forgotten prompt to forget its
+    /// copy, under the member's own correlation of it.
+    async fn forget(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        let Ok(scope) = crate::forget::scope_of(&cmd) else {
+            return;
+        };
+        let sender = crate::forget::sender_of(&em);
+        let forgot = match crate::forget::forget(&self.log, &sender, &scope) {
+            Ok(f) => f,
+            Err(why) => {
+                em.emit(
+                    "CommandFailed",
+                    json!({ "type": cmd.r#type, "reason": format!("the content is gone from what this door serves, but its files could not all be rewritten: {why}; send forget again") }),
+                );
+                return;
+            }
+        };
+        // Each member that answered is asked for each prompt it holds, a few at a time, and told of once.
+        let mut peers = Vec::new();
+        for ((cloud, peer), prompts) in crate::forget::answered_on(&forgot) {
+            let c = self.cloud(&cloud).ok();
+            let asks: Vec<(Option<Arc<Cloud>>, String, String)> = prompts
+                .iter()
+                .map(|prompt| {
+                    let on_member =
+                        crate::cloud::member_correlation(&format!("{sender}:{}", prompt.id), &prompt.data, None);
+                    (c.clone(), peer.clone(), on_member)
+                })
+                .collect();
+            let asks = asks.into_iter().map(|(c, peer, on_member)| async move {
+                match c {
+                    Some(c) => c.forget_on_member(&peer, &on_member).await,
+                    None => Err("its cloud is no longer live".to_string()),
+                }
+            });
+            let told: Vec<Result<(), String>> = futures::stream::iter(asks).buffer_unordered(8).collect().await;
+            let refused: Vec<&String> = told.iter().filter_map(|t| t.as_ref().err()).collect();
+            let mut row = json!({ "cloud": cloud, "peer": peer, "prompts": told.len(), "asked": told.len() - refused.len(), "refused": refused.len() });
+            if let Some(why) = refused.last() {
+                row["reason"] = json!(why);
+            }
+            peers.push(row);
+        }
+        crate::forget::tell_forgotten(&em, &scope, &forgot, Some(json!(peers)));
+    }
+
     async fn prompt(self: Arc<Self>, cmd: Envelope, em: Emitter) {
         let id = cmd.data["deployment"].as_str().unwrap_or_default().to_string();
         match self.cloud_of(&id) {
