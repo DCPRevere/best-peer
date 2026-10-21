@@ -302,6 +302,32 @@ pub fn streams_per_credential(text: Option<&str>) -> Result<usize, String> {
     }
 }
 
+/// What `best-peer --help` prints: the commands, and the settings an operator reaches for first. The README's Run
+/// section has every setting.
+const HELP: &str = "\
+best-peer: serves this machine's accelerators to agents through a BEST door.
+
+usage:
+  best-peer                    serve the door, with the settings below
+  best-peer approve <code> …   admit the agent that showed a person <code> (best-peer approve --help)
+  best-peer revoke <name>      take back every credential of a connection (best-peer revoke --help)
+  best-peer --version          say which build this is
+  best-peer --help             this
+
+settings, as environment variables:
+  BEST_PEER_LISTEN     where the door listens (default 127.0.0.1:7777)
+  BEST_PEER_ENDPOINT   the base URL agents reach it at (default: the listen address)
+  BEST_PEER_DATA       the folder for the credentials, the event log and the certificate (default ~/.best-peer)
+  BEST_PEER_RUNTIME    docker (default), native (an Ollama already running here, no jobs) or fake (no engine)
+  BEST_PEER_GPU        nvml (default: the NVIDIA cards, through the driver) or none (the CPU alone)
+
+Every setting, the sign-in and a first deploy: https://github.com/behavioralstate/best-peer#readme";
+
+/// Whether `args` ask for help, anywhere among them, since a command's help is read before its arguments are.
+fn asks_for_help(args: &[String]) -> bool {
+    args.iter().any(|a| a == "-h" || a == "--help")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -309,10 +335,9 @@ fn main() {
         Some("approve") => approve(&args[1..]),
         Some("revoke") => revoke(&args[1..]),
         Some("--version" | "-V" | "version") => println!("best-peer {}", env!("CARGO_PKG_VERSION")),
+        Some("--help" | "-h" | "help") => println!("{HELP}"),
         Some(other) => {
-            eprintln!(
-                "unknown command {other:?}: run with no arguments to serve, `best-peer approve <code>`, `best-peer revoke <name>`, or `best-peer --version`"
-            );
+            eprintln!("unknown command {other:?}: `best-peer --help` lists the commands");
             std::process::exit(2);
         }
     }
@@ -701,6 +726,10 @@ fn as_the_authority(path: &str, mut form: Vec<(&str, String)>) -> (u16, serde_js
 /// this machine's admin token as the proof, the way `approve` admits.
 fn revoke(args: &[String]) {
     const USAGE: &str = "usage: best-peer revoke <name>: the connection name the agent signed in under, or the holder id get-workloads and the events show";
+    if asks_for_help(args) {
+        println!("{USAGE}");
+        return;
+    }
     let (Some(name), None) = (args.first(), args.get(1)) else {
         fail(USAGE)
     };
@@ -730,6 +759,10 @@ fn revoke(args: &[String]) {
 /// certificate the peer serves and no other, when it serves one.
 fn approve(args: &[String]) {
     const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt | all] [--memory 40G] [--deployments N] [--jobs N] [--open-jobs] [--expires 8h] [--accelerators-only]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said); how many deployments and jobs it may run at once across the door (no count when not said); with a share, whether its jobs leave the closed box (no network, a ceiling on host memory) a tenant's job gets; how long the credential lasts, 366d at most, and 8h at most for a session credential (the agent's choice when not said); whether it sees and uses the accelerators alone, never the host's CPU";
+    if asks_for_help(args) {
+        println!("{USAGE}");
+        return;
+    }
     let Some(code) = args.first() else { fail(USAGE) };
     let (mut may, mut memory, mut open_jobs) = (None::<String>, None::<u64>, false);
     let mut expires = None::<Duration>;
